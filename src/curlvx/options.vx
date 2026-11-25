@@ -1,0 +1,683 @@
+// The command line of curl: which options curl-vx knows, and the `Config` they make.
+//
+// This file needs no right at all: it reads only the argument bytes. Options that name a file,
+// such as `-d @file` or `-o file`, keep the name here. `main` opens the file, because only
+// `main` has the right to open files.
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import curlvx::bytes;
+import curlvx::failure;
+
+// The kinds of request body option. `-d` and `--data-ascii` read a file after `@` and drop its
+// CR and LF bytes. `--data-raw` never reads a file. `--data-binary` and `--json` keep the
+// bytes of the file as they are. `--data-urlencode` encodes its value.
+const DATA_ASCII : i32 = 0;
+const DATA_RAW : i32 = 1;
+const DATA_BINARY : i32 = 2;
+const DATA_URLENCODE : i32 = 3;
+const DATA_JSON : i32 = 4;
+
+/// One `-d`-like option: its kind and its value as the user wrote it.
+struct DataPart {
+  kind : i32,
+  text : Vec<u8>,
+}
+
+/// What the command line asks for.
+struct Config {
+  urls : Vec<Vec<u8>>,
+  // The `-o` file names in order. The first goes with the first URL, and so on.
+  outputs : Vec<Vec<u8>>,
+  // How many `-O` options were given. Each takes the next URL that has no `-o`.
+  remote_names : i32,
+  remote_name_all : bool,
+  has_method : bool,
+  method : Vec<u8>,
+  headers : Vec<Vec<u8>>,
+  data : Vec<DataPart>,
+  get_data : bool,
+  head : bool,
+  include : bool,
+  follow : bool,
+  location_trusted : bool,
+  max_redirs : i64,
+  silent : bool,
+  show_error : bool,
+  verbose : bool,
+  fail : bool,
+  fail_with_body : bool,
+  has_user : bool,
+  user : Vec<u8>,
+  has_user_agent : bool,
+  user_agent : Vec<u8>,
+  has_referer : bool,
+  referer : Vec<u8>,
+  auto_referer : bool,
+  has_cookie : bool,
+  cookie : Vec<u8>,
+  has_write_out : bool,
+  write_out : Vec<u8>,
+  has_dump_header : bool,
+  dump_header : Vec<u8>,
+  http10 : bool,
+  has_upload : bool,
+  upload : Vec<u8>,
+  has_range : bool,
+  range : Vec<u8>,
+  resolve : Vec<Vec<u8>>,
+  connect_to : Vec<Vec<u8>>,
+  max_time_ms : i64,
+  connect_timeout_ms : i64,
+  has_trace : bool,
+  trace : Vec<u8>,
+  path_as_is : bool,
+  raw : bool,
+  show_help : bool,
+  show_version : bool,
+  has_proxy : bool,
+  proxy : Vec<u8>,
+  has_proxy_user : bool,
+  proxy_user : Vec<u8>,
+  noproxy : Vec<u8>,
+  has_output_dir : bool,
+  output_dir : Vec<u8>,
+}
+
+/// A `Config` with curl's defaults.
+pub fn default_config() -> Config {
+  return Config {
+    urls : Vec<Vec<u8>>::new(),
+    outputs : Vec<Vec<u8>>::new(),
+    remote_names : 0,
+    remote_name_all : false,
+    has_method : false,
+    method : Vec<u8>::new(),
+    headers : Vec<Vec<u8>>::new(),
+    data : Vec<DataPart>::new(),
+    get_data : false,
+    head : false,
+    include : false,
+    follow : false,
+    location_trusted : false,
+    max_redirs : 50i64,
+    silent : false,
+    show_error : false,
+    verbose : false,
+    fail : false,
+    fail_with_body : false,
+    has_user : false,
+    user : Vec<u8>::new(),
+    has_user_agent : false,
+    user_agent : Vec<u8>::new(),
+    has_referer : false,
+    referer : Vec<u8>::new(),
+    auto_referer : false,
+    has_cookie : false,
+    cookie : Vec<u8>::new(),
+    has_write_out : false,
+    write_out : Vec<u8>::new(),
+    has_dump_header : false,
+    dump_header : Vec<u8>::new(),
+    http10 : false,
+    has_upload : false,
+    upload : Vec<u8>::new(),
+    has_range : false,
+    range : Vec<u8>::new(),
+    resolve : Vec<Vec<u8>>::new(),
+    connect_to : Vec<Vec<u8>>::new(),
+    max_time_ms : 0i64,
+    connect_timeout_ms : 0i64,
+    has_trace : false,
+    trace : Vec<u8>::new(),
+    path_as_is : false,
+    raw : false,
+    show_help : false,
+    show_version : false,
+    has_proxy : false,
+    proxy : Vec<u8>::new(),
+    has_proxy_user : false,
+    proxy_user : Vec<u8>::new(),
+    noproxy : Vec<u8>::new(),
+    has_output_dir : false,
+    output_dir : Vec<u8>::new()
+  };
+}
+
+// The options curl-vx knows. An option that is in curl but not here is "unknown".
+const OPT_UNKNOWN : i32 = 0;
+const OPT_USER_AGENT : i32 = 1;
+const OPT_COOKIE : i32 = 2;
+const OPT_DATA : i32 = 3;
+const OPT_DATA_ASCII : i32 = 4;
+const OPT_DATA_RAW : i32 = 5;
+const OPT_DATA_BINARY : i32 = 6;
+const OPT_DATA_URLENCODE : i32 = 7;
+const OPT_JSON : i32 = 8;
+const OPT_DUMP_HEADER : i32 = 9;
+const OPT_REFERER : i32 = 10;
+const OPT_HEADER : i32 = 11;
+const OPT_MAX_TIME : i32 = 12;
+const OPT_CONNECT_TIMEOUT : i32 = 13;
+const OPT_OUTPUT : i32 = 14;
+const OPT_RANGE : i32 = 15;
+const OPT_UPLOAD_FILE : i32 = 16;
+const OPT_USER : i32 = 17;
+const OPT_WRITE_OUT : i32 = 18;
+const OPT_REQUEST : i32 = 19;
+const OPT_URL : i32 = 20;
+const OPT_MAX_REDIRS : i32 = 21;
+const OPT_RESOLVE : i32 = 22;
+const OPT_CONNECT_TO : i32 = 23;
+const OPT_TRACE_ASCII : i32 = 24;
+const OPT_TRACE : i32 = 25;
+const OPT_PROXY : i32 = 26;
+const OPT_PROXY_USER : i32 = 27;
+const OPT_NOPROXY : i32 = 28;
+const OPT_OUTPUT_DIR : i32 = 29;
+const OPT_HTTP10 : i32 = 30;
+const OPT_HTTP11 : i32 = 31;
+const OPT_FAIL : i32 = 32;
+const OPT_FAIL_WITH_BODY : i32 = 33;
+const OPT_GET : i32 = 34;
+const OPT_INCLUDE : i32 = 35;
+const OPT_HEAD : i32 = 36;
+const OPT_INSECURE : i32 = 37;
+const OPT_LOCATION : i32 = 38;
+const OPT_LOCATION_TRUSTED : i32 = 39;
+const OPT_REMOTE_NAME : i32 = 40;
+const OPT_REMOTE_NAME_ALL : i32 = 41;
+const OPT_DISABLE : i32 = 42;
+const OPT_SILENT : i32 = 43;
+const OPT_SHOW_ERROR : i32 = 44;
+const OPT_VERBOSE : i32 = 45;
+const OPT_VERSION : i32 = 46;
+const OPT_HELP : i32 = 47;
+const OPT_GLOBOFF : i32 = 48;
+const OPT_PATH_AS_IS : i32 = 49;
+const OPT_TRACE_TIME : i32 = 50;
+const OPT_PROGRESS_BAR : i32 = 51;
+const OPT_NO_PROGRESS_METER : i32 = 52;
+const OPT_NO_BUFFER : i32 = 53;
+const OPT_RAW : i32 = 54;
+const OPT_COMPRESSED : i32 = 55;
+
+/// The option of a long name such as `header`, without the leading `--`.
+fn long_option(name : &Vec<u8>) -> i32 {
+  if eq_lit(name, "user-agent") { return OPT_USER_AGENT; }
+  if eq_lit(name, "cookie") { return OPT_COOKIE; }
+  if eq_lit(name, "data") { return OPT_DATA; }
+  if eq_lit(name, "data-ascii") { return OPT_DATA_ASCII; }
+  if eq_lit(name, "data-raw") { return OPT_DATA_RAW; }
+  if eq_lit(name, "data-binary") { return OPT_DATA_BINARY; }
+  if eq_lit(name, "data-urlencode") { return OPT_DATA_URLENCODE; }
+  if eq_lit(name, "json") { return OPT_JSON; }
+  if eq_lit(name, "dump-header") { return OPT_DUMP_HEADER; }
+  if eq_lit(name, "referer") { return OPT_REFERER; }
+  if eq_lit(name, "header") { return OPT_HEADER; }
+  if eq_lit(name, "max-time") { return OPT_MAX_TIME; }
+  if eq_lit(name, "connect-timeout") { return OPT_CONNECT_TIMEOUT; }
+  if eq_lit(name, "output") { return OPT_OUTPUT; }
+  if eq_lit(name, "range") { return OPT_RANGE; }
+  if eq_lit(name, "upload-file") { return OPT_UPLOAD_FILE; }
+  if eq_lit(name, "user") { return OPT_USER; }
+  if eq_lit(name, "write-out") { return OPT_WRITE_OUT; }
+  if eq_lit(name, "request") { return OPT_REQUEST; }
+  if eq_lit(name, "url") { return OPT_URL; }
+  if eq_lit(name, "max-redirs") { return OPT_MAX_REDIRS; }
+  if eq_lit(name, "resolve") { return OPT_RESOLVE; }
+  if eq_lit(name, "connect-to") { return OPT_CONNECT_TO; }
+  if eq_lit(name, "trace-ascii") { return OPT_TRACE_ASCII; }
+  if eq_lit(name, "trace") { return OPT_TRACE; }
+  if eq_lit(name, "proxy") { return OPT_PROXY; }
+  if eq_lit(name, "proxy-user") { return OPT_PROXY_USER; }
+  if eq_lit(name, "noproxy") { return OPT_NOPROXY; }
+  if eq_lit(name, "output-dir") { return OPT_OUTPUT_DIR; }
+  if eq_lit(name, "http1.0") { return OPT_HTTP10; }
+  if eq_lit(name, "http1.1") { return OPT_HTTP11; }
+  if eq_lit(name, "fail") { return OPT_FAIL; }
+  if eq_lit(name, "fail-with-body") { return OPT_FAIL_WITH_BODY; }
+  if eq_lit(name, "get") { return OPT_GET; }
+  if eq_lit(name, "include") { return OPT_INCLUDE; }
+  if eq_lit(name, "show-headers") { return OPT_INCLUDE; }
+  if eq_lit(name, "head") { return OPT_HEAD; }
+  if eq_lit(name, "insecure") { return OPT_INSECURE; }
+  if eq_lit(name, "location") { return OPT_LOCATION; }
+  if eq_lit(name, "location-trusted") { return OPT_LOCATION_TRUSTED; }
+  if eq_lit(name, "remote-name") { return OPT_REMOTE_NAME; }
+  if eq_lit(name, "remote-name-all") { return OPT_REMOTE_NAME_ALL; }
+  if eq_lit(name, "disable") { return OPT_DISABLE; }
+  if eq_lit(name, "silent") { return OPT_SILENT; }
+  if eq_lit(name, "show-error") { return OPT_SHOW_ERROR; }
+  if eq_lit(name, "verbose") { return OPT_VERBOSE; }
+  if eq_lit(name, "version") { return OPT_VERSION; }
+  if eq_lit(name, "help") { return OPT_HELP; }
+  if eq_lit(name, "globoff") { return OPT_GLOBOFF; }
+  if eq_lit(name, "path-as-is") { return OPT_PATH_AS_IS; }
+  if eq_lit(name, "trace-time") { return OPT_TRACE_TIME; }
+  if eq_lit(name, "progress-bar") { return OPT_PROGRESS_BAR; }
+  if eq_lit(name, "no-progress-meter") { return OPT_NO_PROGRESS_METER; }
+  if eq_lit(name, "buffer") { return OPT_NO_BUFFER; }
+  if eq_lit(name, "raw") { return OPT_RAW; }
+  if eq_lit(name, "compressed") { return OPT_COMPRESSED; }
+  return OPT_UNKNOWN;
+}
+
+/// The option of a short letter such as `H`.
+fn short_option(letter : u8) -> i32 {
+  if letter == 65u8 { return OPT_USER_AGENT; }      // A
+  if letter == 98u8 { return OPT_COOKIE; }          // b
+  if letter == 100u8 { return OPT_DATA; }           // d
+  if letter == 68u8 { return OPT_DUMP_HEADER; }     // D
+  if letter == 101u8 { return OPT_REFERER; }        // e
+  if letter == 72u8 { return OPT_HEADER; }          // H
+  if letter == 109u8 { return OPT_MAX_TIME; }       // m
+  if letter == 111u8 { return OPT_OUTPUT; }         // o
+  if letter == 114u8 { return OPT_RANGE; }          // r
+  if letter == 84u8 { return OPT_UPLOAD_FILE; }     // T
+  if letter == 117u8 { return OPT_USER; }           // u
+  if letter == 119u8 { return OPT_WRITE_OUT; }      // w
+  if letter == 88u8 { return OPT_REQUEST; }         // X
+  if letter == 120u8 { return OPT_PROXY; }          // x
+  if letter == 85u8 { return OPT_PROXY_USER; }      // U
+  if letter == 48u8 { return OPT_HTTP10; }          // 0
+  if letter == 102u8 { return OPT_FAIL; }           // f
+  if letter == 71u8 { return OPT_GET; }             // G
+  if letter == 105u8 { return OPT_INCLUDE; }        // i
+  if letter == 73u8 { return OPT_HEAD; }            // I
+  if letter == 107u8 { return OPT_INSECURE; }       // k
+  if letter == 76u8 { return OPT_LOCATION; }        // L
+  if letter == 79u8 { return OPT_REMOTE_NAME; }     // O
+  if letter == 113u8 { return OPT_DISABLE; }        // q
+  if letter == 115u8 { return OPT_SILENT; }         // s
+  if letter == 83u8 { return OPT_SHOW_ERROR; }      // S
+  if letter == 118u8 { return OPT_VERBOSE; }        // v
+  if letter == 86u8 { return OPT_VERSION; }         // V
+  if letter == 104u8 { return OPT_HELP; }           // h
+  if letter == 103u8 { return OPT_GLOBOFF; }        // g
+  if letter == 35u8 { return OPT_PROGRESS_BAR; }    // #
+  if letter == 78u8 { return OPT_NO_BUFFER; }       // N
+  return OPT_UNKNOWN;
+}
+
+/// Whether the option takes a value.
+fn takes_value(id : i32) -> bool {
+  return id >= OPT_USER_AGENT && id <= OPT_OUTPUT_DIR;
+}
+
+/// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
+pub fn seconds_to_ms(text : &Vec<u8>) -> Option<i64> {
+  let dot = find_byte(text, 46u8, 0);
+  let mut whole = clone_bytes(text);
+  let mut frac = Vec<u8>::new();
+  if dot >= 0 {
+    whole = range_of(text, 0, dot);
+    frac = rest_from(text, dot + 1);
+  }
+  let mut ms : i64 = 0i64;
+  if whole.len() > 0 {
+    match parse_u64(&whole) {
+      Option<u64>::Some(s) => {
+        ms = (s as i64) * 1000i64;
+      },
+      Option<u64>::None() => {
+        return Option<i64>::None();
+      }
+    }
+  }
+  let mut scale : i64 = 100i64;
+  let mut i = 0;
+  while i < frac.len() {
+    let b = frac.get(i);
+    if !is_digit(b) {
+      return Option<i64>::None();
+    }
+    ms = ms + ((b - 48u8) as i64) * scale;
+    scale = scale / 10i64;
+    i = i + 1;
+  }
+  return Option<i64>::Some(ms);
+}
+
+fn done() -> Result<i32, Failure> {
+  return Result<i32, Failure>::Ok(0);
+}
+
+fn option_error(name : &Vec<u8>, what : *const i8) -> Failure {
+  let mut m = lit("option ");
+  append(&mut m, name);
+  push_lit(&mut m, ": ");
+  push_lit(&mut m, what);
+  return fail_with(FAILED_INIT, m);
+}
+
+fn add_data(cfg : &mut Config, kind : i32, value : &Vec<u8>) -> void {
+  cfg.data.push(DataPart {
+    kind : kind,
+    text : clone_bytes(value)
+  });
+}
+
+/// Apply option `id` with `value` to `cfg`. `enable` is false for the `--no-` form of an option.
+/// `shown` is the option as the user wrote it, for error messages.
+fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &Vec<u8>)
+-> Result<i32, Failure> {
+  if id == OPT_USER_AGENT {
+    cfg.has_user_agent = true;
+    cfg.user_agent = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_COOKIE {
+    // Each `-b name=value` adds to the Cookie header, after a `; `.
+    if cfg.has_cookie && find_byte(&cfg.cookie, 61u8, 0) >= 0 && find_byte(value, 61u8, 0) >= 0 {
+      push_lit(&mut cfg.cookie, "; ");
+      append(&mut cfg.cookie, value);
+    } else {
+      cfg.has_cookie = true;
+      cfg.cookie = clone_bytes(value);
+    }
+    return done();
+  }
+  if id == OPT_DATA || id == OPT_DATA_ASCII {
+    add_data(cfg, DATA_ASCII, value);
+    return done();
+  }
+  if id == OPT_DATA_RAW {
+    add_data(cfg, DATA_RAW, value);
+    return done();
+  }
+  if id == OPT_DATA_BINARY {
+    add_data(cfg, DATA_BINARY, value);
+    return done();
+  }
+  if id == OPT_DATA_URLENCODE {
+    add_data(cfg, DATA_URLENCODE, value);
+    return done();
+  }
+  if id == OPT_JSON {
+    add_data(cfg, DATA_JSON, value);
+    return done();
+  }
+  if id == OPT_DUMP_HEADER {
+    cfg.has_dump_header = true;
+    cfg.dump_header = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_REFERER {
+    // `-e "url;auto"` also sets the Referer of each redirect.
+    let semi = find_seq(value, &lit(";auto"), 0);
+    if semi >= 0 && semi + 5 == value.len() {
+      cfg.auto_referer = true;
+      cfg.referer = range_of(value, 0, semi);
+      cfg.has_referer = semi > 0;
+    } else {
+      cfg.has_referer = true;
+      cfg.referer = clone_bytes(value);
+    }
+    return done();
+  }
+  if id == OPT_HEADER {
+    cfg.headers.push(clone_bytes(value));
+    return done();
+  }
+  if id == OPT_MAX_TIME || id == OPT_CONNECT_TIMEOUT {
+    match seconds_to_ms(value) {
+      Option<i64>::Some(ms) => {
+        if id == OPT_MAX_TIME {
+          cfg.max_time_ms = ms;
+        } else {
+          cfg.connect_timeout_ms = ms;
+        }
+      },
+      Option<i64>::None() => {
+        return Result<i32, Failure>::Err(option_error(shown, "expected a proper numerical parameter"));
+      }
+    }
+    return done();
+  }
+  if id == OPT_OUTPUT {
+    cfg.outputs.push(clone_bytes(value));
+    return done();
+  }
+  if id == OPT_RANGE {
+    cfg.has_range = true;
+    cfg.range = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_UPLOAD_FILE {
+    cfg.has_upload = true;
+    cfg.upload = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_USER {
+    cfg.has_user = true;
+    cfg.user = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_WRITE_OUT {
+    cfg.has_write_out = true;
+    cfg.write_out = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_REQUEST {
+    cfg.has_method = true;
+    cfg.method = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_URL {
+    cfg.urls.push(clone_bytes(value));
+    return done();
+  }
+  if id == OPT_MAX_REDIRS {
+    let neg = eq_lit(value, "-1");
+    if neg {
+      cfg.max_redirs = -1i64;
+    } else {
+      match parse_u64(value) {
+        Option<u64>::Some(n) => {
+          cfg.max_redirs = n as i64;
+        },
+        Option<u64>::None() => {
+          return Result<i32, Failure>::Err(option_error(shown, "expected a proper numerical parameter"));
+        }
+      }
+    }
+    return done();
+  }
+  if id == OPT_RESOLVE {
+    cfg.resolve.push(clone_bytes(value));
+    return done();
+  }
+  if id == OPT_CONNECT_TO {
+    cfg.connect_to.push(clone_bytes(value));
+    return done();
+  }
+  if id == OPT_TRACE_ASCII || id == OPT_TRACE {
+    cfg.has_trace = true;
+    cfg.trace = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_PROXY {
+    cfg.has_proxy = value.len() > 0;
+    cfg.proxy = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_PROXY_USER {
+    cfg.has_proxy_user = true;
+    cfg.proxy_user = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_NOPROXY {
+    cfg.noproxy = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_OUTPUT_DIR {
+    cfg.has_output_dir = true;
+    cfg.output_dir = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_HTTP10 {
+    cfg.http10 = enable;
+    return done();
+  }
+  if id == OPT_HTTP11 {
+    cfg.http10 = false;
+    return done();
+  }
+  if id == OPT_FAIL {
+    cfg.fail = enable;
+    return done();
+  }
+  if id == OPT_FAIL_WITH_BODY {
+    cfg.fail_with_body = enable;
+    return done();
+  }
+  if id == OPT_GET {
+    cfg.get_data = enable;
+    return done();
+  }
+  if id == OPT_INCLUDE {
+    cfg.include = enable;
+    return done();
+  }
+  if id == OPT_HEAD {
+    cfg.head = enable;
+    return done();
+  }
+  if id == OPT_LOCATION {
+    cfg.follow = enable;
+    return done();
+  }
+  if id == OPT_LOCATION_TRUSTED {
+    cfg.follow = enable;
+    cfg.location_trusted = enable;
+    return done();
+  }
+  if id == OPT_REMOTE_NAME {
+    cfg.remote_names = cfg.remote_names + 1;
+    return done();
+  }
+  if id == OPT_REMOTE_NAME_ALL {
+    cfg.remote_name_all = enable;
+    return done();
+  }
+  if id == OPT_SILENT {
+    cfg.silent = enable;
+    return done();
+  }
+  if id == OPT_SHOW_ERROR {
+    cfg.show_error = enable;
+    return done();
+  }
+  if id == OPT_VERBOSE {
+    cfg.verbose = enable;
+    return done();
+  }
+  if id == OPT_VERSION {
+    cfg.show_version = true;
+    return done();
+  }
+  if id == OPT_HELP {
+    cfg.show_help = true;
+    return done();
+  }
+  if id == OPT_PATH_AS_IS {
+    cfg.path_as_is = enable;
+    return done();
+  }
+  if id == OPT_RAW {
+    cfg.raw = enable;
+    return done();
+  }
+  if id == OPT_COMPRESSED {
+    if enable {
+      return Result<i32, Failure>::Err(fail_with(NOT_BUILT_IN,
+        lit("option --compressed: the installed libcurl version does not support this")));
+    }
+    return done();
+  }
+  // OPT_INSECURE matters only for HTTPS, which curl-vx does not have yet. OPT_DISABLE,
+  // OPT_GLOBOFF, OPT_TRACE_TIME, OPT_PROGRESS_BAR, OPT_NO_PROGRESS_METER and OPT_NO_BUFFER
+  // change nothing that curl-vx does.
+  return Result<i32, Failure>::Ok(0);
+}
+
+/// Parse the command-line arguments, without the program name, into a `Config`.
+pub fn parse_args(args : &Vec<Vec<u8>>) -> Result<Config, Failure> {
+  let mut cfg = default_config();
+  let mut i = 0;
+  while i < args.len() {
+    let arg = args.get_ref(i);
+    let is_option = arg.len() > 1 && arg.get(0) == 45u8;
+    if !is_option {
+      cfg.urls.push(clone_bytes(arg));
+      i = i + 1;
+      continue;
+    }
+    if arg.get(1) == 45u8 {
+      // A long option, such as `--header` or `--no-location`.
+      let mut name = rest_from(arg, 2);
+      let mut enable = true;
+      let mut id = long_option(&name);
+      if id == OPT_UNKNOWN && starts_lit(&name, "no-") {
+        let rest = rest_from(&name, 3);
+        let base = long_option(&rest);
+        if base != OPT_UNKNOWN && !takes_value(base) {
+          id = base;
+          enable = false;
+        }
+      }
+      if id == OPT_UNKNOWN {
+        return Result<Config, Failure>::Err(option_error(arg, "is unknown"));
+      }
+      let mut value = Vec<u8>::new();
+      if takes_value(id) {
+        if i + 1 >= args.len() {
+          return Result<Config, Failure>::Err(option_error(arg, "requires parameter"));
+        }
+        value = clone_bytes(args.get_ref(i + 1));
+        i = i + 1;
+      }
+      name = clone_bytes(arg);
+      let _applied = apply(&mut cfg, id, &value, enable, &name)?;
+      i = i + 1;
+      continue;
+    }
+    // One or more short options, such as `-sSL` or `-ofile`.
+    let mut j = 1;
+    let mut used_next = false;
+    while j < arg.len() {
+      let letter = arg.get(j);
+      let id = short_option(letter);
+      let mut shown = lit("-");
+      shown.push(letter);
+      if id == OPT_UNKNOWN {
+        return Result<Config, Failure>::Err(option_error(&shown, "is unknown"));
+      }
+      if takes_value(id) {
+        let mut value = Vec<u8>::new();
+        if j + 1 < arg.len() {
+          value = rest_from(arg, j + 1);
+        } else {
+          if i + 1 >= args.len() {
+            return Result<Config, Failure>::Err(option_error(&shown, "requires parameter"));
+          }
+          value = clone_bytes(args.get_ref(i + 1));
+          used_next = true;
+        }
+        let _applied = apply(&mut cfg, id, &value, true, &shown)?;
+        j = arg.len();
+      } else {
+        let none = Vec<u8>::new();
+        let _applied = apply(&mut cfg, id, &none, true, &shown)?;
+        j = j + 1;
+      }
+    }
+    if used_next {
+      i = i + 1;
+    }
+    i = i + 1;
+  }
+  return Result<Config, Failure>::Ok(cfg);
+}

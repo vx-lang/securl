@@ -1,0 +1,116 @@
+// The files that curl-vx reads and writes. Each function takes the right to open files, a
+// `&Files`, which only `main` has. The `curlvx` package never gets it.
+import core::option;
+import core::result;
+import std::fs;
+import std::string;
+import std::vec;
+import sys::console;
+import sys::text;
+import curlvx::bytes;
+import curlvx::failure;
+
+fn path_string(name : &Vec<u8>) -> Option<String> {
+  return to_string(name);
+}
+
+/// All bytes of the file `name`. `-` means standard input.
+pub fn read_file(files : &Files, name : &Vec<u8>) -> Result<Vec<u8>, Failure> {
+  if eq_lit(name, "-") {
+    return Result<Vec<u8>, Failure>::Ok(read_stdin());
+  }
+  let failure = fail_lit(READ_ERROR, "Failed to open/read local data from file/application");
+  match path_string(name) {
+    Option<String>::Some(path) => {
+      match File::open(files, &path, OpenMode::Read()) {
+        Result<File, FileError>::Ok(f) => {
+          let mut file = f;
+          let mut out = Vec<u8>::new();
+          let mut chunk = Vec<u8>::new();
+          let mut i = 0;
+          while i < 65536 {
+            chunk.push(0u8);
+            i = i + 1;
+          }
+          loop {
+            match file.read(&mut chunk) {
+              Result<u64, FileError>::Ok(n) => {
+                if n == 0u64 {
+                  return Result<Vec<u8>, Failure>::Ok(out);
+                }
+                append_range(&mut out, &chunk, 0, n as i32);
+              },
+              Result<u64, FileError>::Err(_e) => {
+                return Result<Vec<u8>, Failure>::Err(failure);
+              }
+            }
+          }
+        },
+        Result<File, FileError>::Err(_e) => {
+          return Result<Vec<u8>, Failure>::Err(failure);
+        }
+      }
+    },
+    Option<String>::None() => {
+      return Result<Vec<u8>, Failure>::Err(failure);
+    }
+  }
+}
+
+/// Make the file `name`, or make an existing one empty, for writing.
+pub fn create_file(files : &Files, name : &Vec<u8>) -> Result<File, Failure> {
+  let mut m = lit("Failed to open the file ");
+  append(&mut m, name);
+  match path_string(name) {
+    Option<String>::Some(path) => {
+      match File::open(files, &path, OpenMode::Write()) {
+        Result<File, FileError>::Ok(f) => {
+          return Result<File, Failure>::Ok(f);
+        },
+        Result<File, FileError>::Err(_e) => {
+          return Result<File, Failure>::Err(fail_with(WRITE_ERROR, m));
+        }
+      }
+    },
+    Option<String>::None() => {
+      return Result<File, Failure>::Err(fail_with(WRITE_ERROR, m));
+    }
+  }
+}
+
+/// Write `bytes` to the file `name`. With `add`, they go after the bytes the file has, and else
+/// the file starts empty.
+pub fn append_to_file(files : &Files, name : &Vec<u8>, add : bool, bytes : &Vec<u8>)
+-> Result<i32, Failure> {
+  let failure = fail_lit(WRITE_ERROR, "Failure writing output to destination");
+  let mut mode = OpenMode::Write();
+  if add {
+    mode = OpenMode::ReadWriteCreate();
+  }
+  match path_string(name) {
+    Option<String>::Some(path) => {
+      match File::open(files, &path, mode) {
+        Result<File, FileError>::Ok(f) => {
+          let mut file = f;
+          if add {
+            let _end = file.seek(0i64, 2);
+          }
+          match file.write(bytes) {
+            Result<u64, FileError>::Ok(_n) => {
+              return Result<i32, Failure>::Ok(0);
+            },
+            Result<u64, FileError>::Err(_e) => {
+              return Result<i32, Failure>::Err(failure);
+            }
+          }
+        },
+        Result<File, FileError>::Err(_e) => {
+          return Result<i32, Failure>::Err(failure);
+        }
+      }
+    },
+    Option<String>::None() => {
+      return Result<i32, Failure>::Err(failure);
+    }
+  }
+}

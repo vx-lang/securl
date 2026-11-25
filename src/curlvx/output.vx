@@ -1,0 +1,107 @@
+// Where the bytes of a response go: standard output, a file, or nowhere.
+//
+// This file cannot open a file, because it never gets a `&Files`. `main` opens each output
+// file and gives the open `File` to `file_output`.
+import core::option;
+import core::result;
+import std::fs;
+import std::vec;
+import sys::console;
+import sys::text;
+import curlvx::bytes;
+import curlvx::failure;
+
+struct Output {
+  to_stdout : bool,
+  file : Option<File>,
+  // How many bytes went to this output.
+  written : i64,
+}
+
+/// An output to standard output.
+pub fn stdout_output() -> Output {
+  return Output {
+    to_stdout : true,
+    file : Option<File>::None(),
+    written : 0i64
+  };
+}
+
+/// An output to `file`, which `main` opened.
+pub fn file_output(file : File) -> Output {
+  return Output {
+    to_stdout : false,
+    file : Option<File>::Some(file),
+    written : 0i64
+  };
+}
+
+/// An output that drops what it gets.
+pub fn null_output() -> Output {
+  return Output {
+    to_stdout : false,
+    file : Option<File>::None(),
+    written : 0i64
+  };
+}
+
+fn write_error() -> Failure {
+  return fail_lit(WRITE_ERROR, "Failure writing output to destination");
+}
+
+/// Write all of `bytes` in as many writes as the file takes.
+fn write_all_to_file(file : &mut File, bytes : &Vec<u8>) -> Result<i32, Failure> {
+  let mut rest = clone_bytes(bytes);
+  while rest.len() > 0 {
+    match file.write(&rest) {
+      Result<u64, FileError>::Ok(n) => {
+        if n == 0u64 || (n as i32) > rest.len() {
+          return Result<i32, Failure>::Err(write_error());
+        }
+        rest = rest_from(&rest, n as i32);
+      },
+      Result<u64, FileError>::Err(_e) => {
+        return Result<i32, Failure>::Err(write_error());
+      }
+    }
+  }
+  return Result<i32, Failure>::Ok(0);
+}
+
+impl Output {
+  /// Write all of `bytes` to the output.
+  pub fn write(self : &mut Output, bytes : &Vec<u8>) -> Result<i32, Failure> {
+    if bytes.len() == 0 {
+      return Result<i32, Failure>::Ok(0);
+    }
+    self.written = self.written + (bytes.len() as i64);
+    if self.to_stdout {
+      if !write_stdout(bytes) {
+        return Result<i32, Failure>::Err(write_error());
+      }
+      return Result<i32, Failure>::Ok(0);
+    }
+    // Vx has no `ref mut` pattern yet, so move the file out and put it back.
+    match self.file.take() {
+      Option<File>::Some(f) => {
+        let mut open = f;
+        let result = write_all_to_file(&mut open, bytes);
+        self.file = Option<File>::Some(open);
+        return result;
+      },
+      Option<File>::None() => {
+        return Result<i32, Failure>::Ok(0);
+      }
+    }
+  }
+}
+
+/// Write `bytes` to standard error. A closed standard error is not an error for curl.
+pub fn to_stderr(bytes : &Vec<u8>) -> void {
+  let _ok = write_stderr(bytes);
+}
+
+/// Write the string literal `s` to standard error.
+pub fn lit_to_stderr(s : *const i8) -> void {
+  let _ok = write_stderr(&lit(s));
+}

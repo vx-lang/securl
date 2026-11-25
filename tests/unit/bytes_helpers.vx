@@ -1,0 +1,37 @@
+// Checks the byte-list helpers of curlvx::bytes.
+import std::vec;
+import sys::text;
+import curlvx::bytes;
+
+fn main() -> i32 {
+  let line = lit("  Content-Length: 42 \r\n");
+  let t = trim_blanks(&trim_newline(&line));
+  let colon = find_byte(&t, 58u8, 0);
+  assert(colon == 14, "the colon is at index 14");
+  let name = range_of(&t, 0, colon);
+  assert(eq_lit(&name, "Content-Length"), "the name is Content-Length");
+  assert(eq_lit_nocase(&name, "content-length"), "case does not count");
+  assert(!eq_lit(&name, "content-length"), "case counts for eq_lit");
+  let value = rest_from(&t, colon + 1);
+  assert(parse_u64(&value).unwrap_or(0u64) == 42u64, "the value is 42");
+  assert(parse_u64(&lit("4x2")).is_none(), "4x2 is not a number");
+  assert(parse_u64(&lit("")).is_none(), "an empty text is not a number");
+  let mut out = Vec<u8>::new();
+  push_u64(&mut out, 0u64);
+  push_lit(&mut out, " ");
+  push_i64(&mut out, -1234i64);
+  assert(eq_lit(&out, "0 -1234"), "decimal digits");
+  assert(find_seq(&lit("abcabd"), &lit("abd"), 0) == 3, "find_seq finds abd");
+  assert(rfind_byte(&lit("a/b/c"), 47u8) == 3, "the last slash");
+  assert(starts_lit_nocase(&lit("HTTP/1.1 200"), "http/"), "starts with http/");
+  assert(hex_value(102u8) == 15 && hex_value(71u8) == -1, "hex digits");
+  match to_string(&lit("127.0.0.1:80")) {
+    Option<String>::Some(s) => {
+      assert(s.len() == 12, "the String has 12 bytes");
+    },
+    Option<String>::None() => {
+      panic("to_string gave None");
+    }
+  }
+  return 0;
+}

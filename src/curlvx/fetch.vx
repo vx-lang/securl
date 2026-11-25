@@ -1,0 +1,831 @@
+// One transfer: connect, send the request, read the response, and follow redirects with `-L`.
+//
+// The caller gives the network right (`&Network`) and the outputs. This file cannot open a
+// file, because it gets no `&Files`.
+import core::option;
+import core::result;
+import std::net;
+import std::vec;
+import sys::text;
+import curlvx::bytes;
+import curlvx::conn;
+import curlvx::failure;
+import curlvx::http;
+import curlvx::options;
+import curlvx::output;
+import curlvx::url;
+
+/// What `-w` can print about a transfer.
+struct TransferInfo {
+  http_code : i32,
+  http_version : i32,
+  size_download : i64,
+  size_header : i64,
+  size_request : i64,
+  num_redirects : i32,
+  url_effective : Vec<u8>,
+  content_type : Vec<u8>,
+  has_redirect_url : bool,
+  redirect_url : Vec<u8>,
+  method : Vec<u8>,
+  num_connects : i32,
+  num_headers : i32,
+  // The headers of the last response, for `-w %header{name}`.
+  headers : Vec<Vec<u8>>,
+  // The headers of all responses of the transfer, for `-w %header{name:all:}`.
+  all_headers : Vec<Vec<u8>>,
+  // The `host:port` of the last connection.
+  remote_address : Vec<u8>,
+  referer : Vec<u8>,
+  // The header bytes of all responses of the transfer, for curl's limit.
+  size_header_total : i64,
+}
+
+/// A `TransferInfo` before the transfer starts.
+pub fn new_info() -> TransferInfo {
+  return TransferInfo {
+    http_code : 0,
+    http_version : 0,
+    size_download : 0i64,
+    size_header : 0i64,
+    size_request : 0i64,
+    num_redirects : 0,
+    url_effective : Vec<u8>::new(),
+    content_type : Vec<u8>::new(),
+    has_redirect_url : false,
+    redirect_url : Vec<u8>::new(),
+    method : Vec<u8>::new(),
+    num_connects : 0,
+    num_headers : 0,
+    headers : Vec<Vec<u8>>::new(),
+    all_headers : Vec<Vec<u8>>::new(),
+    remote_address : Vec<u8>::new(),
+    referer : Vec<u8>::new(),
+    size_header_total : 0i64
+  };
+}
+
+/// Where the bytes of one transfer go.
+struct Sinks {
+  body : Output,
+  headers : Output,
+  has_headers : bool,
+}
+
+/// Write `bytes` to standard error with `prefix` before each line, for `-v`.
+fn verbose_lines(prefix : *const i8, bytes : &Vec<u8>) -> void {
+  let mut out = Vec<u8>::new();
+  let mut start = 0;
+  while start < bytes.len() {
+    let mut end = find_byte(bytes, 10u8, start);
+    if end < 0 {
+      end = bytes.len() - 1;
+    }
+    push_lit(&mut out, prefix);
+    append_range(&mut out, bytes, start, end + 1);
+    start = end + 1;
+  }
+  to_stderr(&out);
+}
+
+fn verbose_info(text : &Vec<u8>) -> void {
+  let mut out = lit("* ");
+  append(&mut out, text);
+  push_lit(&mut out, "\n");
+  to_stderr(&out);
+}
+
+/// `host:port` with brackets around an IPv6 address.
+fn address_of(host : &Vec<u8>, port : i32) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  let v6 = find_byte(host, 58u8, 0) >= 0 && !(host.len() > 0 && host.get(0) == 91u8);
+  if v6 {
+    push_lit(&mut out, "[");
+  }
+  append(&mut out, host);
+  if v6 {
+    push_lit(&mut out, "]");
+  }
+  push_lit(&mut out, ":");
+  push_u64(&mut out, port as u64);
+  return out;
+}
+
+/// The fields of `text` split at each `:`, with `[..]` kept whole.
+fn colon_fields(text : &Vec<u8>) -> Vec<Vec<u8>> {
+  let mut fields = Vec<Vec<u8>>::new();
+  let mut cur = Vec<u8>::new();
+  let mut in_brackets = false;
+  for b in text.iter() {
+    if *b == 91u8 {
+      in_brackets = true;
+    }
+    if *b == 93u8 {
+      in_brackets = false;
+    }
+    if *b == 58u8 && !in_brackets {
+      fields.push(cur);
+      cur = Vec<u8>::new();
+    } else {
+      cur.push(*b);
+    }
+  }
+  fields.push(cur);
+  return fields;
+}
+
+fn port_matches(field : &Vec<u8>, port : i32) -> bool {
+  if field.len() == 0 {
+    return true;
+  }
+  match parse_u64(field) {
+    Option<u64>::Some(p) => {
+      return (p as i32) == port;
+    },
+    Option<u64>::None() => {
+      return false;
+    }
+  }
+}
+
+/// The address to connect to for `u`, after `--connect-to` and `--resolve`. A rule with a
+/// port that is not a number is an error, as in curl.
+fn connect_address(cfg : &Config, u : &Url) -> Result<Vec<u8>, Failure> {
+  let mut host = clone_bytes(&u.host);
+  let mut port = u.port;
+  // `--connect-to HOST1:PORT1:HOST2:PORT2`. An empty field matches any host or port, or keeps
+  // the one of the URL.
+  for rule in cfg.connect_to.iter() {
+    let f = colon_fields(rule);
+    if f.len() == 4 {
+      let host_ok = f.get_ref(0).len() == 0 || eq_nocase(f.get_ref(0), &u.host);
+      if host_ok && port_matches(f.get_ref(1), u.port) {
+        if f.get_ref(2).len() > 0 {
+          host = clone_bytes(f.get_ref(2));
+          if host.len() > 1 && host.get(0) == 91u8 {
+            host = range_of(&host, 1, host.len() - 1);
+          }
+        }
+        if f.get_ref(3).len() > 0 {
+          match parse_u64(f.get_ref(3)) {
+            Option<u64>::Some(p) => {
+              port = p as i32;
+            },
+            Option<u64>::None() => {
+              let mut m = lit("No valid port number in '");
+              append(&mut m, rule);
+              push_lit(&mut m, "'");
+              return Result<Vec<u8>, Failure>::Err(fail_with(SETOPT_OPTION_SYNTAX, m));
+            }
+          }
+        }
+        break;
+      }
+    }
+  }
+  // `--resolve HOST:PORT:ADDRESS[,ADDRESS]` gives the address of a host name.
+  for rule in cfg.resolve.iter() {
+    let mut text = clone_bytes(rule);
+    if text.len() > 0 && (text.get(0) == 43u8 || text.get(0) == 45u8) {
+      text = rest_from(&text, 1);
+    }
+    let f = colon_fields(&text);
+    if f.len() < 3 || parse_u64(f.get_ref(1)).is_none() {
+      let mut m = lit("Couldn't parse CURLOPT_RESOLVE entry '");
+      append(&mut m, rule);
+      push_lit(&mut m, "'");
+      return Result<Vec<u8>, Failure>::Err(fail_with(SETOPT_OPTION_SYNTAX, m));
+    }
+    let any_host = eq_lit(f.get_ref(0), "*");
+    if (any_host || eq_nocase(f.get_ref(0), &host)) && port_matches(f.get_ref(1), port) {
+      let mut addr = clone_bytes(f.get_ref(2));
+      let comma = find_byte(&addr, 44u8, 0);
+      if comma >= 0 {
+        addr = range_of(&addr, 0, comma);
+      }
+      if addr.len() > 1 && addr.get(0) == 91u8 {
+        addr = range_of(&addr, 1, addr.len() - 1);
+      }
+      if addr.len() > 0 {
+        host = addr;
+      }
+      break;
+    }
+  }
+  return Result<Vec<u8>, Failure>::Ok(address_of(&host, port));
+}
+
+// The limits of libcurl for response headers: one header line, all headers of one response,
+// and the number of headers.
+const MAX_HEADER_LINE : i32 = 102400;
+const MAX_HEADERS_SIZE : i64 = 307200i64;
+const MAX_HEADER_COUNT : i32 = 5000;
+
+/// Read one response head: the status line and the headers, up to the empty line. `total`
+/// counts the header bytes of all responses of the transfer, which libcurl also limits.
+fn read_head(c : &mut Conn, raw : bool, total : &mut i64) -> Result<ResponseHead, Failure> {
+  let mut head = empty_head();
+  let mut line = Vec<u8>::new();
+  let n = c.read_line(&mut line)?;
+  if n == 0 {
+    return Result<ResponseHead, Failure>::Err(fail_lit(GOT_NOTHING, "Empty reply from server"));
+  }
+  if !parse_status_line(&line, &mut head) {
+    return Result<ResponseHead, Failure>::Err(fail_lit(UNSUPPORTED_PROTOCOL,
+      "Received HTTP/0.9 when not allowed"));
+  }
+  if head.error_code != 0 {
+    return Result<ResponseHead, Failure>::Ok(head);
+  }
+  append(&mut head.raw, &line);
+  let mut size : i64 = line.len() as i64;
+  let mut index = 1;
+  loop {
+    let mut h = Vec<u8>::new();
+    let got = c.read_line(&mut h)?;
+    if got == 0 {
+      // The peer closed the connection inside the headers.
+      return Result<ResponseHead, Failure>::Ok(head);
+    }
+    index = index + 1;
+    size = size + (h.len() as i64);
+    *total = *total + (h.len() as i64);
+    if h.len() > MAX_HEADER_LINE || index > MAX_HEADER_COUNT {
+      return Result<ResponseHead, Failure>::Err(fail_lit(TOO_LARGE, "Too large response headers"));
+    }
+    if size > MAX_HEADERS_SIZE || *total > MAX_HEADERS_SIZE * 20i64 {
+      let mut m = lit("Too large response headers: ");
+      push_i64(&mut m, size);
+      push_lit(&mut m, " > 307200");
+      return Result<ResponseHead, Failure>::Err(fail_with(RECV_ERROR, m));
+    }
+    if eq_lit(&h, "\r\n") || eq_lit(&h, "\n") {
+      append(&mut head.raw, &h);
+      return Result<ResponseHead, Failure>::Ok(head);
+    }
+    parse_header_line(&h, index, raw, &mut head);
+    if head.error_code != 0 {
+      return Result<ResponseHead, Failure>::Ok(head);
+    }
+    append(&mut head.raw, &h);
+  }
+}
+
+/// Copy exactly `length` body bytes to `out`.
+fn read_length(c : &mut Conn, length : i64, out : &mut Output, info : &mut TransferInfo)
+-> Result<i32, Failure> {
+  let mut left = length;
+  while left > 0i64 {
+    let part = c.read_some(left)?;
+    if part.len() == 0 {
+      let mut m = lit("end of response with ");
+      push_i64(&mut m, left);
+      push_lit(&mut m, " bytes missing");
+      return Result<i32, Failure>::Err(fail_with(PARTIAL_FILE, m));
+    }
+    left = left - (part.len() as i64);
+    info.size_download = info.size_download + (part.len() as i64);
+    let _w = out.write(&part)?;
+  }
+  return Result<i32, Failure>::Ok(0);
+}
+
+/// Copy the body bytes to `out` until the peer closes the connection.
+fn read_to_close(c : &mut Conn, out : &mut Output, info : &mut TransferInfo)
+-> Result<i32, Failure> {
+  loop {
+    let part = c.read_some(1048576i64)?;
+    if part.len() == 0 {
+      return Result<i32, Failure>::Ok(0);
+    }
+    info.size_download = info.size_download + (part.len() as i64);
+    let _w = out.write(&part)?;
+  }
+}
+
+fn bad_chunk() -> Failure {
+  return fail_lit(RECV_ERROR, "Illegal or missing hexadecimal sequence in chunked-encoding");
+}
+
+/// Decode a chunked body and copy its data to `out`. The trailer headers go to `trailers`.
+/// With `raw` (`--raw`), the chunk lines go to `out` as they arrived.
+fn read_chunked(c : &mut Conn, out : &mut Output, info : &mut TransferInfo, trailers : &mut Vec<u8>,
+raw : bool) -> Result<i32, Failure> {
+  loop {
+    let mut line = Vec<u8>::new();
+    let n = c.read_line(&mut line)?;
+    if n == 0 {
+      return Result<i32, Failure>::Err(fail_lit(PARTIAL_FILE,
+        "transfer closed with outstanding read data remaining"));
+    }
+    if raw {
+      let _w = out.write(&line)?;
+    }
+    let mut size : i64 = 0i64;
+    let mut digits = 0;
+    let mut i = 0;
+    while i < line.len() && hex_value(line.get(i)) >= 0 {
+      size = size * 16i64 + (hex_value(line.get(i)) as i64);
+      digits = digits + 1;
+      i = i + 1;
+    }
+    if digits == 0 || digits > 16 {
+      return Result<i32, Failure>::Err(bad_chunk());
+    }
+    if size == 0i64 {
+      loop {
+        let mut t = Vec<u8>::new();
+        let got = c.read_line(&mut t)?;
+        if raw {
+          let _w = out.write(&t)?;
+        }
+        if got == 0 || eq_lit(&t, "\r\n") || eq_lit(&t, "\n") {
+          return Result<i32, Failure>::Ok(0);
+        }
+        if !raw {
+          append(trailers, &t);
+        }
+      }
+    }
+    let _copied = read_length(c, size, out, info)?;
+    let mut end = Vec<u8>::new();
+    let _n = c.read_line(&mut end)?;
+    if raw {
+      let _w = out.write(&end)?;
+    }
+  }
+}
+
+/// The credentials of a transfer, from `-u` or from the URL.
+struct Credentials {
+  present : bool,
+  user : Vec<u8>,
+  password : Vec<u8>,
+}
+
+/// What one request and its response decided.
+struct Hop {
+  // The response is a redirect that `-L` follows.
+  follow : bool,
+  status : i32,
+  location : Vec<u8>,
+}
+
+/// Send one request for `u` and read its response. The body of the response goes to
+/// `sinks`, unless curl follows the redirect that the response gives.
+fn one_hop(network : &Network, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
+req_kind : i32, body : &Vec<u8>, creds : &Credentials, same_host : bool, has_referer : bool,
+referer : &Vec<u8>, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop, Failure> {
+  let mut method = lit("GET");
+  if cfg.has_method {
+    method = clone_bytes(&cfg.method);
+  } else {
+    if req_kind == REQ_POST {
+      method = lit("POST");
+    }
+    if req_kind == REQ_PUT {
+      method = lit("PUT");
+    }
+    if req_kind == REQ_HEAD {
+      method = lit("HEAD");
+    }
+  }
+  info.method = clone_bytes(&method);
+  info.referer = Vec<u8>::new();
+  if has_referer {
+    info.referer = clone_bytes(referer);
+  }
+  let proxy = proxy_for(cfg, u)?;
+  let sends_body = req_kind == REQ_POST || req_kind == REQ_PUT;
+  // A `-H "Transfer-Encoding: chunked"` header, or an upload from standard input, whose
+  // length curl does not know, sends the body in chunks.
+  let custom_chunked = custom_header_has(headers, "Transfer-Encoding", "chunked");
+  let chunked_upload = custom_chunked || (req_kind == REQ_PUT && eq_lit(&cfg.upload, "-")
+    && !cfg.http10 && !has_custom(headers, "Content-Length"));
+  let mut body_length = -1i64;
+  if sends_body {
+    body_length = body.len() as i64;
+  }
+  let req_info = RequestInfo {
+    method : method,
+    kind : req_kind,
+    body_length : body_length,
+    http10 : cfg.http10,
+    headers : clone_lines(headers),
+    has_credentials : creds.present,
+    user : clone_bytes(&creds.user),
+    password : clone_bytes(&creds.password),
+    trusted_host : same_host || cfg.location_trusted,
+    first_host : same_host,
+    has_user_agent : cfg.has_user_agent,
+    user_agent : clone_bytes(&cfg.user_agent),
+    has_referer : has_referer,
+    referer : clone_bytes(referer),
+    has_range : cfg.has_range,
+    range : clone_bytes(&cfg.range),
+    has_cookie : cfg.has_cookie,
+    cookie : clone_bytes(&cfg.cookie),
+    via_proxy : proxy.used,
+    has_proxy_credentials : proxy.has_credentials,
+    proxy_user : clone_bytes(&proxy.user),
+    proxy_password : clone_bytes(&proxy.password),
+    chunked : sends_body && chunked_upload,
+    add_chunked_header : sends_body && chunked_upload && !has_custom(headers, "Transfer-Encoding")
+  };
+
+  let mut address = Vec<u8>::new();
+  if proxy.used {
+    address = connect_address(cfg, &proxy.url)?;
+  } else {
+    address = connect_address(cfg, u)?;
+  }
+  if cfg.verbose {
+    let mut m = lit("  Trying ");
+    append(&mut m, &address);
+    push_lit(&mut m, "...");
+    verbose_info(&m);
+  }
+  let mut c = open_conn(network, &address, &u.host, u.port)?;
+  info.num_connects = info.num_connects + 1;
+  info.remote_address = clone_bytes(&address);
+  if cfg.verbose {
+    let mut m = lit("Connected to ");
+    append(&mut m, &host_text(u));
+    push_lit(&mut m, " port ");
+    push_u64(&mut m, u.port as u64);
+    verbose_info(&m);
+  }
+  let request = build_request(u, &req_info);
+  if cfg.verbose {
+    verbose_lines("> ", &request);
+  }
+  info.size_request = info.size_request + (request.len() as i64);
+  let _sent = c.send(&request)?;
+  if sends_body {
+    if chunked_upload {
+      let _sent_body = c.send(&chunk_encode(body))?;
+    } else {
+      let _sent_body = c.send(body)?;
+    }
+    info.size_request = info.size_request + (body.len() as i64);
+  }
+
+  // Skip each informational response, such as `100 Continue`. With `-i`, curl shows it.
+  let mut head = read_head(&mut c, cfg.raw, &mut info.size_header_total)?;
+  while head.error_code == 0 && head.status >= 100 && head.status < 200 && head.status != 101 {
+    info.size_header = info.size_header + (head.raw.len() as i64);
+    if cfg.verbose {
+      verbose_lines("< ", &head.raw);
+    }
+    if cfg.include {
+      let _w = sinks.body.write(&head.raw)?;
+    }
+    if sinks.has_headers {
+      let _w = sinks.headers.write(&head.raw)?;
+    }
+    head = read_head(&mut c, cfg.raw, &mut info.size_header_total)?;
+  }
+  if head.error_code != 0 {
+    // curl writes the headers before the bad one, and stops.
+    if cfg.include || cfg.head {
+      let _w = sinks.body.write(&head.raw)?;
+    }
+    return Result<Hop, Failure>::Err(fail_with(head.error_code, clone_bytes(&head.error)));
+  }
+  if head.bad_length && !has_no_body(head.status, req_kind) {
+    return Result<Hop, Failure>::Err(fail_lit(WEIRD_SERVER_REPLY, "Invalid Content-Length: value"));
+  }
+  info.http_code = head.status;
+  info.http_version = head.version;
+  info.num_headers = head.headers.len();
+  info.headers = clone_lines(&head.headers);
+  for h in head.headers.iter() {
+    info.all_headers.push(clone_bytes(h));
+  }
+  info.content_type = clone_bytes(&head.content_type);
+  info.size_header = info.size_header + (head.raw.len() as i64);
+  if cfg.verbose {
+    verbose_lines("< ", &head.raw);
+  }
+
+  let redirect = head.has_location && (head.status == 301 || head.status == 302
+    || head.status == 303 || head.status == 307 || head.status == 308);
+  let follow = cfg.follow && redirect;
+  if redirect && !follow {
+    match resolve_location(u, &head.location) {
+      Result<Url, Failure>::Ok(target) => {
+        info.has_redirect_url = true;
+        info.redirect_url = url_text(&target);
+      },
+      Result<Url, Failure>::Err(_e) => {}
+    }
+  }
+
+  let failed = head.status >= 400 && (cfg.fail || cfg.fail_with_body);
+  if failed && !cfg.fail_with_body {
+    return Result<Hop, Failure>::Err(http_error(head.status));
+  }
+
+  if cfg.include || cfg.head {
+    let _w = sinks.body.write(&head.raw)?;
+  }
+  if sinks.has_headers {
+    let _w = sinks.headers.write(&head.raw)?;
+  }
+
+  // The body of a redirect that curl follows goes nowhere.
+  let mut trailers = Vec<u8>::new();
+  // curl does not wait for the body of a redirect that it follows when the connection closes
+  // after it, or when the body has no known end.
+  let unknown_end = (head.content_length < 0i64 || head.has_transfer_encoding) && !head.chunked;
+  let skip_body = follow && (head.close || unknown_end);
+  if !has_no_body(head.status, req_kind) && !skip_body {
+    if follow {
+      let mut discard = null_output();
+      let _b = read_body(&mut c, &head, cfg.raw, &mut discard, info, &mut trailers)?;
+    } else {
+      let _b = read_body(&mut c, &head, cfg.raw, &mut sinks.body, info, &mut trailers)?;
+    }
+  }
+  if trailers.len() > 0 {
+    if cfg.include {
+      let _w = sinks.body.write(&trailers)?;
+    }
+    if sinks.has_headers {
+      let _w = sinks.headers.write(&trailers)?;
+    }
+  }
+  if failed {
+    return Result<Hop, Failure>::Err(http_error(head.status));
+  }
+  if cfg.verbose && !follow {
+    let mut m = lit("Connection #0 to host ");
+    append(&mut m, &host_text(u));
+    push_lit(&mut m, " left intact");
+    verbose_info(&m);
+  }
+  return Result<Hop, Failure>::Ok(Hop {
+    follow : follow,
+    status : head.status,
+    location : clone_bytes(&head.location)
+  });
+}
+
+/// `body` as one chunk and the last chunk, for `Transfer-Encoding: chunked`.
+fn chunk_encode(body : &Vec<u8>) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  if body.len() > 0 {
+    let mut digits = Vec<u8>::new();
+    let mut n = body.len();
+    while n > 0 {
+      digits.push(ascii_lower(hex_digit((n % 16) as u8)));
+      n = n / 16;
+    }
+    let mut i = digits.len() - 1;
+    while i >= 0 {
+      out.push(digits.get(i));
+      i = i - 1;
+    }
+    push_lit(&mut out, "\r\n");
+    append(&mut out, body);
+    push_lit(&mut out, "\r\n");
+  }
+  push_lit(&mut out, "0\r\n\r\n");
+  return out;
+}
+
+/// Whether a `-H` header called `name` has `word` in its value, in any case.
+fn custom_header_has(headers : &Vec<Vec<u8>>, name : *const i8, word : *const i8) -> bool {
+  for line in headers.iter() {
+    let h = split_header(line);
+    if !h.ignored && eq_lit_nocase(&h.name, name)
+       && find_seq(&to_lower(&h.value), &lit(word), 0) >= 0 {
+      return true;
+    }
+  }
+  return false;
+}
+
+fn http_error(status : i32) -> Failure {
+  let mut m = lit("The requested URL returned error: ");
+  push_u64(&mut m, status as u64);
+  return fail_with(HTTP_RETURNED_ERROR, m);
+}
+
+/// The HTTP proxy of a request, from `-x`.
+struct Proxy {
+  used : bool,
+  // The proxy as a URL: its host and port are where curl connects.
+  url : Url,
+  has_credentials : bool,
+  user : Vec<u8>,
+  password : Vec<u8>,
+}
+
+/// Whether `--noproxy` names `host`: `*`, the host itself, or a domain that it ends with.
+fn no_proxy_for(list : &Vec<u8>, host : &Vec<u8>) -> bool {
+  let mut start = 0;
+  while start < list.len() {
+    let mut end = find_byte(list, 44u8, start);
+    if end < 0 {
+      end = list.len();
+    }
+    let mut name = trim_blanks(&range_of(list, start, end));
+    start = end + 1;
+    if eq_lit(&name, "*") {
+      return true;
+    }
+    if name.len() > 0 && name.get(0) == 46u8 {
+      name = rest_from(&name, 1);
+    }
+    if name.len() == 0 || name.len() > host.len() {
+      continue;
+    }
+    let tail_start = host.len() - name.len();
+    if eq_nocase(&rest_from(host, tail_start), &name)
+       && (tail_start == 0 || host.get(tail_start - 1) == 46u8) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// The proxy for a request to `u`. curl-vx speaks only to HTTP proxies.
+fn proxy_for(cfg : &Config, u : &Url) -> Result<Proxy, Failure> {
+  let none = Proxy {
+    used : false,
+    url : clone_url(u),
+    has_credentials : false,
+    user : Vec<u8>::new(),
+    password : Vec<u8>::new()
+  };
+  if !cfg.has_proxy || no_proxy_for(&cfg.noproxy, &u.host) {
+    return Result<Proxy, Failure>::Ok(none);
+  }
+  let mut text = clone_bytes(&cfg.proxy);
+  let sep = find_seq(&text, &lit("://"), 0);
+  if sep >= 0 {
+    let scheme = to_lower(&range_of(&text, 0, sep));
+    if !eq_lit(&scheme, "http") {
+      let mut m = lit("Unsupported proxy scheme for '");
+      append(&mut m, &cfg.proxy);
+      push_lit(&mut m, "'");
+      return Result<Proxy, Failure>::Err(fail_with(COULDNT_CONNECT, m));
+    }
+  } else {
+    text = lit_then("http://", &text);
+  }
+  let mut url = parse_url(&text, false)?;
+  if !has_port_in(&text) {
+    url.port = 1080;
+  }
+  let mut has_credentials = url.has_user;
+  let mut user = clone_bytes(&url.user);
+  let mut password = clone_bytes(&url.password);
+  if cfg.has_proxy_user {
+    has_credentials = true;
+    let colon = find_byte(&cfg.proxy_user, 58u8, 0);
+    if colon >= 0 {
+      user = range_of(&cfg.proxy_user, 0, colon);
+      password = rest_from(&cfg.proxy_user, colon + 1);
+    } else {
+      user = clone_bytes(&cfg.proxy_user);
+      password = Vec<u8>::new();
+    }
+  }
+  return Result<Proxy, Failure>::Ok(Proxy {
+    used : true,
+    url : url,
+    has_credentials : has_credentials,
+    user : user,
+    password : password
+  });
+}
+
+/// Whether the authority of the URL `text` gives a port.
+fn has_port_in(text : &Vec<u8>) -> bool {
+  let start = find_seq(text, &lit("://"), 0) + 3;
+  let mut end = find_byte(text, 47u8, start);
+  if end < 0 {
+    end = text.len();
+  }
+  let authority = range_of(text, start, end);
+  let at = rfind_byte(&authority, 64u8);
+  let host_port = rest_from(&authority, at + 1);
+  let close = find_byte(&host_port, 93u8, 0);
+  return find_byte(&host_port, 58u8, close + 1) >= 0;
+}
+
+/// The credentials of `-u user:password`, or else of the URL.
+fn credentials_of(cfg : &Config, u : &Url) -> Credentials {
+  if cfg.has_user {
+    let colon = find_byte(&cfg.user, 58u8, 0);
+    if colon >= 0 {
+      return Credentials {
+        present : true,
+        user : range_of(&cfg.user, 0, colon),
+        password : rest_from(&cfg.user, colon + 1)
+      };
+    }
+    return Credentials {
+      present : true,
+      user : clone_bytes(&cfg.user),
+      password : Vec<u8>::new()
+    };
+  }
+  return Credentials {
+    present : u.has_user,
+    user : clone_bytes(&u.user),
+    password : clone_bytes(&u.password)
+  };
+}
+
+/// Run the transfer of `url_text`. `body` is the request body for a POST or a PUT. `kind` is
+/// `REQ_GET`, `REQ_POST`, `REQ_PUT` or `REQ_HEAD`.
+pub fn run_transfer(network : &Network, cfg : &Config, headers : &Vec<Vec<u8>>,
+url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, sinks : &mut Sinks, info : &mut TransferInfo)
+-> Result<i32, Failure> {
+  let first = parse_url(url_text, cfg.path_as_is)?;
+  let mut creds = credentials_of(cfg, &first);
+  let first_port = first.port;
+  let first_host = first.host;
+  // The URL of the current request, as text. Each turn of the loop parses it again, so that no
+  // value of one turn outlives the turn.
+  let mut current = clone_bytes(url_text);
+  let mut path_as_is = cfg.path_as_is;
+  let mut req_kind = kind;
+  let mut has_referer = cfg.has_referer;
+  let mut referer = clone_bytes(&cfg.referer);
+  let mut redirects = 0;
+  loop {
+    let u = parse_url(&current, path_as_is)?;
+    info.url_effective = url_text(&u);
+    if !eq_lit(&u.scheme, "http") {
+      let mut m = lit("Protocol \"");
+      append(&mut m, &u.scheme);
+      push_lit(&mut m, "\" not supported");
+      return Result<i32, Failure>::Err(fail_with(UNSUPPORTED_PROTOCOL, m));
+    }
+    let same_host = eq_nocase(&u.host, &first_host) && u.port == first_port;
+    if redirects > 0 && !cfg.has_user && u.has_user {
+      creds = credentials_of(cfg, &u);
+    }
+    let hop = one_hop(network, cfg, headers, &u, req_kind, body, &creds, same_host, has_referer,
+      &referer, sinks, info)?;
+    if !hop.follow {
+      return Result<i32, Failure>::Ok(0);
+    }
+    redirects = redirects + 1;
+    if cfg.max_redirs >= 0i64 && (redirects as i64) > cfg.max_redirs {
+      let mut m = lit("Maximum (");
+      push_i64(&mut m, cfg.max_redirs);
+      push_lit(&mut m, ") redirects followed");
+      return Result<i32, Failure>::Err(fail_with(TOO_MANY_REDIRECTS, m));
+    }
+    let next = resolve_location(&u, &hop.location)?;
+    let next_text = url_text(&next);
+    if cfg.verbose {
+      let mut m = lit("Issue another request to this URL: '");
+      append(&mut m, &next_text);
+      push_lit(&mut m, "'");
+      verbose_info(&m);
+    }
+    // 301, 302 and 303 turn a POST into a GET, as browsers do. 303 turns a PUT into a GET too.
+    // 307 and 308 keep the method and the body.
+    let to_get = hop.status == 301 || hop.status == 302 || hop.status == 303;
+    if req_kind == REQ_POST && to_get {
+      req_kind = REQ_GET;
+    }
+    if req_kind == REQ_PUT && hop.status == 303 {
+      req_kind = REQ_GET;
+    }
+    if cfg.auto_referer {
+      has_referer = true;
+      referer = url_text(&u);
+    }
+    // The URL of a redirect is already normalized.
+    current = next_text;
+    path_as_is = true;
+    info.num_redirects = redirects;
+  }
+}
+
+fn read_body(c : &mut Conn, head : &ResponseHead, raw : bool, out : &mut Output,
+info : &mut TransferInfo, trailers : &mut Vec<u8>) -> Result<i32, Failure> {
+  if head.chunked {
+    return read_chunked(c, out, info, trailers, raw);
+  }
+  if head.content_length >= 0i64 && !head.has_transfer_encoding {
+    return read_length(c, head.content_length, out, info);
+  }
+  return read_to_close(c, out, info);
+}
+
+/// A copy of each line of `lines`.
+pub fn clone_lines(lines : &Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+  let mut out = Vec<Vec<u8>>::new();
+  for l in lines.iter() {
+    out.push(clone_bytes(l));
+  }
+  return out;
+}

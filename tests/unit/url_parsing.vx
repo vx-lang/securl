@@ -1,0 +1,84 @@
+// Checks how curlvx::url parses URLs and resolves the Location of a redirect.
+import core::result;
+import std::vec;
+import sys::text;
+import curlvx::bytes;
+import curlvx::failure;
+import curlvx::url;
+
+fn parsed(s : *const i8) -> Url {
+  match parse_url(&lit(s), false) {
+    Result<Url, Failure>::Ok(u) => {
+      return u;
+    },
+    Result<Url, Failure>::Err(_f) => {
+      panic("a URL that should parse did not");
+    }
+  }
+}
+
+fn error_code(s : *const i8) -> i32 {
+  match parse_url(&lit(s), false) {
+    Result<Url, Failure>::Ok(_u) => {
+      return 0;
+    },
+    Result<Url, Failure>::Err(f) => {
+      return f.code;
+    }
+  }
+}
+
+fn resolved(base : *const i8, location : *const i8) -> Vec<u8> {
+  let b = parsed(base);
+  match resolve_location(&b, &lit(location)) {
+    Result<Url, Failure>::Ok(u) => {
+      return url_text(&u);
+    },
+    Result<Url, Failure>::Err(_f) => {
+      panic("a Location that should resolve did not");
+    }
+  }
+}
+
+fn main() -> i32 {
+  let a = parsed("http://user:p%40ss@Example.com:8080/a/b?x=1#frag");
+  assert(eq_lit(&a.scheme, "http"), "scheme");
+  assert(a.has_user && eq_lit(&a.user, "user"), "user");
+  assert(a.has_password && eq_lit(&a.password, "p@ss"), "the password is decoded");
+  assert(eq_lit(&a.host, "Example.com"), "host");
+  assert(a.port == 8080, "port");
+  assert(eq_lit(&a.path, "/a/b?x=1"), "the fragment is dropped");
+  assert(eq_lit(&host_header_value(&a), "Example.com:8080"), "Host header keeps the port");
+
+  let b = parsed("example.org");
+  assert(eq_lit(&b.scheme, "http") && b.port == 80, "no scheme means http");
+  assert(eq_lit(&b.path, "/"), "an empty path is /");
+  assert(eq_lit(&host_header_value(&b), "example.org"), "Host header drops port 80");
+
+  let c = parsed("HTTP://[::1]:9000?q");
+  assert(c.ipv6 && eq_lit(&c.host, "::1"), "IPv6 host without brackets");
+  assert(eq_lit(&host_text(&c), "[::1]"), "IPv6 host with brackets");
+  assert(eq_lit(&c.path, "/?q"), "a query with no path gets /");
+  assert(eq_lit(&c.scheme, "http"), "the scheme is lowercase");
+
+  let d = parsed("http://h/a/./b/../c/");
+  assert(eq_lit(&d.path, "/a/c/"), "dot segments are removed");
+  let e = parsed("http://h/a/b/..");
+  assert(eq_lit(&e.path, "/a/"), "a final .. keeps the slash");
+
+  assert(error_code("http://:80/") == URL_MALFORMAT, "no host");
+  assert(error_code("http://h:99999/") == URL_MALFORMAT, "port too large");
+  assert(error_code("http://h:8x/") == URL_MALFORMAT, "port not a number");
+
+  assert(eq_lit(&remote_file_name(&parsed("http://h/dir/file.txt?x")), "file.txt"), "-O name");
+  assert(remote_file_name(&parsed("http://h/dir/")).len() == 0, "-O name of a folder");
+
+  assert(eq_lit(&resolved("http://h/a/b", "/c"), "http://h/c"), "absolute path");
+  assert(eq_lit(&resolved("http://h/a/b", "c"), "http://h/a/c"), "relative path");
+  assert(eq_lit(&resolved("http://h/a/b?q", "?z"), "http://h/a/b?z"), "query only");
+  assert(eq_lit(&resolved("http://h:81/a/b", "../x y"), "http://h:81/x%20y"), "dots, space");
+  assert(eq_lit(&resolved("http://h/a", "/p?q=a b"), "http://h/p?q=a+b"), "space in query");
+  assert(eq_lit(&resolved("http://h/a", "//other:82/p"), "http://other:82/p"), "no scheme");
+  assert(eq_lit(&resolved("http://h/a", "https://s/"), "https://s/"), "whole URL");
+  return 0;
+}

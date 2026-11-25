@@ -1,0 +1,296 @@
+// Helpers for byte lists (`Vec<u8>`). Vx has no slices and no byte-string type yet, so the
+// whole program keeps text as `Vec<u8>` and works on index ranges.
+import core::option;
+import std::vec;
+import sys::text;
+
+/// A copy of `src`.
+pub fn clone_bytes(src : &Vec<u8>) -> Vec<u8> {
+  let mut out = Vec<u8>::with_capacity(src.len());
+  for b in src.iter() {
+    out.push(*b);
+  }
+  return out;
+}
+
+/// The bytes of `src` from `start` up to `end`, without `end`.
+pub fn range_of(src : &Vec<u8>, start : i32, end : i32) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  let mut i = start;
+  while i < end {
+    out.push(src.get(i));
+    i = i + 1;
+  }
+  return out;
+}
+
+/// The bytes of `src` from `start` to its end.
+pub fn rest_from(src : &Vec<u8>, start : i32) -> Vec<u8> {
+  return range_of(src, start, src.len());
+}
+
+/// Add all bytes of `src` to the end of `dst`.
+pub fn append(dst : &mut Vec<u8>, src : &Vec<u8>) -> void {
+  for b in src.iter() {
+    dst.push(*b);
+  }
+}
+
+/// Add the bytes of `src` from `start` up to `end` to the end of `dst`.
+pub fn append_range(dst : &mut Vec<u8>, src : &Vec<u8>, start : i32, end : i32) -> void {
+  let mut i = start;
+  while i < end {
+    dst.push(src.get(i));
+    i = i + 1;
+  }
+}
+
+/// The lowercase form of an ASCII letter. Other bytes stay the same.
+pub fn ascii_lower(b : u8) -> u8 {
+  if b >= 65u8 && b <= 90u8 {
+    return b + 32u8;
+  }
+  return b;
+}
+
+/// Whether `b` is a space or a tab.
+pub fn is_blank(b : u8) -> bool {
+  return b == 32u8 || b == 9u8;
+}
+
+/// Whether `b` is a decimal digit.
+pub fn is_digit(b : u8) -> bool {
+  return b >= 48u8 && b <= 57u8;
+}
+
+/// Whether `a` and `b` hold the same bytes.
+pub fn same_bytes(a : &Vec<u8>, b : &Vec<u8>) -> bool {
+  if a.len() != b.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.len() {
+    if a.get(i) != b.get(i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Whether `a` and `b` hold the same bytes when ASCII case does not count.
+pub fn eq_nocase(a : &Vec<u8>, b : &Vec<u8>) -> bool {
+  if a.len() != b.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.len() {
+    if ascii_lower(a.get(i)) != ascii_lower(b.get(i)) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Whether `a` holds the bytes of the string literal `s`.
+pub fn eq_lit(a : &Vec<u8>, s : *const i8) -> bool {
+  return same_bytes(a, &lit(s));
+}
+
+/// Whether `a` holds the bytes of the string literal `s` when ASCII case does not count.
+pub fn eq_lit_nocase(a : &Vec<u8>, s : *const i8) -> bool {
+  return eq_nocase(a, &lit(s));
+}
+
+/// Whether the bytes of `a` from `at` on start with `prefix`.
+pub fn has_at(a : &Vec<u8>, at : i32, prefix : &Vec<u8>) -> bool {
+  if at < 0 || at + prefix.len() > a.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < prefix.len() {
+    if a.get(at + i) != prefix.get(i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Whether `a` starts with the string literal `s`.
+pub fn starts_lit(a : &Vec<u8>, s : *const i8) -> bool {
+  return has_at(a, 0, &lit(s));
+}
+
+/// Whether `a` starts with the string literal `s` when ASCII case does not count.
+pub fn starts_lit_nocase(a : &Vec<u8>, s : *const i8) -> bool {
+  let p = lit(s);
+  if p.len() > a.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < p.len() {
+    if ascii_lower(a.get(i)) != ascii_lower(p.get(i)) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// The index of the first `b` in `a` at or after `from`, or -1.
+pub fn find_byte(a : &Vec<u8>, b : u8, from : i32) -> i32 {
+  let mut i = from;
+  while i < a.len() {
+    if a.get(i) == b {
+      return i;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+/// The index of the last `b` in `a`, or -1.
+pub fn rfind_byte(a : &Vec<u8>, b : u8) -> i32 {
+  let mut i = a.len() - 1;
+  while i >= 0 {
+    if a.get(i) == b {
+      return i;
+    }
+    i = i - 1;
+  }
+  return -1;
+}
+
+/// The index of the first copy of `needle` in `a` at or after `from`, or -1.
+pub fn find_seq(a : &Vec<u8>, needle : &Vec<u8>, from : i32) -> i32 {
+  let mut i = from;
+  while i + needle.len() <= a.len() {
+    if has_at(a, i, needle) {
+      return i;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+/// `a` without the spaces and tabs at its start and its end.
+pub fn trim_blanks(a : &Vec<u8>) -> Vec<u8> {
+  let mut start = 0;
+  let mut end = a.len();
+  while start < end && is_blank(a.get(start)) {
+    start = start + 1;
+  }
+  while end > start && is_blank(a.get(end - 1)) {
+    end = end - 1;
+  }
+  return range_of(a, start, end);
+}
+
+/// `a` without the CR and LF bytes at its end.
+pub fn trim_newline(a : &Vec<u8>) -> Vec<u8> {
+  let mut end = a.len();
+  while end > 0 && (a.get(end - 1) == 13u8 || a.get(end - 1) == 10u8) {
+    end = end - 1;
+  }
+  return range_of(a, 0, end);
+}
+
+/// The decimal number that is all of `a`, or None. Leading and trailing blanks are allowed.
+pub fn parse_u64(a : &Vec<u8>) -> Option<u64> {
+  let t = trim_blanks(a);
+  if t.len() == 0 {
+    return Option<u64>::None();
+  }
+  let mut v : u64 = 0u64;
+  let mut i = 0;
+  while i < t.len() {
+    let b = t.get(i);
+    if !is_digit(b) {
+      return Option<u64>::None();
+    }
+    let d = (b - 48u8) as u64;
+    // Refuse a number that does not fit in 63 bits.
+    if v > 922337203685477579u64 {
+      return Option<u64>::None();
+    }
+    v = v * 10u64 + d;
+    i = i + 1;
+  }
+  return Option<u64>::Some(v);
+}
+
+/// The value of a hexadecimal digit, or -1.
+pub fn hex_value(b : u8) -> i32 {
+  if b >= 48u8 && b <= 57u8 {
+    return (b - 48u8) as i32;
+  }
+  if b >= 97u8 && b <= 102u8 {
+    return (b - 87u8) as i32;
+  }
+  if b >= 65u8 && b <= 70u8 {
+    return (b - 55u8) as i32;
+  }
+  return -1;
+}
+
+/// The hexadecimal digit for `v`, which is 0 to 15, in upper case.
+pub fn hex_digit(v : u8) -> u8 {
+  if v < 10u8 {
+    return 48u8 + v;
+  }
+  return 55u8 + v;
+}
+
+/// Add the decimal digits of `v` to `dst`.
+pub fn push_u64(dst : &mut Vec<u8>, v : u64) -> void {
+  if v == 0u64 {
+    dst.push(48u8);
+    return;
+  }
+  let mut digits = Vec<u8>::new();
+  let mut n = v;
+  while n > 0u64 {
+    digits.push(48u8 + ((n % 10u64) as u8));
+    n = n / 10u64;
+  }
+  let mut i = digits.len() - 1;
+  while i >= 0 {
+    dst.push(digits.get(i));
+    i = i - 1;
+  }
+}
+
+/// Add the decimal digits of `v` to `dst`. A negative `v` gets a `-`.
+pub fn push_i64(dst : &mut Vec<u8>, v : i64) -> void {
+  if v < 0i64 {
+    dst.push(45u8);
+    push_u64(dst, (0i64 - v) as u64);
+    return;
+  }
+  push_u64(dst, v as u64);
+}
+
+/// The decimal digits of `v`.
+pub fn u64_text(v : u64) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  push_u64(&mut out, v);
+  return out;
+}
+
+/// The bytes of the string literal `s` followed by the bytes of `rest`.
+pub fn lit_then(s : *const i8, rest : &Vec<u8>) -> Vec<u8> {
+  let mut out = lit(s);
+  append(&mut out, rest);
+  return out;
+}
+
+/// The lowercase form of all of `a`.
+pub fn to_lower(a : &Vec<u8>) -> Vec<u8> {
+  let mut out = Vec<u8>::with_capacity(a.len());
+  for b in a.iter() {
+    out.push(ascii_lower(*b));
+  }
+  return out;
+}

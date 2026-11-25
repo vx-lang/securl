@@ -1,0 +1,168 @@
+// A TCP connection with a read buffer, for reading a response line by line and then its body.
+import core::option;
+import core::result;
+import std::net;
+import std::string;
+import std::vec;
+import sys::text;
+import curlvx::bytes;
+import curlvx::failure;
+
+const READ_BUFFER_SIZE : i32 = 16384;
+
+struct Conn {
+  stream : TcpStream,
+  buffer : Vec<u8>,
+  // The next byte of `buffer` to give.
+  start : i32,
+  // The end of the bytes in `buffer` that are not given yet.
+  end : i32,
+  // The peer closed the connection.
+  closed : bool,
+}
+
+/// The failure of a receive that did not work.
+fn recv_failure(e : NetError) -> Failure {
+  match e {
+    NetError::Reset() => {
+      return fail_lit(RECV_ERROR, "Recv failure: Connection reset by peer");
+    },
+    _ => {
+      return fail_lit(RECV_ERROR, "Recv failure");
+    }
+  }
+}
+
+/// Connect to `address`, written as `host:port`. `host` and `port` are for the messages.
+/// The caller needs the network right.
+pub fn open_conn(network : &Network, address : &Vec<u8>, host : &Vec<u8>, port : i32)
+-> Result<Conn, Failure> {
+  let mut target = String::new();
+  match to_string(address) {
+    Option<String>::Some(s) => {
+      target = s;
+    },
+    Option<String>::None() => {
+      return Result<Conn, Failure>::Err(fail_lit(URL_MALFORMAT,
+        "URL rejected: Malformed input to a URL function"));
+    }
+  }
+  match TcpStream::connect(network, &target) {
+    Result<TcpStream, NetError>::Ok(stream) => {
+      let mut buffer = Vec<u8>::new();
+      let mut i = 0;
+      while i < READ_BUFFER_SIZE {
+        buffer.push(0u8);
+        i = i + 1;
+      }
+      return Result<Conn, Failure>::Ok(Conn {
+        stream : stream,
+        buffer : buffer,
+        start : 0,
+        end : 0,
+        closed : false
+      });
+    },
+    Result<TcpStream, NetError>::Err(e) => {
+      match e {
+        NetError::BadAddress() => {
+          let mut m = lit("Could not resolve host: ");
+          append(&mut m, host);
+          return Result<Conn, Failure>::Err(fail_with(COULDNT_RESOLVE_HOST, m));
+        },
+        _ => {
+          let mut m = lit("Failed to connect to ");
+          append(&mut m, host);
+          push_lit(&mut m, " port ");
+          push_u64(&mut m, port as u64);
+          push_lit(&mut m, ": Could not connect to server");
+          return Result<Conn, Failure>::Err(fail_with(COULDNT_CONNECT, m));
+        }
+      }
+    }
+  }
+}
+
+impl Conn {
+  /// Send all of `bytes`.
+  pub fn send(self : &mut Conn, bytes : &Vec<u8>) -> Result<i32, Failure> {
+    if bytes.len() == 0 {
+      return Result<i32, Failure>::Ok(0);
+    }
+    match self.stream.write_all(bytes) {
+      Result<u64, NetError>::Ok(_n) => {
+        return Result<i32, Failure>::Ok(0);
+      },
+      Result<u64, NetError>::Err(_e) => {
+        return Result<i32, Failure>::Err(fail_lit(SEND_ERROR,
+          "Send failure: Connection reset by peer"));
+      }
+    }
+  }
+
+  /// Read more bytes into the empty buffer. Gives false when the peer closed the connection.
+  fn fill(self : &mut Conn) -> Result<bool, Failure> {
+    if self.closed {
+      return Result<bool, Failure>::Ok(false);
+    }
+    match self.stream.read(&mut self.buffer) {
+      Result<u64, NetError>::Ok(n) => {
+        if n == 0u64 {
+          self.closed = true;
+          return Result<bool, Failure>::Ok(false);
+        }
+        self.start = 0;
+        self.end = n as i32;
+        return Result<bool, Failure>::Ok(true);
+      },
+      Result<u64, NetError>::Err(e) => {
+        return Result<bool, Failure>::Err(recv_failure(e));
+      }
+    }
+  }
+
+  /// Add the next line, with its `\n`, to the end of `line`, and give how many bytes it added.
+  /// The last line before the peer closes can have no `\n`. 0 means that the peer closed the
+  /// connection first.
+  pub fn read_line(self : &mut Conn, line : &mut Vec<u8>) -> Result<i32, Failure> {
+    let mut count = 0;
+    loop {
+      if self.start == self.end {
+        let more = self.fill()?;
+        if !more {
+          return Result<i32, Failure>::Ok(count);
+        }
+      }
+      let mut stop = self.start;
+      let mut found = false;
+      while stop < self.end && !found {
+        found = self.buffer.get(stop) == 10u8;
+        stop = stop + 1;
+      }
+      append_range(line, &self.buffer, self.start, stop);
+      count = count + (stop - self.start);
+      self.start = stop;
+      if found {
+        return Result<i32, Failure>::Ok(count);
+      }
+    }
+  }
+
+  /// Give up to `max` bytes, the buffered ones first. An empty result means that the peer
+  /// closed the connection.
+  pub fn read_some(self : &mut Conn, max : i64) -> Result<Vec<u8>, Failure> {
+    if self.start == self.end {
+      let more = self.fill()?;
+      if !more {
+        return Result<Vec<u8>, Failure>::Ok(Vec<u8>::new());
+      }
+    }
+    let mut stop = self.end;
+    if ((stop - self.start) as i64) > max {
+      stop = self.start + (max as i32);
+    }
+    let out = range_of(&self.buffer, self.start, stop);
+    self.start = stop;
+    return Result<Vec<u8>, Failure>::Ok(out);
+  }
+}

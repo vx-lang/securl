@@ -1,0 +1,95 @@
+// Base64 for Basic authentication, and the URL encoding of `--data-urlencode`.
+import std::vec;
+import curlvx::bytes;
+
+/// The Base64 digit for the 6-bit value `v`.
+fn base64_digit(v : u8) -> u8 {
+  if v < 26u8 {
+    return 65u8 + v;
+  }
+  if v < 52u8 {
+    return 97u8 + (v - 26u8);
+  }
+  if v < 62u8 {
+    return 48u8 + (v - 52u8);
+  }
+  if v == 62u8 {
+    return 43u8;
+  }
+  return 47u8;
+}
+
+/// `data` in Base64, with `=` padding, as RFC 4648 says.
+pub fn base64(data : &Vec<u8>) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  let n = data.len();
+  let mut i = 0;
+  while i + 2 < n {
+    let a = data.get(i);
+    let b = data.get(i + 1);
+    let c = data.get(i + 2);
+    out.push(base64_digit(a / 4u8));
+    out.push(base64_digit((a % 4u8) * 16u8 + b / 16u8));
+    out.push(base64_digit((b % 16u8) * 4u8 + c / 64u8));
+    out.push(base64_digit(c % 64u8));
+    i = i + 3;
+  }
+  let left = n - i;
+  if left == 1 {
+    let a = data.get(i);
+    out.push(base64_digit(a / 4u8));
+    out.push(base64_digit((a % 4u8) * 16u8));
+    out.push(61u8);
+    out.push(61u8);
+  }
+  if left == 2 {
+    let a = data.get(i);
+    let b = data.get(i + 1);
+    out.push(base64_digit(a / 4u8));
+    out.push(base64_digit((a % 4u8) * 16u8 + b / 16u8));
+    out.push(base64_digit((b % 16u8) * 4u8));
+    out.push(61u8);
+  }
+  return out;
+}
+
+/// Whether URL encoding keeps `b` as it is: a letter, a digit, or one of `-._~`.
+fn is_unreserved(b : u8) -> bool {
+  let letter = (b >= 97u8 && b <= 122u8) || (b >= 65u8 && b <= 90u8);
+  return letter || is_digit(b) || b == 45u8 || b == 46u8 || b == 95u8 || b == 126u8;
+}
+
+/// `data` URL-encoded as `--data-urlencode` does: as `url_encode`, but a space becomes `+`.
+pub fn form_encode(data : &Vec<u8>) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  for b in data.iter() {
+    if *b == 32u8 {
+      out.push(43u8);
+    } else {
+      if is_unreserved(*b) {
+        out.push(*b);
+      } else {
+        out.push(37u8);
+        out.push(hex_digit(*b / 16u8));
+        out.push(hex_digit(*b % 16u8));
+      }
+    }
+  }
+  return out;
+}
+
+/// `data` with each byte that is not a letter, a digit or one of `-._~` written as `%XX`, as
+/// `curl_easy_escape` does.
+pub fn url_encode(data : &Vec<u8>) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  for b in data.iter() {
+    if is_unreserved(*b) {
+      out.push(*b);
+    } else {
+      out.push(37u8);
+      out.push(hex_digit(*b / 16u8));
+      out.push(hex_digit(*b % 16u8));
+    }
+  }
+  return out;
+}

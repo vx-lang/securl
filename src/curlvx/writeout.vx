@@ -1,0 +1,311 @@
+// `-w` / `--write-out`: the text that curl prints after a transfer, with `%{name}` variables.
+//
+// `%output{file}` sends the text after it to a file. This file cannot open the file, because
+// it gets no `&Files`. So the result is a list of pieces with their destinations, and `main`
+// writes each piece.
+import std::vec;
+import sys::text;
+import curlvx::bytes;
+import curlvx::fetch;
+
+// The destinations of a piece of `-w` text.
+const TO_STDOUT : i32 = 0;
+const TO_STDERR : i32 = 1;
+const TO_FILE : i32 = 2;
+
+/// A run of `-w` text and where it goes.
+struct WriteOutPiece {
+  destination : i32,
+  // The file, for `TO_FILE`.
+  file : Vec<u8>,
+  // `%output{>>file}` adds to the end of the file.
+  append : bool,
+  bytes : Vec<u8>,
+}
+
+/// What `-w` knows about the transfer besides `TransferInfo`.
+struct WriteOutContext {
+  exit_code : i32,
+  error : Vec<u8>,
+  url_index : i32,
+}
+
+fn push_three_digits(out : &mut Vec<u8>, code : i32) -> void {
+  out.push(48u8 + ((code / 100) % 10) as u8);
+  out.push(48u8 + ((code / 10) % 10) as u8);
+  out.push(48u8 + (code % 10) as u8);
+}
+
+/// The value of the `-w` variable `name`, or false when curl-vx does not know it.
+fn variable(name : &Vec<u8>, info : &TransferInfo, ctx : &WriteOutContext, out : &mut Vec<u8>)
+-> bool {
+  if eq_lit(name, "http_code") || eq_lit(name, "response_code") {
+    push_three_digits(out, info.http_code);
+    return true;
+  }
+  if eq_lit(name, "url_effective") {
+    append(out, &info.url_effective);
+    return true;
+  }
+  if eq_lit(name, "size_download") {
+    push_i64(out, info.size_download);
+    return true;
+  }
+  if eq_lit(name, "size_header") {
+    push_i64(out, info.size_header);
+    return true;
+  }
+  if eq_lit(name, "size_request") {
+    push_i64(out, info.size_request);
+    return true;
+  }
+  if eq_lit(name, "num_redirects") {
+    push_i64(out, info.num_redirects as i64);
+    return true;
+  }
+  if eq_lit(name, "num_connects") {
+    push_i64(out, info.num_connects as i64);
+    return true;
+  }
+  if eq_lit(name, "num_headers") {
+    push_i64(out, info.num_headers as i64);
+    return true;
+  }
+  if eq_lit(name, "content_type") {
+    append(out, &info.content_type);
+    return true;
+  }
+  if eq_lit(name, "redirect_url") {
+    append(out, &info.redirect_url);
+    return true;
+  }
+  if eq_lit(name, "referer") {
+    append(out, &info.referer);
+    return true;
+  }
+  if eq_lit(name, "method") {
+    append(out, &info.method);
+    return true;
+  }
+  if eq_lit(name, "http_version") {
+    if info.http_version == 10 {
+      push_lit(out, "1.0");
+    } else {
+      if info.http_version == 11 {
+        push_lit(out, "1.1");
+      } else {
+        push_lit(out, "0");
+      }
+    }
+    return true;
+  }
+  if eq_lit(name, "exitcode") {
+    push_i64(out, ctx.exit_code as i64);
+    return true;
+  }
+  if eq_lit(name, "errormsg") {
+    append(out, &ctx.error);
+    return true;
+  }
+  if eq_lit(name, "urlnum") {
+    push_i64(out, ctx.url_index as i64);
+    return true;
+  }
+  if eq_lit(name, "scheme") {
+    let colon = find_byte(&info.url_effective, 58u8, 0);
+    if colon > 0 {
+      append(out, &to_lower(&range_of(&info.url_effective, 0, colon)));
+    }
+    return true;
+  }
+  if eq_lit(name, "remote_ip") || eq_lit(name, "remote_port") {
+    let colon = rfind_byte(&info.remote_address, 58u8);
+    if colon > 0 {
+      if eq_lit(name, "remote_port") {
+        append(out, &rest_from(&info.remote_address, colon + 1));
+      } else {
+        let mut ip = range_of(&info.remote_address, 0, colon);
+        if ip.len() > 1 && ip.get(0) == 91u8 {
+          ip = range_of(&ip, 1, ip.len() - 1);
+        }
+        append(out, &ip);
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+/// The values of the response headers called `name`, as `%header{name}` writes them. With
+/// `name:all:separator`, all of them from each response of the transfer, with `separator`
+/// between them. Otherwise the first one of the last response.
+fn header_values(spec : &Vec<u8>, info : &TransferInfo, out : &mut Vec<u8>) -> void {
+  let mut name = clone_bytes(spec);
+  let mut all = false;
+  let mut separator = Vec<u8>::new();
+  let marker = find_seq(spec, &lit(":all:"), 0);
+  if marker >= 0 {
+    name = range_of(spec, 0, marker);
+    all = true;
+    // `\}` stands for `}` in the separator.
+    let raw = rest_from(spec, marker + 5);
+    let mut i = 0;
+    while i < raw.len() {
+      if raw.get(i) == 92u8 && i + 1 < raw.len() && raw.get(i + 1) == 125u8 {
+        separator.push(125u8);
+        i = i + 2;
+      } else {
+        separator.push(raw.get(i));
+        i = i + 1;
+      }
+    }
+  }
+  if all {
+    values_of(&info.all_headers, &name, true, &separator, out);
+  } else {
+    values_of(&info.headers, &name, false, &separator, out);
+  }
+}
+
+/// Write the value of each header in `lines` called `name`, or only the first one.
+fn values_of(lines : &Vec<Vec<u8>>, name : &Vec<u8>, all : bool, separator : &Vec<u8>,
+out : &mut Vec<u8>) -> void {
+  let mut found = 0;
+  for line in lines.iter() {
+    let colon = find_byte(line, 58u8, 0);
+    if colon > 0 && eq_nocase(&range_of(line, 0, colon), name) {
+      if found > 0 {
+        if !all {
+          return;
+        }
+        append(out, separator);
+      }
+      append(out, &trim_blanks(&rest_from(line, colon + 1)));
+      found = found + 1;
+    }
+  }
+}
+
+/// The end of a `{..}` that starts at `open`. A `\}` does not end it.
+fn closing_brace(format : &Vec<u8>, open : i32) -> i32 {
+  let mut i = open + 1;
+  while i < format.len() {
+    let b = format.get(i);
+    if b == 92u8 && i + 1 < format.len() {
+      i = i + 2;
+      continue;
+    }
+    if b == 125u8 {
+      return i;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn new_piece(destination : i32, file : Vec<u8>, add : bool) -> WriteOutPiece {
+  return WriteOutPiece {
+    destination : destination,
+    file : file,
+    append : add,
+    bytes : Vec<u8>::new()
+  };
+}
+
+/// The pieces of text that `-w format` gives for a transfer. Unknown variables go to `warnings`,
+/// which curl prints to standard error.
+pub fn format_write_out(format : &Vec<u8>, info : &TransferInfo, ctx : &WriteOutContext,
+warnings : &mut Vec<u8>) -> Vec<WriteOutPiece> {
+  let mut pieces = Vec<WriteOutPiece>::new();
+  let mut cur = new_piece(TO_STDOUT, Vec<u8>::new(), false);
+  let mut i = 0;
+  while i < format.len() {
+    let b = format.get(i);
+    if b == 37u8 && i + 1 < format.len() {
+      let next = format.get(i + 1);
+      if next == 37u8 {
+        cur.bytes.push(37u8);
+        i = i + 2;
+        continue;
+      }
+      if next == 123u8 {
+        let close = closing_brace(format, i + 1);
+        if close > 0 {
+          let name = range_of(format, i + 2, close);
+          i = close + 1;
+          if eq_lit(&name, "stderr") || eq_lit(&name, "stdout") {
+            let mut destination = TO_STDOUT;
+            if eq_lit(&name, "stderr") {
+              destination = TO_STDERR;
+            }
+            pieces.push(cur);
+            cur = new_piece(destination, Vec<u8>::new(), false);
+            continue;
+          }
+          if eq_lit(&name, "onerror") {
+            if ctx.exit_code == 0 {
+              i = format.len();
+            }
+            continue;
+          }
+          if !variable(&name, info, ctx, &mut cur.bytes) {
+            push_lit(warnings, "curl: unknown --write-out variable: '");
+            append(warnings, &name);
+            push_lit(warnings, "'\n");
+          }
+          continue;
+        }
+      }
+      // `%header{name}` and `%output{file}`.
+      if has_at(format, i + 1, &lit("header{")) {
+        let close = closing_brace(format, i + 7);
+        if close > 0 {
+          header_values(&range_of(format, i + 8, close), info, &mut cur.bytes);
+          i = close + 1;
+          continue;
+        }
+      }
+      if has_at(format, i + 1, &lit("output{")) {
+        let close = closing_brace(format, i + 7);
+        if close > 0 {
+          let mut file = range_of(format, i + 8, close);
+          let add = starts_lit(&file, ">>");
+          if add {
+            file = rest_from(&file, 2);
+          }
+          pieces.push(cur);
+          cur = new_piece(TO_FILE, file, add);
+          i = close + 1;
+          continue;
+        }
+      }
+    }
+    if b == 92u8 && i + 1 < format.len() {
+      let next = format.get(i + 1);
+      if next == 110u8 {
+        cur.bytes.push(10u8);
+        i = i + 2;
+        continue;
+      }
+      if next == 114u8 {
+        cur.bytes.push(13u8);
+        i = i + 2;
+        continue;
+      }
+      if next == 116u8 {
+        cur.bytes.push(9u8);
+        i = i + 2;
+        continue;
+      }
+      if next == 92u8 {
+        cur.bytes.push(92u8);
+        i = i + 2;
+        continue;
+      }
+    }
+    cur.bytes.push(b);
+    i = i + 1;
+  }
+  pieces.push(cur);
+  return pieces;
+}

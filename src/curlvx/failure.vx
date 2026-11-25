@@ -1,0 +1,48 @@
+// The error of a transfer: curl's exit code and the text that follows `curl: (code) `.
+import std::vec;
+import sys::text;
+
+/// Why a command did not work. `code` is the exit code of curl for the same error, for example
+/// 6 when a host name has no address. `message` is the text that curl prints for it.
+struct Failure {
+  code : i32,
+  message : Vec<u8>,
+}
+
+/// A failure with exit code `code` and the message `message`.
+pub fn fail_with(code : i32, message : Vec<u8>) -> Failure {
+  return Failure {
+    code : code,
+    message : message
+  };
+}
+
+/// A failure with exit code `code` and the string literal `message`.
+pub fn fail_lit(code : i32, message : *const i8) -> Failure {
+  return Failure {
+    code : code,
+    message : lit(message)
+  };
+}
+
+// The exit codes of curl that curl-vx uses. They are the CURLcode numbers of libcurl.
+const UNSUPPORTED_PROTOCOL : i32 = 1;
+const FAILED_INIT : i32 = 2;
+const URL_MALFORMAT : i32 = 3;
+const NOT_BUILT_IN : i32 = 4;
+const COULDNT_RESOLVE_HOST : i32 = 6;
+const COULDNT_CONNECT : i32 = 7;
+const WEIRD_SERVER_REPLY : i32 = 8;
+const PARTIAL_FILE : i32 = 18;
+const HTTP_RETURNED_ERROR : i32 = 22;
+const WRITE_ERROR : i32 = 23;
+const READ_ERROR : i32 = 26;
+const OPERATION_TIMEDOUT : i32 = 28;
+const TOO_MANY_REDIRECTS : i32 = 47;
+const GOT_NOTHING : i32 = 52;
+const SEND_ERROR : i32 = 55;
+const RECV_ERROR : i32 = 56;
+const BAD_CONTENT_ENCODING : i32 = 61;
+const UPLOAD_FAILED : i32 = 25;
+const TOO_LARGE : i32 = 100;
+const SETOPT_OPTION_SYNTAX : i32 = 49;

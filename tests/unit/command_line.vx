@@ -1,0 +1,66 @@
+// Checks how curlvx::options reads a command line.
+import core::result;
+import std::vec;
+import sys::text;
+import curlvx::bytes;
+import curlvx::failure;
+import curlvx::options;
+
+fn words(a : *const i8, b : *const i8, c : *const i8, d : *const i8, e : *const i8) -> Vec<Vec<u8>> {
+  let mut v = Vec<Vec<u8>>::new();
+  v.push(lit(a));
+  v.push(lit(b));
+  v.push(lit(c));
+  v.push(lit(d));
+  v.push(lit(e));
+  return v;
+}
+
+fn parsed(args : &Vec<Vec<u8>>) -> Config {
+  match parse_args(args) {
+    Result<Config, Failure>::Ok(c) => {
+      return c;
+    },
+    Result<Config, Failure>::Err(_f) => {
+      panic("a command line that should parse did not");
+    }
+  }
+}
+
+fn error_of(args : &Vec<Vec<u8>>) -> Vec<u8> {
+  match parse_args(args) {
+    Result<Config, Failure>::Ok(_c) => {
+      return lit("no error");
+    },
+    Result<Config, Failure>::Err(f) => {
+      assert(f.code == FAILED_INIT, "a bad option gives exit code 2");
+      return f.message;
+    }
+  }
+}
+
+fn main() -> i32 {
+  let a = parsed(&words("-sSL", "-ofile.txt", "-H", "X-A: 1", "http://h/"));
+  assert(a.silent && a.show_error && a.follow, "a cluster of short options");
+  assert(a.outputs.len() == 1 && eq_lit(a.outputs.get_ref(0), "file.txt"), "-o glued value");
+  assert(a.headers.len() == 1 && eq_lit(a.headers.get_ref(0), "X-A: 1"), "-H value");
+  assert(a.urls.len() == 1 && eq_lit(a.urls.get_ref(0), "http://h/"), "one URL");
+
+  let b = parsed(&words("--location", "--no-location", "-d", "a=1", "-i"));
+  assert(b.include, "-i");
+  assert(!b.follow, "--no-location turns -L off");
+  assert(b.data.len() == 1 && b.data.get_ref(0).kind == DATA_ASCII, "-d is ASCII data");
+
+  let c = parsed(&words("-X", "PUT", "--max-time", "2.5", "-e;auto"));
+  assert(eq_lit(&c.method, "PUT"), "-X");
+  assert(c.max_time_ms == 2500i64, "2.5 seconds");
+  assert(c.auto_referer && !c.has_referer, "-e ;auto alone");
+
+  assert(eq_lit(&error_of(&words("--bogus", "a", "b", "c", "d")), "option --bogus: is unknown"),
+    "an unknown long option");
+  assert(eq_lit(&error_of(&words("-Z", "a", "b", "c", "d")), "option -Z: is unknown"),
+    "an unknown short option");
+  assert(eq_lit(&error_of(&words("a", "b", "c", "d", "-H")), "option -H: requires parameter"),
+    "a missing value");
+  return 0;
+}

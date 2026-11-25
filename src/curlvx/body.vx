@@ -1,0 +1,107 @@
+// The body of a POST: the `-d`, `--data-*` and `--json` options joined as curl joins them.
+//
+// An option can name a file, such as `-d @file`. This file cannot read it, because it never
+// gets a `&Files`. `data_file_name` tells `main` which file each option needs, `main` reads
+// it, and `build_body` gets the contents.
+import core::option;
+import std::vec;
+import sys::text;
+import curlvx::bytes;
+import curlvx::encode;
+import curlvx::options;
+
+/// The file that `part` reads, or None. `-` means standard input.
+pub fn data_file_name(part : &DataPart) -> Option<Vec<u8>> {
+  let t = &part.text;
+  if part.kind == DATA_RAW {
+    return Option<Vec<u8>>::None();
+  }
+  if part.kind == DATA_URLENCODE {
+    // `name@file` and `@file` read a file, unless an `=` comes first.
+    let eq_at = find_byte(t, 61u8, 0);
+    if eq_at >= 0 {
+      return Option<Vec<u8>>::None();
+    }
+    let at = find_byte(t, 64u8, 0);
+    if at < 0 {
+      return Option<Vec<u8>>::None();
+    }
+    return Option<Vec<u8>>::Some(rest_from(t, at + 1));
+  }
+  if t.len() > 0 && t.get(0) == 64u8 {
+    return Option<Vec<u8>>::Some(rest_from(t, 1));
+  }
+  return Option<Vec<u8>>::None();
+}
+
+/// The bytes that one part adds to the body. `content` holds the file that the part names, if
+/// it names one.
+fn part_bytes(part : &DataPart, content : &Vec<u8>, reads_file : bool) -> Vec<u8> {
+  let t = &part.text;
+  if part.kind == DATA_URLENCODE {
+    let mut name_end = find_byte(t, 61u8, 0);
+    if name_end < 0 {
+      name_end = find_byte(t, 64u8, 0);
+    }
+    let mut value = clone_bytes(t);
+    if reads_file {
+      value = clone_bytes(content);
+    } else {
+      if name_end >= 0 {
+        value = rest_from(t, name_end + 1);
+      }
+    }
+    let mut out = Vec<u8>::new();
+    if name_end > 0 {
+      append_range(&mut out, t, 0, name_end);
+      out.push(61u8);
+    }
+    append(&mut out, &form_encode(&value));
+    return out;
+  }
+  if !reads_file {
+    return clone_bytes(t);
+  }
+  if part.kind == DATA_ASCII {
+    // `-d @file` drops the CR, LF and NUL bytes of the file.
+    let mut out = Vec<u8>::new();
+    for b in content.iter() {
+      if *b != 13u8 && *b != 10u8 && *b != 0u8 {
+        out.push(*b);
+      }
+    }
+    return out;
+  }
+  return clone_bytes(content);
+}
+
+/// The whole body. `contents` has one entry for each part: the bytes of the file that the part
+/// names, or an empty list.
+pub fn build_body(parts : &Vec<DataPart>, contents : &Vec<Vec<u8>>) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  let mut i = 0;
+  while i < parts.len() {
+    let part = parts.get_ref(i);
+    let reads_file = data_file_name(part).is_some();
+    if i > 0 {
+      // `--json` pieces are joined with nothing between them. The others get `&`.
+      let both_json = part.kind == DATA_JSON && parts.get_ref(i - 1).kind == DATA_JSON;
+      if !both_json {
+        out.push(38u8);
+      }
+    }
+    append(&mut out, &part_bytes(part, contents.get_ref(i), reads_file));
+    i = i + 1;
+  }
+  return out;
+}
+
+/// Whether any part is `--json`.
+pub fn has_json(parts : &Vec<DataPart>) -> bool {
+  for p in parts.iter() {
+    if p.kind == DATA_JSON {
+      return true;
+    }
+  }
+  return false;
+}

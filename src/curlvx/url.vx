@@ -1,0 +1,411 @@
+// URLs: parse a URL as curl does, resolve the `Location` of a redirect, and give the parts that
+// a request needs.
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import curlvx::bytes;
+import curlvx::failure;
+
+/// A parsed URL. `path` holds the path and the query, such as `/a/b?x=1`, and starts with `/`.
+/// The fragment is not part of it, because it never goes to the server.
+struct Url {
+  scheme : Vec<u8>,
+  has_user : bool,
+  user : Vec<u8>,
+  has_password : bool,
+  password : Vec<u8>,
+  host : Vec<u8>,
+  // The host is an IPv6 address. `host` holds it without the brackets.
+  ipv6 : bool,
+  port : i32,
+  path : Vec<u8>,
+}
+
+/// A copy of `u`.
+pub fn clone_url(u : &Url) -> Url {
+  return Url {
+    scheme : clone_bytes(&u.scheme),
+    has_user : u.has_user,
+    user : clone_bytes(&u.user),
+    has_password : u.has_password,
+    password : clone_bytes(&u.password),
+    host : clone_bytes(&u.host),
+    ipv6 : u.ipv6,
+    port : u.port,
+    path : clone_bytes(&u.path)
+  };
+}
+
+/// The port that a scheme uses when the URL gives none, or 0 for a scheme that curl-vx does
+/// not know.
+pub fn default_port(scheme : &Vec<u8>) -> i32 {
+  if eq_lit(scheme, "http") {
+    return 80;
+  }
+  if eq_lit(scheme, "https") {
+    return 443;
+  }
+  if eq_lit(scheme, "ftp") {
+    return 21;
+  }
+  return 0;
+}
+
+fn is_scheme_byte(b : u8, first : bool) -> bool {
+  let letter = (b >= 97u8 && b <= 122u8) || (b >= 65u8 && b <= 90u8);
+  if first {
+    return letter;
+  }
+  return letter || is_digit(b) || b == 43u8 || b == 45u8 || b == 46u8;
+}
+
+/// The length of the scheme at the start of `text` when `://` follows it, else 0.
+fn scheme_length(text : &Vec<u8>) -> i32 {
+  let sep = find_seq(text, &lit("://"), 0);
+  if sep <= 0 {
+    return 0;
+  }
+  let mut i = 0;
+  while i < sep {
+    if !is_scheme_byte(text.get(i), i == 0) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return sep;
+}
+
+/// The scheme that curl guesses for a URL with no scheme, from the start of the host name.
+fn guess_scheme(host_start : &Vec<u8>) -> Vec<u8> {
+  if starts_lit_nocase(host_start, "ftp.") {
+    return lit("ftp");
+  }
+  if starts_lit_nocase(host_start, "dict.") {
+    return lit("dict");
+  }
+  if starts_lit_nocase(host_start, "ldap.") {
+    return lit("ldap");
+  }
+  if starts_lit_nocase(host_start, "imap.") {
+    return lit("imap");
+  }
+  if starts_lit_nocase(host_start, "smtp.") {
+    return lit("smtp");
+  }
+  if starts_lit_nocase(host_start, "pop3.") {
+    return lit("pop3");
+  }
+  return lit("http");
+}
+
+/// `text` with each `%XX` replaced by the byte it stands for. A `%` that two hexadecimal digits
+/// do not follow stays as it is.
+pub fn percent_decode(text : &Vec<u8>) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  let mut i = 0;
+  while i < text.len() {
+    let b = text.get(i);
+    if b == 37u8 && i + 2 < text.len() {
+      let hi = hex_value(text.get(i + 1));
+      let lo = hex_value(text.get(i + 2));
+      if hi >= 0 && lo >= 0 {
+        out.push((hi * 16 + lo) as u8);
+        i = i + 3;
+        continue;
+      }
+    }
+    out.push(b);
+    i = i + 1;
+  }
+  return out;
+}
+
+/// Remove the `.` and `..` segments of a path, as RFC 3986 says. `path` starts with `/`.
+pub fn remove_dot_segments(path : &Vec<u8>) -> Vec<u8> {
+  if find_seq(path, &lit("/."), 0) < 0 {
+    return clone_bytes(path);
+  }
+  let mut segments = Vec<Vec<u8>>::new();
+  let mut trailing_slash = false;
+  let mut start = 1;
+  let mut done = false;
+  while !done {
+    let mut end = find_byte(path, 47u8, start);
+    let last = end < 0;
+    if last {
+      end = path.len();
+      done = true;
+    }
+    let seg = range_of(path, start, end);
+    if eq_lit(&seg, ".") {
+      trailing_slash = last;
+    } else {
+      if eq_lit(&seg, "..") {
+        let _dropped = segments.pop();
+        trailing_slash = last;
+      } else {
+        segments.push(seg);
+        trailing_slash = false;
+      }
+    }
+    start = end + 1;
+  }
+  let mut out = lit("/");
+  let mut i = 0;
+  while i < segments.len() {
+    if i > 0 {
+      out.push(47u8);
+    }
+    append(&mut out, segments.get_ref(i));
+    i = i + 1;
+  }
+  if trailing_slash && segments.len() > 0 {
+    out.push(47u8);
+  }
+  return out;
+}
+
+/// `path` with its dot segments removed. The query, after `?`, stays as it is.
+fn normalize_path(path : &Vec<u8>) -> Vec<u8> {
+  let q = find_byte(path, 63u8, 0);
+  if q < 0 {
+    return remove_dot_segments(path);
+  }
+  let mut out = remove_dot_segments(&range_of(path, 0, q));
+  append_range(&mut out, path, q, path.len());
+  return out;
+}
+
+/// Parse `text` as curl does. A URL with no scheme gets one that curl guesses from the host
+/// name, which is `http` for most names. `path_as_is` keeps `.` and `..` segments.
+pub fn parse_url(text : &Vec<u8>, path_as_is : bool) -> Result<Url, Failure> {
+  let mut end = find_byte(text, 35u8, 0);
+  if end < 0 {
+    end = text.len();
+  }
+  let scheme_len = scheme_length(text);
+  let mut i = 0;
+  let mut scheme = Vec<u8>::new();
+  if scheme_len > 0 {
+    scheme = to_lower(&range_of(text, 0, scheme_len));
+    i = scheme_len + 3;
+  } else {
+    scheme = guess_scheme(text);
+  }
+
+  // The authority ends at the first `/` or `?`.
+  let mut auth_end = i;
+  while auth_end < end && text.get(auth_end) != 47u8 && text.get(auth_end) != 63u8 {
+    auth_end = auth_end + 1;
+  }
+  let authority = range_of(text, i, auth_end);
+
+  let mut has_user = false;
+  let mut user = Vec<u8>::new();
+  let mut has_password = false;
+  let mut password = Vec<u8>::new();
+  let mut host_port = clone_bytes(&authority);
+  let at = rfind_byte(&authority, 64u8);
+  if at >= 0 {
+    let info = range_of(&authority, 0, at);
+    host_port = rest_from(&authority, at + 1);
+    has_user = true;
+    let colon = find_byte(&info, 58u8, 0);
+    if colon >= 0 {
+      user = percent_decode(&range_of(&info, 0, colon));
+      password = percent_decode(&rest_from(&info, colon + 1));
+      has_password = true;
+    } else {
+      user = percent_decode(&info);
+    }
+  }
+
+  let mut host = Vec<u8>::new();
+  let mut ipv6 = false;
+  let mut port_text = Vec<u8>::new();
+  let mut has_port = false;
+  if host_port.len() > 0 && host_port.get(0) == 91u8 {
+    let close = find_byte(&host_port, 93u8, 0);
+    if close < 0 {
+      return Result<Url, Failure>::Err(fail_lit(URL_MALFORMAT,
+        "URL rejected: Bad IPv6 address"));
+    }
+    host = range_of(&host_port, 1, close);
+    ipv6 = true;
+    if close + 1 < host_port.len() {
+      if host_port.get(close + 1) != 58u8 {
+        return Result<Url, Failure>::Err(fail_lit(URL_MALFORMAT,
+          "URL rejected: Bad IPv6 address"));
+      }
+      port_text = rest_from(&host_port, close + 2);
+      has_port = true;
+    }
+  } else {
+    let colon = rfind_byte(&host_port, 58u8);
+    if colon >= 0 {
+      host = range_of(&host_port, 0, colon);
+      port_text = rest_from(&host_port, colon + 1);
+      has_port = true;
+    } else {
+      host = clone_bytes(&host_port);
+    }
+  }
+  if host.len() == 0 {
+    return Result<Url, Failure>::Err(fail_lit(URL_MALFORMAT,
+      "URL rejected: No host part in the URL"));
+  }
+
+  let mut port = default_port(&scheme);
+  if has_port && port_text.len() > 0 {
+    match parse_u64(&port_text) {
+      Option<u64>::Some(p) => {
+        if p > 65535u64 {
+          return Result<Url, Failure>::Err(fail_lit(URL_MALFORMAT,
+            "URL rejected: Port number was not a decimal number between 0 and 65535"));
+        }
+        port = p as i32;
+      },
+      Option<u64>::None() => {
+        return Result<Url, Failure>::Err(fail_lit(URL_MALFORMAT,
+          "URL rejected: Port number was not a decimal number between 0 and 65535"));
+      }
+    }
+  }
+
+  let mut path = range_of(text, auth_end, end);
+  if path.len() == 0 || path.get(0) != 47u8 {
+    let mut p = lit("/");
+    append(&mut p, &path);
+    path = p;
+  }
+  if !path_as_is {
+    path = normalize_path(&path);
+  }
+  return Result<Url, Failure>::Ok(Url {
+    scheme : scheme,
+    has_user : has_user,
+    user : user,
+    has_password : has_password,
+    password : password,
+    host : host,
+    ipv6 : ipv6,
+    port : port,
+    path : path
+  });
+}
+
+/// The URL that a redirect to `location` leads to from `base`. `location` can be a whole URL,
+/// a URL with no scheme (`//host/path`), an absolute path, a query or a relative path.
+pub fn resolve_location(base : &Url, location : &Vec<u8>) -> Result<Url, Failure> {
+  // curl sends a space in a redirect URL as %20 in the path and as + in the query.
+  let mut loc = Vec<u8>::new();
+  let raw = trim_blanks(location);
+  let mut in_query = false;
+  for b in raw.iter() {
+    if *b == 63u8 {
+      in_query = true;
+    }
+    if *b == 32u8 {
+      if in_query {
+        loc.push(43u8);
+      } else {
+        push_lit(&mut loc, "%20");
+      }
+    } else {
+      loc.push(*b);
+    }
+  }
+  if scheme_length(&loc) > 0 {
+    return parse_url(&loc, false);
+  }
+  if starts_lit(&loc, "//") {
+    let mut whole = clone_bytes(&base.scheme);
+    push_lit(&mut whole, ":");
+    append(&mut whole, &loc);
+    return parse_url(&whole, false);
+  }
+  let hash = find_byte(&loc, 35u8, 0);
+  if hash >= 0 {
+    loc = range_of(&loc, 0, hash);
+  }
+  let mut next = clone_url(base);
+  let q = find_byte(&base.path, 63u8, 0);
+  let mut base_path = clone_bytes(&base.path);
+  if q >= 0 {
+    base_path = range_of(&base.path, 0, q);
+  }
+  if loc.len() == 0 {
+    return Result<Url, Failure>::Ok(next);
+  }
+  if loc.get(0) == 47u8 {
+    next.path = normalize_path(&loc);
+  } else {
+    if loc.get(0) == 63u8 {
+      let mut p = base_path;
+      append(&mut p, &loc);
+      next.path = p;
+    } else {
+      let slash = rfind_byte(&base_path, 47u8);
+      let mut p = range_of(&base_path, 0, slash + 1);
+      append(&mut p, &loc);
+      next.path = normalize_path(&p);
+    }
+  }
+  return Result<Url, Failure>::Ok(next);
+}
+
+/// The host as a request writes it: an IPv6 address gets its brackets back.
+pub fn host_text(u : &Url) -> Vec<u8> {
+  if u.ipv6 {
+    let mut out = lit("[");
+    append(&mut out, &u.host);
+    push_lit(&mut out, "]");
+    return out;
+  }
+  return clone_bytes(&u.host);
+}
+
+/// The value of the `Host` header: the host, and the port when it is not the default one.
+pub fn host_header_value(u : &Url) -> Vec<u8> {
+  let mut out = host_text(u);
+  if u.port != default_port(&u.scheme) {
+    push_lit(&mut out, ":");
+    push_u64(&mut out, u.port as u64);
+  }
+  return out;
+}
+
+/// `scheme://host:port/path`, the URL that the transfer used, as curl's `%{url_effective}`
+/// writes it.
+pub fn url_text(u : &Url) -> Vec<u8> {
+  let mut out = clone_bytes(&u.scheme);
+  push_lit(&mut out, "://");
+  if u.has_user {
+    append(&mut out, &u.user);
+    if u.has_password {
+      push_lit(&mut out, ":");
+      append(&mut out, &u.password);
+    }
+    push_lit(&mut out, "@");
+  }
+  append(&mut out, &host_text(u));
+  if u.port != default_port(&u.scheme) {
+    push_lit(&mut out, ":");
+    push_u64(&mut out, u.port as u64);
+  }
+  append(&mut out, &u.path);
+  return out;
+}
+
+/// The last segment of the path, without the query, for `-O`. It is empty when the path ends
+/// in `/`.
+pub fn remote_file_name(u : &Url) -> Vec<u8> {
+  let mut path = clone_bytes(&u.path);
+  let q = find_byte(&path, 63u8, 0);
+  if q >= 0 {
+    path = range_of(&path, 0, q);
+  }
+  let slash = rfind_byte(&path, 47u8);
+  return rest_from(&path, slash + 1);
+}

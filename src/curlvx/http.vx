@@ -1,0 +1,523 @@
+// HTTP/1.1 messages: the request that curl sends, and the head of the response.
+//
+// The order of the request headers is the order of libcurl's `http_add_hd`: Host,
+// Authorization, Range, User-Agent, Accept, Referer, Cookie, the `-H` headers, the body
+// headers, and Connection. curl's tests compare the request byte for byte, so the order matters.
+import core::option;
+import std::vec;
+import sys::text;
+import curlvx::bytes;
+import curlvx::encode;
+import curlvx::failure;
+import curlvx::url;
+
+/// The text that curl-vx gives as its version, and sends in `User-Agent`.
+pub fn curl_vx_version() -> Vec<u8> {
+  return lit("0.1.0-vx");
+}
+
+// The kinds of request: no body, a POST body, an upload with PUT, or HEAD.
+const REQ_GET : i32 = 0;
+const REQ_POST : i32 = 1;
+const REQ_PUT : i32 = 2;
+const REQ_HEAD : i32 = 3;
+
+// The body of a request is larger than this, so curl asks the server first with
+// `Expect: 100-continue`.
+const EXPECT_100_THRESHOLD : i64 = 1048576i64;
+
+/// One `-H` header split into its name and value. `empty` is true for the `name;` form, which
+/// sends a header with no value. `remove` is true for the `name:` form, which only stops curl
+/// from sending its own header of that name.
+struct CustomHeader {
+  name : Vec<u8>,
+  value : Vec<u8>,
+  empty : bool,
+  remove : bool,
+  // The header as the user wrote it.
+  line : Vec<u8>,
+  // The line has neither a `:` nor the `;` form, so curl ignores it.
+  ignored : bool,
+}
+
+/// Split a `-H` header as libcurl's `Curl_dynhds_add_slist` does.
+pub fn split_header(line : &Vec<u8>) -> CustomHeader {
+  let colon = find_byte(line, 58u8, 0);
+  let semi = find_byte(line, 59u8, 0);
+  // `name;` with nothing after the `;` and no `:` in the name sends an empty header.
+  if semi >= 0 && semi == line.len() - 1 && (colon < 0 || colon > semi) {
+    return CustomHeader {
+      name : trim_blanks(&range_of(line, 0, semi)),
+      value : Vec<u8>::new(),
+      empty : true,
+      remove : false,
+      line : clone_bytes(line),
+      ignored : false
+    };
+  }
+  if colon < 0 {
+    return CustomHeader {
+      name : Vec<u8>::new(),
+      value : Vec<u8>::new(),
+      empty : false,
+      remove : false,
+      line : clone_bytes(line),
+      ignored : true
+    };
+  }
+  let mut value = rest_from(line, colon + 1);
+  let nl = find_byte(&value, 13u8, 0);
+  if nl >= 0 {
+    value = range_of(&value, 0, nl);
+  }
+  let lf = find_byte(&value, 10u8, 0);
+  if lf >= 0 {
+    value = range_of(&value, 0, lf);
+  }
+  value = trim_blanks(&value);
+  let name = trim_blanks(&range_of(line, 0, colon));
+  let remove = value.len() == 0;
+  return CustomHeader {
+    name : name,
+    value : value,
+    empty : false,
+    remove : remove,
+    line : clone_bytes(line),
+    ignored : false
+  };
+}
+
+/// Whether the `-H` headers name the header `name`, in any form. libcurl's
+/// `Curl_checkheaders` does this check before it adds a header of its own.
+pub fn has_custom(headers : &Vec<Vec<u8>>, name : *const i8) -> bool {
+  let want = lit(name);
+  for line in headers.iter() {
+    if has_at_nocase(line, &want) && line.len() > want.len() {
+      let sep = line.get(want.len());
+      if sep == 58u8 || sep == 59u8 {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/// The value of the first `-H` header called `name`, if it has one.
+fn custom_value(headers : &Vec<Vec<u8>>, name : *const i8) -> Option<Vec<u8>> {
+  for line in headers.iter() {
+    let h = split_header(line);
+    if !h.ignored && eq_lit_nocase(&h.name, name) {
+      return Option<Vec<u8>>::Some(h.value);
+    }
+  }
+  return Option<Vec<u8>>::None();
+}
+
+fn has_at_nocase(a : &Vec<u8>, prefix : &Vec<u8>) -> bool {
+  if prefix.len() > a.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < prefix.len() {
+    if ascii_lower(a.get(i)) != ascii_lower(prefix.get(i)) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// What a request needs besides the URL.
+struct RequestInfo {
+  method : Vec<u8>,
+  kind : i32,
+  body_length : i64,
+  http10 : bool,
+  // The `-H` headers, with the ones that `--json` adds.
+  headers : Vec<Vec<u8>>,
+  has_credentials : bool,
+  user : Vec<u8>,
+  password : Vec<u8>,
+  // Credentials and cookies may go to this host: it is the first host, or `--location-trusted`.
+  trusted_host : bool,
+  // A custom Host header may go to this host: it is the first host.
+  first_host : bool,
+  has_user_agent : bool,
+  user_agent : Vec<u8>,
+  has_referer : bool,
+  referer : Vec<u8>,
+  has_range : bool,
+  range : Vec<u8>,
+  has_cookie : bool,
+  cookie : Vec<u8>,
+  // The request goes to an HTTP proxy, so the request line holds the whole URL.
+  via_proxy : bool,
+  has_proxy_credentials : bool,
+  proxy_user : Vec<u8>,
+  proxy_password : Vec<u8>,
+  // The body goes in chunks, with no Content-Length.
+  chunked : bool,
+  // curl adds `Transfer-Encoding: chunked` itself, because the length of the body is unknown.
+  add_chunked_header : bool,
+}
+
+fn add_line(out : &mut Vec<u8>, name : *const i8, value : &Vec<u8>) -> void {
+  push_lit(out, name);
+  append(out, value);
+  push_lit(out, "\r\n");
+}
+
+/// The bytes of the request line and the headers of a request for `u`, up to and with the
+/// empty line that ends them.
+pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
+  let mut out = clone_bytes(&info.method);
+  push_lit(&mut out, " ");
+  if info.via_proxy {
+    append(&mut out, &u.scheme);
+    push_lit(&mut out, "://");
+    append(&mut out, &host_header_value(u));
+  }
+  append(&mut out, &u.path);
+  if info.http10 {
+    push_lit(&mut out, " HTTP/1.0\r\n");
+  } else {
+    push_lit(&mut out, " HTTP/1.1\r\n");
+  }
+
+  // Host. A custom Host header goes only to the first host. curl copies it after `Host:` as
+  // the user wrote it.
+  let mut custom_host = false;
+  if info.first_host {
+    for line in info.headers.iter() {
+      let h = split_header(line);
+      if !custom_host && !h.ignored && eq_lit_nocase(&h.name, "Host") {
+        custom_host = true;
+        if !h.remove {
+          let colon = find_byte(line, 58u8, 0);
+          if colon >= 0 {
+            push_lit(&mut out, "Host:");
+            append_range(&mut out, line, colon + 1, line.len());
+            push_lit(&mut out, "\r\n");
+          } else {
+            push_lit(&mut out, "Host:\r\n");
+          }
+        }
+      }
+    }
+  }
+  if !custom_host {
+    add_line(&mut out, "Host: ", &host_header_value(u));
+  }
+
+  if info.via_proxy && info.has_proxy_credentials {
+    let mut pair = clone_bytes(&info.proxy_user);
+    push_lit(&mut pair, ":");
+    append(&mut pair, &info.proxy_password);
+    add_line(&mut out, "Proxy-Authorization: Basic ", &base64(&pair));
+  }
+
+  if info.has_credentials && info.trusted_host && !has_custom(&info.headers, "Authorization") {
+    let mut pair = clone_bytes(&info.user);
+    push_lit(&mut pair, ":");
+    append(&mut pair, &info.password);
+    add_line(&mut out, "Authorization: Basic ", &base64(&pair));
+  }
+
+  if info.has_range && !has_custom(&info.headers, "Range") {
+    // curl adds the `-` of an open range, so `-r 4` asks for byte 4 to the end.
+    let mut range = clone_bytes(&info.range);
+    if find_byte(&range, 45u8, 0) < 0 {
+      range.push(45u8);
+    }
+    add_line(&mut out, "Range: bytes=", &range);
+  }
+
+  if !has_custom(&info.headers, "User-Agent") {
+    if info.has_user_agent {
+      if info.user_agent.len() > 0 {
+        add_line(&mut out, "User-Agent: ", &info.user_agent);
+      }
+    } else {
+      add_line(&mut out, "User-Agent: curl/", &curl_vx_version());
+    }
+  }
+
+  if !has_custom(&info.headers, "Accept") {
+    push_lit(&mut out, "Accept: */*\r\n");
+  }
+
+  if info.has_referer && !has_custom(&info.headers, "Referer") {
+    add_line(&mut out, "Referer: ", &info.referer);
+  }
+
+  if info.via_proxy && !has_custom(&info.headers, "Proxy-Connection") {
+    push_lit(&mut out, "Proxy-Connection: Keep-Alive\r\n");
+  }
+
+  if info.add_chunked_header {
+    push_lit(&mut out, "Transfer-Encoding: chunked\r\n");
+  }
+
+  // `-b name=value` sends a cookie. A value with no `=` names a cookie file, which curl-vx
+  // does not read yet.
+  if info.has_cookie && info.trusted_host && find_byte(&info.cookie, 61u8, 0) >= 0
+     && !has_custom(&info.headers, "Cookie") {
+    add_line(&mut out, "Cookie: ", &info.cookie);
+  }
+
+  for line in info.headers.iter() {
+    let h = split_header(line);
+    let skip = h.ignored || h.remove || eq_lit_nocase(&h.name, "Host")
+      || eq_lit_nocase(&h.name, "Connection")
+      || ((eq_lit_nocase(&h.name, "Authorization") || eq_lit_nocase(&h.name, "Cookie"))
+          && !info.trusted_host);
+    if !skip {
+      if h.empty {
+        append(&mut out, &h.name);
+        push_lit(&mut out, ":\r\n");
+      } else {
+        append(&mut out, line);
+        push_lit(&mut out, "\r\n");
+      }
+    }
+  }
+
+  if info.kind == REQ_POST || info.kind == REQ_PUT {
+    if info.body_length >= 0i64 && !info.chunked && !has_custom(&info.headers, "Content-Length") {
+      let mut n = Vec<u8>::new();
+      push_i64(&mut n, info.body_length);
+      add_line(&mut out, "Content-Length: ", &n);
+    }
+    if info.kind == REQ_POST && !has_custom(&info.headers, "Content-Type") {
+      push_lit(&mut out, "Content-Type: application/x-www-form-urlencoded\r\n");
+    }
+    if !info.http10 && !has_custom(&info.headers, "Expect")
+       && (info.body_length > EXPECT_100_THRESHOLD || info.add_chunked_header) {
+      push_lit(&mut out, "Expect: 100-continue\r\n");
+    }
+  }
+
+  // The first custom Connection header with a value comes last, and the others after it.
+  let mut first_connection = true;
+  for line in info.headers.iter() {
+    let h = split_header(line);
+    if !h.ignored && !h.remove && !h.empty && eq_lit_nocase(&h.name, "Connection") {
+      if first_connection {
+        add_line(&mut out, "Connection: ", &h.value);
+        first_connection = false;
+      } else {
+        append(&mut out, line);
+        push_lit(&mut out, "\r\n");
+      }
+    }
+  }
+
+  push_lit(&mut out, "\r\n");
+  return out;
+}
+
+/// The head of a response: its status line and headers.
+struct ResponseHead {
+  // The status line and the headers as they arrived, with the empty line that ends them. When
+  // a header is bad, `raw` ends before it, because curl writes no header after an error.
+  raw : Vec<u8>,
+  // 10 for HTTP/1.0, 11 for HTTP/1.1.
+  version : i32,
+  status : i32,
+  // -1 when the response has no Content-Length.
+  content_length : i64,
+  // The response has a Transfer-Encoding header, so curl does not use its Content-Length.
+  has_transfer_encoding : bool,
+  chunked : bool,
+  has_location : bool,
+  location : Vec<u8>,
+  content_type : Vec<u8>,
+  close : bool,
+  // A Content-Length header held something that is not a number, or two lengths disagree.
+  bad_length : bool,
+  // The headers, without the status line, each without its line end. For `-w %header{}`.
+  headers : Vec<Vec<u8>>,
+  // Not 0 when the head is bad: the exit code, with `error` as the message.
+  error_code : i32,
+  error : Vec<u8>,
+}
+
+/// An empty response head, before the status line is read.
+pub fn empty_head() -> ResponseHead {
+  return ResponseHead {
+    raw : Vec<u8>::new(),
+    version : 11,
+    status : 0,
+    content_length : -1i64,
+    has_transfer_encoding : false,
+    chunked : false,
+    has_location : false,
+    location : Vec<u8>::new(),
+    content_type : Vec<u8>::new(),
+    close : false,
+    bad_length : false,
+    headers : Vec<Vec<u8>>::new(),
+    error_code : 0,
+    error : Vec<u8>::new()
+  };
+}
+
+fn set_error(head : &mut ResponseHead, code : i32, message : Vec<u8>) -> void {
+  if head.error_code == 0 {
+    head.error_code = code;
+    head.error = message;
+  }
+}
+
+/// Read the status line `line` into `head`. Gives false when it is not an HTTP/1.x status line.
+/// A status line of another HTTP version sets the error of `head`.
+pub fn parse_status_line(line : &Vec<u8>, head : &mut ResponseHead) -> bool {
+  let t = trim_newline(line);
+  if !starts_lit(&t, "HTTP/") || t.len() < 6 {
+    return false;
+  }
+  if !starts_lit(&t, "HTTP/1.0 ") && !starts_lit(&t, "HTTP/1.1 ") {
+    set_error(head, UNSUPPORTED_PROTOCOL, lit("Unsupported HTTP version in response"));
+    return true;
+  }
+  if t.get(7) == 48u8 {
+    head.version = 10;
+  } else {
+    head.version = 11;
+  }
+  let mut end = 9;
+  while end < t.len() && is_digit(t.get(end)) {
+    end = end + 1;
+  }
+  if end - 9 != 3 {
+    return false;
+  }
+  match parse_u64(&range_of(&t, 9, end)) {
+    Option<u64>::Some(code) => {
+      head.status = code as i32;
+    },
+    Option<u64>::None() => {
+      return false;
+    }
+  }
+  if head.version == 10 {
+    head.close = true;
+  }
+  return true;
+}
+
+/// Read the tokens of a Transfer-Encoding header as libcurl's `Curl_build_unencoding_stack`
+/// does, for a client that asks for no transfer decoding but `chunked`. With `raw`
+/// (`--raw`), curl passes the body on as it arrived.
+fn parse_transfer_encoding(value : &Vec<u8>, raw : bool, head : &mut ResponseHead) -> void {
+  head.has_transfer_encoding = true;
+  let mut start = 0;
+  while start < value.len() {
+    let mut end = find_byte(value, 44u8, start);
+    if end < 0 {
+      end = value.len();
+    }
+    let token = to_lower(&trim_blanks(&range_of(value, start, end)));
+    start = end + 1;
+    if token.len() == 0 {
+      continue;
+    }
+    if eq_lit(&token, "chunked") {
+      head.chunked = true;
+      continue;
+    }
+    if raw {
+      return;
+    }
+    if head.chunked {
+      let mut m = lit("A Transfer-Encoding (");
+      append(&mut m, &token);
+      push_lit(&mut m, ") was listed after chunked");
+      set_error(head, BAD_CONTENT_ENCODING, m);
+      return;
+    }
+    if !eq_lit(&token, "identity") {
+      let mut m = lit("Unsolicited Transfer-Encoding (");
+      append(&mut m, &token);
+      push_lit(&mut m, ") found");
+      set_error(head, BAD_CONTENT_ENCODING, m);
+      return;
+    }
+  }
+}
+
+/// Read one header line into `head`. `index` counts the lines of the head: the status line is
+/// 1. A bad header sets the error of `head`, as libcurl's checks do.
+pub fn parse_header_line(line : &Vec<u8>, index : i32, raw : bool, head : &mut ResponseHead)
+-> void {
+  let t = trim_newline(line);
+  if find_byte(&t, 0u8, 0) >= 0 {
+    set_error(head, WEIRD_SERVER_REPLY, lit("NUL byte in header"));
+    return;
+  }
+  let folded = index > 2 && t.len() > 0 && is_blank(t.get(0));
+  let colon = find_byte(&t, 58u8, 0);
+  if colon < 0 && !folded {
+    set_error(head, WEIRD_SERVER_REPLY, lit("Header without colon"));
+    return;
+  }
+  head.headers.push(clone_bytes(&t));
+  if colon <= 0 || folded {
+    return;
+  }
+  let name = range_of(&t, 0, colon);
+  let value = trim_blanks(&rest_from(&t, colon + 1));
+  if eq_lit_nocase(&name, "Content-Length") {
+    // curl takes a list such as `6, 6` when all values are the same, as browsers do.
+    let mut start = 0;
+    while start <= value.len() {
+      let mut end = find_byte(&value, 44u8, start);
+      if end < 0 {
+        end = value.len();
+      }
+      match parse_u64(&range_of(&value, start, end)) {
+        Option<u64>::Some(n) => {
+          if head.content_length >= 0i64 && head.content_length != (n as i64) {
+            head.bad_length = true;
+          }
+          head.content_length = n as i64;
+        },
+        Option<u64>::None() => {
+          head.bad_length = true;
+        }
+      }
+      start = end + 1;
+    }
+    return;
+  }
+  if eq_lit_nocase(&name, "Transfer-Encoding") {
+    parse_transfer_encoding(&value, raw, head);
+    return;
+  }
+  if eq_lit_nocase(&name, "Location") && head.status >= 200 {
+    // An empty Location, or the same one again, changes nothing. A different second one is an
+    // error.
+    if value.len() == 0 || (head.has_location && same_bytes(&head.location, &value)) {
+      return;
+    }
+    if head.has_location {
+      set_error(head, WEIRD_SERVER_REPLY, lit("Multiple Location headers"));
+      return;
+    }
+    head.has_location = true;
+    head.location = value;
+    return;
+  }
+  if eq_lit_nocase(&name, "Content-Type") {
+    head.content_type = value;
+    return;
+  }
+  if eq_lit_nocase(&name, "Connection") && find_seq(&to_lower(&value), &lit("close"), 0) >= 0 {
+    head.close = true;
+  }
+}
+
+/// Whether a response with this status to this request has no body.
+pub fn has_no_body(status : i32, kind : i32) -> bool {
+  return kind == REQ_HEAD || status == 204 || status == 304 || (status >= 100 && status < 200);
+}
