@@ -163,6 +163,8 @@ struct RequestInfo {
   // The request is the probe of an authentication with an empty body: it says
   // `Content-Length: 0`, and a custom Content-Length does not go.
   probe : bool,
+  // The boundary of a multipart form (`-F`), or empty.
+  form_boundary : Vec<u8>,
 }
 
 fn add_line(out : &mut Vec<u8>, name : *const i8, value : &Vec<u8>) -> void {
@@ -277,6 +279,7 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
     let skip = h.ignored || h.remove || eq_lit_nocase(&h.name, "Host")
       || eq_lit_nocase(&h.name, "Connection")
       || (info.probe && eq_lit_nocase(&h.name, "Content-Length"))
+      || (info.form_boundary.len() > 0 && eq_lit_nocase(&h.name, "Content-Type"))
       || ((eq_lit_nocase(&h.name, "Authorization") || eq_lit_nocase(&h.name, "Cookie"))
           && !info.trusted_host);
     if !skip {
@@ -297,7 +300,21 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
       push_i64(&mut n, info.body_length);
       add_line(&mut out, "Content-Length: ", &n);
     }
-    if info.kind == REQ_POST && !has_custom(&info.headers, "Content-Type") {
+    if info.kind == REQ_POST && info.form_boundary.len() > 0 {
+      // A form: the type of a `-H "Content-Type: ..."`, or multipart/form-data, and the boundary.
+      let mut ct = lit("multipart/form-data");
+      for line in info.headers.iter() {
+        let h = split_header(line);
+        if !h.ignored && !h.remove && eq_lit_nocase(&h.name, "Content-Type") {
+          ct = trim_blanks(&h.value);
+        }
+      }
+      push_lit(&mut ct, "; boundary=");
+      append(&mut ct, &info.form_boundary);
+      add_line(&mut out, "Content-Type: ", &ct);
+    }
+    if info.kind == REQ_POST && info.form_boundary.len() == 0
+       && !has_custom(&info.headers, "Content-Type") {
       push_lit(&mut out, "Content-Type: application/x-www-form-urlencoded\r\n");
     }
     if !info.http10 && !has_custom(&info.headers, "Expect")

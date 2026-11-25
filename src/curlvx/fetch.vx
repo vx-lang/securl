@@ -391,8 +391,8 @@ struct Hop {
 /// `sinks`, unless curl follows the redirect that the response gives.
 fn one_hop(network : &Network, tls : &TlsConfig, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
 req_kind : i32, body : &Vec<u8>, creds : &Credentials, same_host : bool, has_referer : bool,
-referer : &Vec<u8>, deadline : Instant, auth : &mut AuthContext, sinks : &mut Sinks,
-info : &mut TransferInfo) -> Result<Hop, Failure> {
+referer : &Vec<u8>, deadline : Instant, form_boundary : &Vec<u8>, auth : &mut AuthContext,
+sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop, Failure> {
   let secure = eq_lit(&u.scheme, "https");
   let mut method = lit("GET");
   if cfg.has_method {
@@ -472,7 +472,8 @@ info : &mut TransferInfo) -> Result<Hop, Failure> {
     chunked : sends_body_now && chunked_upload,
     add_chunked_header : sends_body_now && chunked_upload
       && !has_custom(headers, "Transfer-Encoding"),
-    probe : probe
+    probe : probe,
+    form_boundary : form_text(req_kind, form_boundary)
   };
 
   let mut address = Vec<u8>::new();
@@ -635,6 +636,15 @@ info : &mut TransferInfo) -> Result<Hop, Failure> {
     status : head.status,
     location : clone_bytes(&head.location)
   });
+}
+
+/// The boundary of a form for a request of `kind`: a POST that a redirect turned into a GET has
+/// none.
+fn form_text(kind : i32, boundary : &Vec<u8>) -> Vec<u8> {
+  if kind == REQ_POST {
+    return clone_bytes(boundary);
+  }
+  return Vec<u8>::new();
 }
 
 // How many times one transfer sends a request again for authentication.
@@ -915,14 +925,15 @@ fn credentials_of(cfg : &Config, u : &Url) -> Credentials {
 /// `REQ_GET`, `REQ_POST`, `REQ_PUT` or `REQ_HEAD`. With `-m`, the whole transfer, redirects
 /// included, has that time limit.
 pub fn run_transfer(network : &Network, tls : &TlsConfig, cfg : &Config, headers : &Vec<Vec<u8>>,
-url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, sinks : &mut Sinks, info : &mut TransferInfo)
--> Result<i32, Failure> {
+url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>, sinks : &mut Sinks,
+info : &mut TransferInfo) -> Result<i32, Failure> {
   let started = Instant::now();
   let mut deadline = Instant::never();
   if cfg.max_time_ms > 0i64 {
     deadline = deadline_after(Duration::from_millis(cfg.max_time_ms as u64));
   }
-  match follow_redirects(network, tls, cfg, headers, url_text, body, kind, deadline, sinks, info) {
+  match follow_redirects(network, tls, cfg, headers, url_text, body, kind, deadline, form_boundary,
+    sinks, info) {
     Result<i32, Failure>::Ok(n) => {
       return Result<i32, Failure>::Ok(n);
     },
@@ -953,7 +964,7 @@ fn timeout_message(f : Failure, started : &Instant, info : &TransferInfo) -> Fai
 /// The transfer of `url_text`, and of each redirect that it follows, until `deadline`.
 fn follow_redirects(network : &Network, tls : &TlsConfig, cfg : &Config,
 headers : &Vec<Vec<u8>>, url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, deadline : Instant,
-sinks : &mut Sinks, info : &mut TransferInfo) -> Result<i32, Failure> {
+form_boundary : &Vec<u8>, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<i32, Failure> {
   let first = parse_url(url_text, cfg.path_as_is)?;
   let mut creds = credentials_of(cfg, &first);
   let mut auth = new_auth_context(cfg.auth_type, cfg.proxy_auth_type);
@@ -983,7 +994,7 @@ sinks : &mut Sinks, info : &mut TransferInfo) -> Result<i32, Failure> {
       creds = credentials_of(cfg, &u);
     }
     let hop = one_hop(network, tls, cfg, headers, &u, req_kind, body, &creds, same_host, has_referer,
-      &referer, deadline, &mut auth, sinks, info)?;
+      &referer, deadline, form_boundary, &mut auth, sinks, info)?;
     if hop.retry && auth_rounds < MAX_AUTH_ROUNDS {
       auth_rounds = auth_rounds + 1;
       continue;

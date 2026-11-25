@@ -13,12 +13,14 @@ import std::root;
 import std::vec;
 import sys::console;
 import sys::env;
+import sys::hash;
 import sys::text;
 import sys::tls;
 import curlvx::body;
 import curlvx::encode;
 import curlvx::bytes;
 import curlvx::failure;
+import curlvx::form;
 import curlvx::http;
 import curlvx::options;
 import curlvx::output;
@@ -75,6 +77,8 @@ fn print_help() -> void {
   push_lit(&mut m, " -d, --data <data>          HTTP POST data (--data-ascii, --data-raw, --data-binary)\n");
   push_lit(&mut m, "     --data-urlencode <data> HTTP POST data, URL-encoded\n");
   push_lit(&mut m, "     --json <data>          HTTP POST JSON\n");
+  push_lit(&mut m, " -F, --form <name=content>  Specify multipart MIME data\n");
+  push_lit(&mut m, "     --form-string <name=string> Specify multipart MIME data\n");
   push_lit(&mut m, " -f, --fail                 Fail fast with no output on HTTP errors\n");
   push_lit(&mut m, "     --fail-with-body       Fail on HTTP errors but save the body\n");
   push_lit(&mut m, " -G, --get                  Put the post data in the URL and use GET\n");
@@ -235,7 +239,52 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
       }
     }
   }
-  let request_body = build_body(&cfg.data, &contents);
+  let mut request_body = build_body(&cfg.data, &contents);
+
+  // A form (`-F`): read the files of its fields, and make the multipart body.
+  let mut form_boundary = Vec<u8>::new();
+  if cfg.forms.len() > 0 {
+    let mut parts = Vec<FormPart>::new();
+    for arg in cfg.forms.iter() {
+      match parse_form(&arg.text, arg.literal) {
+        Result<FormPart, Failure>::Ok(parsed) => {
+          let mut part = parsed;
+          if reads_file(&part) {
+            match read_file(files, &part.data) {
+              Result<Vec<u8>, Failure>::Ok(bytes) => {
+                part.content = bytes;
+              },
+              Result<Vec<u8>, Failure>::Err(_e) => {
+                let f = fail_lit(READ_ERROR,
+                  "Failed to open/read local data from file/application");
+                report(cfg, &f);
+                return f.code;
+              }
+            }
+          }
+          parts.push(part);
+        },
+        Result<FormPart, Failure>::Err(f) => {
+          let mut m = lit("curl: ");
+          append(&mut m, &f.message);
+          push_lit(&mut m, "\ncurl: try 'curl --help' for more information\n");
+          to_stderr(&m);
+          return f.code;
+        }
+      }
+    }
+    form_boundary = make_boundary(&random_bytes(22));
+    // A `-H "Content-Type: ..."` gives the type of the whole body.
+    let mut form_type = lit("multipart/form-data");
+    for line in cfg.headers.iter() {
+      let h = split_header(line);
+      if !h.ignored && !h.remove && eq_lit_nocase(&h.name, "Content-Type") {
+        form_type = trim_blanks(&h.value);
+      }
+    }
+    request_body = multipart_body(&parts, &form_boundary, type_is(&form_type, "multipart/form-data"),
+      cfg.form_escape);
+  }
 
   let mut headers = clone_lines(&cfg.headers);
   if has_json(&cfg.data) {
@@ -262,7 +311,7 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
   if cfg.head {
     other_kind = REQ_HEAD;
   } else {
-    if cfg.data.len() > 0 && !cfg.get_data {
+    if (cfg.data.len() > 0 && !cfg.get_data) || cfg.forms.len() > 0 {
       other_kind = REQ_POST;
     }
   }
@@ -288,7 +337,7 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
   match TlsConfig::new(files, cfg.insecure, &cfg.cacert, &cfg.capath) {
     Result<TlsConfig, TlsError>::Ok(t) => {
       return run_all(network, files, &t, cfg, &headers, &request_body, &upload_body, kind,
-        other_kind);
+        other_kind, &form_boundary);
     },
     Result<TlsConfig, TlsError>::Err(e) => {
       let f = fail_with(e.code, e.message);
@@ -301,7 +350,7 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
 /// Run the transfer of each URL, and give the exit code of the last one that failed.
 fn run_all(network : &Network, files : &Files, tls : &TlsConfig, cfg : &Config,
 headers : &Vec<Vec<u8>>, request_body : &Vec<u8>, upload_body : &Vec<u8>, kind : i32,
-other_kind : i32) -> i32 {
+other_kind : i32, form_boundary : &Vec<u8>) -> i32 {
   let mut exit_code = 0;
   let mut i = 0;
   while i < cfg.urls.len() {
@@ -328,10 +377,10 @@ other_kind : i32) -> i32 {
     let mut result = Result<i32, Failure>::Ok(0);
     if this_kind == REQ_PUT {
       result = transfer_one(network, files, tls, cfg, headers, &url_text, upload_body, this_kind,
-        i, &mut info);
+        form_boundary, i, &mut info);
     } else {
       result = transfer_one(network, files, tls, cfg, headers, &url_text, request_body, this_kind,
-        i, &mut info);
+        form_boundary, i, &mut info);
     }
     match result {
       Result<i32, Failure>::Ok(_v) => {},
@@ -390,8 +439,8 @@ fn write_pieces(files : &Files, pieces : &Vec<WriteOutPiece>) -> void {
 
 fn transfer_one(network : &Network, files : &Files, tls : &TlsConfig, cfg : &Config,
 headers : &Vec<Vec<u8>>,
-url_text : &Vec<u8>, request_body : &Vec<u8>, kind : i32, index : i32, info : &mut TransferInfo)
--> Result<i32, Failure> {
+url_text : &Vec<u8>, request_body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>, index : i32,
+info : &mut TransferInfo) -> Result<i32, Failure> {
   let body_output = open_output(files, cfg, index, url_text)?;
   let header_output = open_header_output(files, cfg)?;
   let mut sinks = Sinks {
@@ -399,5 +448,6 @@ url_text : &Vec<u8>, request_body : &Vec<u8>, kind : i32, index : i32, info : &m
     headers : header_output,
     has_headers : cfg.has_dump_header
   };
-  return run_transfer(network, tls, cfg, headers, url_text, request_body, kind, &mut sinks, info);
+  return run_transfer(network, tls, cfg, headers, url_text, request_body, kind, form_boundary,
+    &mut sinks, info);
 }

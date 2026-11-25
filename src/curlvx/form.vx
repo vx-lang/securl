@@ -1,0 +1,553 @@
+// `-F` and `--form-string`: the fields of a multipart/form-data POST, as the curl tool reads
+// them (`tool_formparse.c`) and as libcurl writes them (`mime.c`).
+//
+// `parse_form` reads one `-F` value. A field is text (`name=value`), the bytes of a file that
+// goes as a file (`name=@path`), or the text of a file (`name=<path`). Parameters after a `;`
+// give its `type=`, `filename=` and `headers=`. `main` reads the files, because only it has the
+// file right, and puts their bytes in `content`. `multipart_body` then writes the body.
+import core::option;
+import core::result;
+import std::vec;
+import sys::console;
+import sys::text;
+import curlvx::bytes;
+import curlvx::failure;
+
+// The kinds of field.
+const FORM_TEXT : i32 = 0;
+// `@path`: a file that goes with its name.
+const FORM_FILE : i32 = 1;
+// `<path`: the text of a file, with no file name.
+const FORM_FILE_TEXT : i32 = 2;
+
+/// One field of a form.
+struct FormPart {
+  has_name : bool,
+  name : Vec<u8>,
+  kind : i32,
+  // The text, or the path of the file. `-` is standard input.
+  data : Vec<u8>,
+  has_type : bool,
+  mime_type : Vec<u8>,
+  has_filename : bool,
+  filename : Vec<u8>,
+  // `headers=`: more header lines for the field.
+  headers : Vec<Vec<u8>>,
+  // The bytes of the field: the text, or the content of the file.
+  content : Vec<u8>,
+}
+
+/// A word of a `-F` value, and where the text after it starts (a `;`, a `,` or the end).
+struct Word {
+  value : Vec<u8>,
+  next : i32,
+  quoted : bool,
+}
+
+fn is_end(b : u8, comma : bool) -> bool {
+  return b == 59u8 || (comma && b == 44u8);
+}
+
+/// The word at `at` (curl's `get_param_word`). A quoted word may hold `\"` and `\\`. A word
+/// ends at a `;`, or at a `,` when `comma`.
+fn param_word(s : &Vec<u8>, at : i32, comma : bool) -> Word {
+  if at < s.len() && s.get(at) == 34u8 {
+    let mut value = Vec<u8>::new();
+    let mut i = at + 1;
+    while i < s.len() {
+      let b = s.get(i);
+      if b == 92u8 && i + 1 < s.len() && (s.get(i + 1) == 92u8 || s.get(i + 1) == 34u8) {
+        value.push(s.get(i + 1));
+        i = i + 2;
+        continue;
+      }
+      if b == 34u8 {
+        i = i + 1;
+        let mut trailing = false;
+        while i < s.len() && !is_end(s.get(i), comma) {
+          if !is_blank(s.get(i)) {
+            trailing = true;
+          }
+          i = i + 1;
+        }
+        if trailing {
+          warn_lit("Trailing data after quoted form parameter");
+        }
+        return Word {
+          value : value,
+          next : i,
+          quoted : true
+        };
+      }
+      value.push(b);
+      i = i + 1;
+    }
+    // No closing quote: the word is not quoted.
+  }
+  let mut i = at;
+  while i < s.len() && !is_end(s.get(i), comma) {
+    i = i + 1;
+  }
+  return Word {
+    value : range_of(s, at, i),
+    next : i,
+    quoted : false
+  };
+}
+
+/// `w` without the blanks at its end, unless it was quoted.
+fn word_value(w : &Word) -> Vec<u8> {
+  if w.quoted {
+    return clone_bytes(&w.value);
+  }
+  let mut end = w.value.len();
+  while end > 0 && is_blank(w.value.get(end - 1)) {
+    end = end - 1;
+  }
+  return range_of(&w.value, 0, end);
+}
+
+fn skip_blanks(s : &Vec<u8>, at : i32) -> i32 {
+  let mut i = at;
+  while i < s.len() && is_blank(s.get(i)) {
+    i = i + 1;
+  }
+  return i;
+}
+
+fn byte_at(s : &Vec<u8>, i : i32) -> u8 {
+  if i < s.len() {
+    return s.get(i);
+  }
+  return 0u8;
+}
+
+fn warn_lit(message : *const i8) -> void {
+  let mut m = lit("Warning: ");
+  push_lit(&mut m, message);
+  push_lit(&mut m, "\n");
+  let _w = write_stderr(&m);
+}
+
+/// The bytes that end a content type after `type=`.
+fn ends_type(b : u8) -> bool {
+  let stops = lit("()<>@,;:\\\"[]?=\r\n ");
+  return find_byte(&stops, b, 0) >= 0;
+}
+
+/// A field before its name and kind: the data word and the parameters after it.
+struct PartParams {
+  data : Vec<u8>,
+  has_type : bool,
+  mime_type : Vec<u8>,
+  has_filename : bool,
+  filename : Vec<u8>,
+  headers : Vec<Vec<u8>>,
+  // A `headers=@file` or an `encoder=`, which curl-vx does not do yet.
+  unsupported : bool,
+  // The byte where the parse stopped: a `,`, or 0 at the end.
+  sep : u8,
+  next : i32,
+}
+
+/// Read the data word at `at` and its parameters (curl's `get_param_part`). After `type=`,
+/// a parameter that curl does not know is part of the content type, as in
+/// `type=text/html;charset=utf-8`.
+fn param_part(s : &Vec<u8>, at : i32, comma : bool) -> PartParams {
+  let mut i = skip_blanks(s, at);
+  let w = param_word(s, i, comma);
+  let mut p = PartParams {
+    data : word_value(&w),
+    has_type : false,
+    mime_type : Vec<u8>::new(),
+    has_filename : false,
+    filename : Vec<u8>::new(),
+    headers : Vec<Vec<u8>>::new(),
+    unsupported : false,
+    sep : 0u8,
+    next : 0
+  };
+  i = w.next;
+  let mut type_start = 0;
+  let mut type_end = 0;
+  let mut in_type = false;
+  while byte_at(s, i) == 59u8 {
+    i = skip_blanks(s, i + 1);
+    let rest = rest_from(s, i);
+    let mut handled = false;
+    if !in_type && starts_lit_nocase(&rest, "type=") {
+      let mut j = skip_blanks(s, i + 5);
+      type_start = j;
+      while j < s.len() && !ends_type(s.get(j)) {
+        j = j + 1;
+      }
+      type_end = j;
+      in_type = true;
+      p.has_type = true;
+      i = j;
+      handled = true;
+    }
+    if !handled && (starts_lit_nocase(&rest, "filename=") || starts_lit_nocase(&rest, "headers=")
+        || starts_lit_nocase(&rest, "encoder=")) {
+      if in_type {
+        p.mime_type = range_of(s, type_start, type_end);
+        in_type = false;
+      }
+      let is_filename = starts_lit_nocase(&rest, "filename=");
+      let is_headers = starts_lit_nocase(&rest, "headers=");
+      let mut j = i + 8;
+      if is_filename {
+        j = i + 9;
+      }
+      if is_headers && (byte_at(s, j) == 64u8 || byte_at(s, j) == 60u8) {
+        // Header lines from a file.
+        p.unsupported = true;
+        j = j + 1;
+      }
+      j = skip_blanks(s, j);
+      let v = param_word(s, j, comma);
+      if is_filename {
+        p.has_filename = true;
+        p.filename = word_value(&v);
+      } else {
+        if is_headers && !p.unsupported {
+          p.headers.push(word_value(&v));
+        } else {
+          p.unsupported = true;
+        }
+      }
+      i = v.next;
+      handled = true;
+    }
+    if !handled && in_type {
+      // More of the content type.
+      let mut j = i;
+      while j < s.len() && !is_end(s.get(j), comma) {
+        if !is_blank(s.get(j)) {
+          type_end = j + 1;
+        }
+        j = j + 1;
+      }
+      i = j;
+      handled = true;
+    }
+    if !handled {
+      let v = param_word(s, i, comma);
+      if v.value.len() > 0 {
+        let mut m = lit("Warning: skip unknown form field: ");
+        append(&mut m, &v.value);
+        push_lit(&mut m, "\n");
+        let _w = write_stderr(&m);
+      }
+      i = v.next;
+    }
+  }
+  if in_type {
+    p.mime_type = range_of(s, type_start, type_end);
+  }
+  p.sep = byte_at(s, i);
+  p.next = i;
+  return p;
+}
+
+fn bad_form() -> Failure {
+  return fail_lit(FAILED_INIT, "option -F: is badly used here");
+}
+
+/// The file name of `path`: the part after the last `/`.
+fn base_name(path : &Vec<u8>) -> Vec<u8> {
+  let slash = rfind_byte(path, 47u8);
+  return rest_from(path, slash + 1);
+}
+
+/// Read one `-F` value (`literal` for `--form-string`, which takes the value as it is).
+pub fn parse_form(input : &Vec<u8>, literal : bool) -> Result<FormPart, Failure> {
+  let eq = find_byte(input, 61u8, 0);
+  if eq < 0 {
+    warn_lit("Illegally formatted input field");
+    return Result<FormPart, Failure>::Err(bad_form());
+  }
+  let mut part = FormPart {
+    has_name : eq > 0,
+    name : range_of(input, 0, eq),
+    kind : FORM_TEXT,
+    data : Vec<u8>::new(),
+    has_type : false,
+    mime_type : Vec<u8>::new(),
+    has_filename : false,
+    filename : Vec<u8>::new(),
+    headers : Vec<Vec<u8>>::new(),
+    content : Vec<u8>::new()
+  };
+  let first = byte_at(input, eq + 1);
+  if literal {
+    part.data = rest_from(input, eq + 1);
+    part.content = clone_bytes(&part.data);
+    return Result<FormPart, Failure>::Ok(part);
+  }
+  if first == 40u8 || (!part.has_name && eq_lit(&rest_from(input, eq + 1), ")")) {
+    // Nested multipart parts with `(` and `)`.
+    warn_lit("curl-vx does not support nested multipart forms yet");
+    return Result<FormPart, Failure>::Err(bad_form());
+  }
+  let mut start = eq + 1;
+  let mut comma = false;
+  if first == 64u8 {
+    part.kind = FORM_FILE;
+    start = start + 1;
+    comma = true;
+  }
+  if first == 60u8 {
+    part.kind = FORM_FILE_TEXT;
+    start = start + 1;
+  }
+  let p = param_part(input, start, comma);
+  if p.unsupported {
+    warn_lit("curl-vx does not support headers=@file and encoder= in a form yet");
+    return Result<FormPart, Failure>::Err(bad_form());
+  }
+  if p.sep == 44u8 {
+    warn_lit("curl-vx does not support more than one file in a form field yet");
+    return Result<FormPart, Failure>::Err(bad_form());
+  }
+  part.data = p.data;
+  part.has_type = p.has_type;
+  part.mime_type = p.mime_type;
+  part.headers = p.headers;
+  if part.kind == FORM_FILE_TEXT {
+    if p.has_filename {
+      let mut m = lit("Warning: Field filename not allowed here: ");
+      append(&mut m, &p.filename);
+      push_lit(&mut m, "\n");
+      let _w = write_stderr(&m);
+    }
+  } else {
+    part.has_filename = p.has_filename;
+    part.filename = p.filename;
+  }
+  if part.kind == FORM_FILE && !part.has_filename {
+    // A file goes with its name, and standard input with the name `-`.
+    part.has_filename = true;
+    part.filename = base_name(&part.data);
+  }
+  if part.kind == FORM_TEXT {
+    part.content = clone_bytes(&part.data);
+  }
+  return Result<FormPart, Failure>::Ok(part);
+}
+
+/// Whether the field gets its bytes from a file (or from standard input).
+pub fn reads_file(part : &FormPart) -> bool {
+  return part.kind == FORM_FILE || part.kind == FORM_FILE_TEXT;
+}
+
+/// The content type of a file name, from its extension (libcurl's `Curl_mime_contenttype`).
+fn type_of_name(name : &Vec<u8>) -> Option<Vec<u8>> {
+  let n = to_lower(name);
+  let mut ext = Vec<Vec<u8>>::new();
+  let mut types = Vec<Vec<u8>>::new();
+  ext.push(lit(".gif"));
+  types.push(lit("image/gif"));
+  ext.push(lit(".jpg"));
+  types.push(lit("image/jpeg"));
+  ext.push(lit(".jpeg"));
+  types.push(lit("image/jpeg"));
+  ext.push(lit(".png"));
+  types.push(lit("image/png"));
+  ext.push(lit(".svg"));
+  types.push(lit("image/svg+xml"));
+  ext.push(lit(".txt"));
+  types.push(lit("text/plain"));
+  ext.push(lit(".htm"));
+  types.push(lit("text/html"));
+  ext.push(lit(".html"));
+  types.push(lit("text/html"));
+  ext.push(lit(".pdf"));
+  types.push(lit("application/pdf"));
+  ext.push(lit(".xml"));
+  types.push(lit("application/xml"));
+  let mut i = 0;
+  while i < ext.len() {
+    let e = ext.get_ref(i);
+    if n.len() >= e.len() && has_at(&n, n.len() - e.len(), e) {
+      return Option<Vec<u8>>::Some(clone_bytes(types.get_ref(i)));
+    }
+    i = i + 1;
+  }
+  return Option<Vec<u8>>::None;
+}
+
+/// The value of the header `name` among the `headers=` lines of a field.
+fn user_header(headers : &Vec<Vec<u8>>, name : *const i8) -> Option<Vec<u8>> {
+  let want = lit(name);
+  for line in headers.iter() {
+    let colon = find_byte(line, 58u8, 0);
+    if colon > 0 && eq_nocase(&trim_blanks(&range_of(line, 0, colon)), &want) {
+      return Option<Vec<u8>>::Some(trim_blanks(&rest_from(line, colon + 1)));
+    }
+  }
+  return Option<Vec<u8>>::None;
+}
+
+/// Whether `ct` is `target`, maybe with parameters after it.
+pub fn type_is(ct : &Vec<u8>, target : *const i8) -> bool {
+  let t = lit(target);
+  if ct.len() < t.len() || !eq_nocase(&range_of(ct, 0, t.len()), &t) {
+    return false;
+  }
+  if ct.len() == t.len() {
+    return true;
+  }
+  let b = ct.get(t.len());
+  return b == 59u8 || is_blank(b);
+}
+
+/// The content type of a field (libcurl's `mime_prepare_headers` for a form).
+fn part_type(part : &FormPart) -> Option<Vec<u8>> {
+  if part.has_type {
+    return Option<Vec<u8>>::Some(clone_bytes(&part.mime_type));
+  }
+  match user_header(&part.headers, "Content-Type") {
+    Option<Vec<u8>>::Some(t) => {
+      return Option<Vec<u8>>::Some(t);
+    },
+    Option<Vec<u8>>::None() => {}
+  }
+  let mut found = Option<Vec<u8>>::None;
+  if part.has_filename {
+    found = type_of_name(&part.filename);
+  }
+  if reads_file(part) && found.is_none() && !eq_lit(&part.data, "-") {
+    found = type_of_name(&part.data);
+    if found.is_none() && part.has_filename {
+      found = Option<Vec<u8>>::Some(lit("application/octet-stream"));
+    }
+  }
+  match found {
+    Option<Vec<u8>>::Some(t) => {
+      // A form sends no text/plain type for a field with no file name.
+      if type_is(&t, "text/plain") && !part.has_filename {
+        return Option<Vec<u8>>::None;
+      }
+      return Option<Vec<u8>>::Some(t);
+    },
+    Option<Vec<u8>>::None() => {
+      return Option<Vec<u8>>::None;
+    }
+  }
+}
+
+/// A name or file name in Content-Disposition: `"`, CR and LF become `%22`, `%0D` and `%0A`. With
+/// `backslash` (`--form-escape`), `\` and `"` get a `\` instead.
+fn form_escape(s : &Vec<u8>, backslash : bool) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  if backslash {
+    for b in s.iter() {
+      if *b == 92u8 || *b == 34u8 {
+        out.push(92u8);
+      }
+      out.push(*b);
+    }
+    return out;
+  }
+  for b in s.iter() {
+    if *b == 34u8 {
+      push_lit(&mut out, "%22");
+    } else {
+      if *b == 13u8 {
+        push_lit(&mut out, "%0D");
+      } else {
+        if *b == 10u8 {
+          push_lit(&mut out, "%0A");
+        } else {
+          out.push(*b);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/// The multipart body of `parts`, with the boundary `boundary`. `form_data` says that the body
+/// is multipart/form-data, so that each field is `form-data`. Under another type (a `-H
+/// "Content-Type: ..."`), a field is an `attachment`. `backslash` is for `--form-escape`.
+pub fn multipart_body(parts : &Vec<FormPart>, boundary : &Vec<u8>, form_data : bool,
+backslash : bool) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  for part in parts.iter() {
+    push_lit(&mut out, "--");
+    append(&mut out, boundary);
+    push_lit(&mut out, "\r\n");
+    let ct = part_type(part);
+    let has_disposition = user_header(&part.headers, "Content-Disposition").is_some();
+    let mut wants_disposition = part.has_filename || part.has_name;
+    if !form_data && !part.has_filename && !part.has_name {
+      // An attachment with no name and no file name says nothing.
+      wants_disposition = false;
+    }
+    if form_data && ct.is_some() {
+      wants_disposition = true;
+    }
+    if wants_disposition && !has_disposition {
+      if form_data {
+        push_lit(&mut out, "Content-Disposition: form-data");
+      } else {
+        push_lit(&mut out, "Content-Disposition: attachment");
+      }
+      if part.has_name {
+        push_lit(&mut out, "; name=\"");
+        append(&mut out, &form_escape(&part.name, backslash));
+        push_lit(&mut out, "\"");
+      }
+      if part.has_filename {
+        push_lit(&mut out, "; filename=\"");
+        append(&mut out, &form_escape(&part.filename, backslash));
+        push_lit(&mut out, "\"");
+      }
+      push_lit(&mut out, "\r\n");
+    }
+    match ct {
+      Option<Vec<u8>>::Some(t) => {
+        push_lit(&mut out, "Content-Type: ");
+        append(&mut out, &t);
+        push_lit(&mut out, "\r\n");
+      },
+      Option<Vec<u8>>::None() => {}
+    }
+    // libcurl writes the Content-Type itself, so a user line for it does not go.
+    for line in part.headers.iter() {
+      let colon = find_byte(line, 58u8, 0);
+      let is_type = colon > 0 && eq_lit_nocase(&trim_blanks(&range_of(line, 0, colon)),
+        "Content-Type");
+      if !is_type {
+        append(&mut out, line);
+        push_lit(&mut out, "\r\n");
+      }
+    }
+    push_lit(&mut out, "\r\n");
+    append(&mut out, &part.content);
+    push_lit(&mut out, "\r\n");
+  }
+  push_lit(&mut out, "--");
+  append(&mut out, boundary);
+  push_lit(&mut out, "--\r\n");
+  return out;
+}
+
+/// A boundary as libcurl makes it: 24 dashes and 22 letters and digits from `random`, which
+/// gives at least 22 bytes.
+pub fn make_boundary(random : &Vec<u8>) -> Vec<u8> {
+  let alnum = lit("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ");
+  let mut out = Vec<u8>::new();
+  let mut i = 0;
+  while i < 24 {
+    out.push(45u8);
+    i = i + 1;
+  }
+  i = 0;
+  while i < 22 {
+    out.push(alnum.get((random.get(i) % 62u8) as i32));
+    i = i + 1;
+  }
+  return out;
+}

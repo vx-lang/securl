@@ -52,8 +52,8 @@ Vx main d3ed6cf0b.
 
 | Test set | Passed |
 |---|---|
-| All tests with the keyword `HTTP` that runtests.pl runs for curl-vx | 458 of 855 (54%) |
-| The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 399 of 478 (83%) |
+| All tests with the keyword `HTTP` that runtests.pl runs for curl-vx | 472 of 855 (55%) |
+| The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 414 of 498 (83%) |
 | TLS and time-limit tests against local servers (`tests/tls`) | 18 of 18 |
 | Unit tests (`tests/unit`) | 4 of 4 |
 
@@ -65,8 +65,8 @@ curl's test suite"). Before Digest, curl-vx passed 409 of those 855.
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/curlvx/` (the package with all protocol code) | 4,655 | none, and `--no-trusted-code` enforces this |
-| `src/main.vx`, `src/disk.vx` | 512 | none |
+| `src/curlvx/` (the package with all protocol code) | 5,267 | none, and `--no-trusted-code` enforces this |
+| `src/main.vx`, `src/disk.vx` | 569 | none |
 | `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 827 | 37 `extern` functions, 51 `unsafe` blocks |
 
 Of the trusted code in `src/sys/`, 77 of the 88 items are the OpenSSL bindings: TLS in `tls.vx`,
@@ -153,7 +153,8 @@ missing options that block the most tests.
 ## Options
 
 `-A` `-b` (a cookie string) `-d` `--data-ascii` `--data-raw` `--data-binary` `--data-urlencode`
-`--json` `-D` `-e` (with `;auto`) `-f` `--fail-with-body` `-G` `-H` (with the `name:` and
+`--json` `-F` (with `@file`, `<file`, `type=`, `filename=` and `headers=`) `--form-string`
+`--form-escape` `-D` `-e` (with `;auto`) `-f` `--fail-with-body` `-G` `-H` (with the `name:` and
 `name;` forms) `-I` `-i` `-k` `--cacert` `--capath` `-L` `--location-trusted` `--max-redirs`
 `-o` `-O` `--remote-name-all` `--output-dir` `-r` `-s` `-S` `-T` `-u` `--digest` `--basic`
 `--anyauth` `-v` `-w` (most variables, `%header{}`, `%output{}`, `%{stderr}`) `-X` `-x` `-U`
@@ -161,8 +162,8 @@ missing options that block the most tests.
 `--path-as-is` `--raw` `-0` `--url` `-m` `--connect-timeout` `-h` `-V`, and the options that
 runtests.pl adds: `-q` `--trace-ascii` `--trace-time`.
 
-The 2025 curl user survey asked for each user's favourite option. curl-vx accepts 18 of the top
-20 answers. It does not have `--libcurl` and `-F`. `-vv` and `-vvv` work as `-v`, and `-w` has no
+The 2025 curl user survey asked for each user's favourite option. curl-vx accepts 19 of the top
+20 answers. It does not have `--libcurl`. `-vv` and `-vvv` work as `-v`, and `-w` has no
 time variables yet.
 
 ## Not done yet
@@ -170,10 +171,10 @@ time variables yet.
 In order of how much users need them:
 
 1. HTTP/2 (73% of survey users), connection reuse, compression (`--compressed`).
-1. URL globbing (`{a,b}` and `[1-9]`), the cookie engine (`-c`, cookie files), `-F` multipart
-   forms, `--next`, `-J`, `-C` resume, `-K` config files, `--netrc`, `http_proxy` and
-   `NO_PROXY` variables (Vx has no safe way to read the environment), HTTPS proxies, and
-   Digest with the proxy of a CONNECT tunnel.
+1. URL globbing (`{a,b}` and `[1-9]`), the cookie engine (`-c`, cookie files), `--next`, `-J`,
+   `-C` resume, `-K` config files, `--netrc`, several files in one `-F` field, nested
+   multipart forms and `-F` encoders, `http_proxy` and `NO_PROXY` variables (Vx has no safe
+   way to read the environment), HTTPS proxies, and Digest with the proxy of a CONNECT tunnel.
 1. HTTP/3.
 
 ## Vx issues found while writing curl-vx

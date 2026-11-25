@@ -26,6 +26,12 @@ struct DataPart {
   text : Vec<u8>,
 }
 
+/// One `-F` or `--form-string` value. `literal` is for `--form-string`.
+struct FormArg {
+  literal : bool,
+  text : Vec<u8>,
+}
+
 /// What the command line asks for.
 struct Config {
   urls : Vec<Vec<u8>>,
@@ -93,6 +99,10 @@ struct Config {
   auth_type : i32,
   // The same for the proxy: `--proxy-basic`, `--proxy-digest` and `--proxy-anyauth`.
   proxy_auth_type : i32,
+  // The fields of a multipart form, in order.
+  forms : Vec<FormArg>,
+  // `--form-escape`: escape names and file names with backslashes.
+  form_escape : bool,
 }
 
 /// A `Config` with curl's defaults.
@@ -156,7 +166,9 @@ pub fn default_config() -> Config {
     cacert : Vec<u8>::new(),
     capath : Vec<u8>::new(),
     auth_type : 0,
-    proxy_auth_type : 0
+    proxy_auth_type : 0,
+    forms : Vec<FormArg>::new(),
+    form_escape : false
   };
 }
 
@@ -223,6 +235,9 @@ const OPT_ANYAUTH : i32 = 58;
 const OPT_PROXY_DIGEST : i32 = 59;
 const OPT_PROXY_BASIC : i32 = 62;
 const OPT_PROXY_ANYAUTH : i32 = 63;
+const OPT_FORM : i32 = 64;
+const OPT_FORM_STRING : i32 = 65;
+const OPT_FORM_ESCAPE : i32 = 66;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -291,6 +306,9 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "proxy-digest") { return OPT_PROXY_DIGEST; }
   if eq_lit(name, "proxy-basic") { return OPT_PROXY_BASIC; }
   if eq_lit(name, "proxy-anyauth") { return OPT_PROXY_ANYAUTH; }
+  if eq_lit(name, "form") { return OPT_FORM; }
+  if eq_lit(name, "form-string") { return OPT_FORM_STRING; }
+  if eq_lit(name, "form-escape") { return OPT_FORM_ESCAPE; }
   if eq_lit(name, "cacert") { return OPT_CACERT; }
   if eq_lit(name, "capath") { return OPT_CAPATH; }
   return OPT_UNKNOWN;
@@ -299,6 +317,7 @@ fn long_option(name : &Vec<u8>) -> i32 {
 /// The option of a short letter such as `H`.
 fn short_option(letter : u8) -> i32 {
   if letter == 65u8 { return OPT_USER_AGENT; }      // A
+  if letter == 70u8 { return OPT_FORM; }            // F
   if letter == 98u8 { return OPT_COOKIE; }          // b
   if letter == 100u8 { return OPT_DATA; }           // d
   if letter == 68u8 { return OPT_DUMP_HEADER; }     // D
@@ -335,7 +354,8 @@ fn short_option(letter : u8) -> i32 {
 
 /// Whether the option takes a value.
 fn takes_value(id : i32) -> bool {
-  return (id >= OPT_USER_AGENT && id <= OPT_OUTPUT_DIR) || id == OPT_CACERT || id == OPT_CAPATH;
+  return (id >= OPT_USER_AGENT && id <= OPT_OUTPUT_DIR) || id == OPT_CACERT || id == OPT_CAPATH
+    || id == OPT_FORM || id == OPT_FORM_STRING;
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -451,6 +471,13 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
   }
   if id == OPT_HEADER {
     cfg.headers.push(clone_bytes(value));
+    return done();
+  }
+  if id == OPT_FORM || id == OPT_FORM_STRING {
+    cfg.forms.push(FormArg {
+      literal : id == OPT_FORM_STRING,
+      text : clone_bytes(value)
+    });
     return done();
   }
   if id == OPT_MAX_TIME || id == OPT_CONNECT_TIMEOUT {
@@ -632,6 +659,10 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
   }
   if id == OPT_RAW {
     cfg.raw = enable;
+    return done();
+  }
+  if id == OPT_FORM_ESCAPE {
+    cfg.form_escape = enable;
     return done();
   }
   if id == OPT_DIGEST {
