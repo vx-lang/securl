@@ -162,9 +162,11 @@ The Vx project tracks these.
   [#4004](https://github.com/vx-lang/Vx/issues/4004): a reference cannot be pointed at another
   field, `assert(false, ..)` fails at compile time on a path that never runs, and there is no
   `ref mut` pattern or `Option::as_mut`.
-- A loop that reassigned a `Url` variable (`u = next;`) got E4009 ("`u` is assigned while it is
-  borrowed"), and smaller programs with the same shape compile. `fetch.vx` carries the URL as
-  text instead. The cause is not known yet.
+- [#4010](https://github.com/vx-lang/Vx/issues/4010) In a loop, `info.url_effective =
+  url_text(&u);` makes the checker think that `info` borrows `u`, so a later `u = next;` gets
+  E4009. The result of `url_text` holds no reference. `fetch.vx` carries the URL as text
+  instead. Binding the result first (`let t = url_text(&u); info.url_effective = t;`) also
+  works.
 
 ## Layout
 
