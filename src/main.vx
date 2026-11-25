@@ -94,6 +94,9 @@ fn print_help() -> void {
   push_lit(&mut m, " -S, --show-error           Show error even when -s is used\n");
   push_lit(&mut m, " -T, --upload-file <file>   Transfer local FILE to destination\n");
   push_lit(&mut m, " -u, --user <user:password> Server user and password\n");
+  push_lit(&mut m, "     --digest               HTTP Digest Authentication\n");
+  push_lit(&mut m, "     --basic                HTTP Basic Authentication (the default)\n");
+  push_lit(&mut m, "     --anyauth              Pick any authentication method\n");
   push_lit(&mut m, " -A, --user-agent <name>    Send User-Agent <name> to server\n");
   push_lit(&mut m, " -e, --referer <URL>        Referrer URL\n");
   push_lit(&mut m, " -b, --cookie <data>        Send cookies from string\n");
@@ -103,6 +106,10 @@ fn print_help() -> void {
   push_lit(&mut m, " -X, --request <method>     Specify request method to use\n");
   push_lit(&mut m, " -x, --proxy <proxy>        Use this HTTP proxy\n");
   push_lit(&mut m, " -U, --proxy-user <u:p>     Proxy user and password\n");
+  push_lit(&mut m, "     --proxy-digest         Digest Authentication with the proxy\n");
+  push_lit(&mut m, "     --proxy-anyauth        Pick any proxy authentication method\n");
+  push_lit(&mut m, " -m, --max-time <seconds>   Maximum time allowed for transfer\n");
+  push_lit(&mut m, "     --connect-timeout <seconds> Maximum time allowed to connect\n");
   push_lit(&mut m, "     --noproxy <hosts>      List of hosts which do not use a proxy\n");
   push_lit(&mut m, "     --resolve <host:port:addr> Resolve the host+port to this address\n");
   push_lit(&mut m, "     --connect-to <HOST1:PORT1:HOST2:PORT2> Connect to host\n");

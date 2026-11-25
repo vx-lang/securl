@@ -7,6 +7,7 @@ import core::option;
 import core::result;
 import std::vec;
 import sys::text;
+import curlvx::auth;
 import curlvx::bytes;
 import curlvx::failure;
 
@@ -87,6 +88,11 @@ struct Config {
   insecure : bool,
   cacert : Vec<u8>,
   capath : Vec<u8>,
+  // The authentication methods of `--basic`, `--digest` and `--anyauth`, as `AUTH_` bits. 0
+  // means Basic, libcurl's default.
+  auth_type : i32,
+  // The same for the proxy: `--proxy-basic`, `--proxy-digest` and `--proxy-anyauth`.
+  proxy_auth_type : i32,
 }
 
 /// A `Config` with curl's defaults.
@@ -148,7 +154,9 @@ pub fn default_config() -> Config {
     output_dir : Vec<u8>::new(),
     insecure : false,
     cacert : Vec<u8>::new(),
-    capath : Vec<u8>::new()
+    capath : Vec<u8>::new(),
+    auth_type : 0,
+    proxy_auth_type : 0
   };
 }
 
@@ -209,6 +217,12 @@ const OPT_NO_PROGRESS_METER : i32 = 52;
 const OPT_NO_BUFFER : i32 = 53;
 const OPT_RAW : i32 = 54;
 const OPT_COMPRESSED : i32 = 55;
+const OPT_DIGEST : i32 = 56;
+const OPT_BASIC : i32 = 57;
+const OPT_ANYAUTH : i32 = 58;
+const OPT_PROXY_DIGEST : i32 = 59;
+const OPT_PROXY_BASIC : i32 = 62;
+const OPT_PROXY_ANYAUTH : i32 = 63;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -271,6 +285,12 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "buffer") { return OPT_NO_BUFFER; }
   if eq_lit(name, "raw") { return OPT_RAW; }
   if eq_lit(name, "compressed") { return OPT_COMPRESSED; }
+  if eq_lit(name, "digest") { return OPT_DIGEST; }
+  if eq_lit(name, "basic") { return OPT_BASIC; }
+  if eq_lit(name, "anyauth") { return OPT_ANYAUTH; }
+  if eq_lit(name, "proxy-digest") { return OPT_PROXY_DIGEST; }
+  if eq_lit(name, "proxy-basic") { return OPT_PROXY_BASIC; }
+  if eq_lit(name, "proxy-anyauth") { return OPT_PROXY_ANYAUTH; }
   if eq_lit(name, "cacert") { return OPT_CACERT; }
   if eq_lit(name, "capath") { return OPT_CAPATH; }
   return OPT_UNKNOWN;
@@ -614,6 +634,30 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     cfg.raw = enable;
     return done();
   }
+  if id == OPT_DIGEST {
+    cfg.auth_type = toggle_bit(cfg.auth_type, AUTH_DIGEST, enable);
+    return done();
+  }
+  if id == OPT_BASIC {
+    cfg.auth_type = toggle_bit(cfg.auth_type, AUTH_BASIC, enable);
+    return done();
+  }
+  if id == OPT_ANYAUTH {
+    cfg.auth_type = AUTH_ANY;
+    return done();
+  }
+  if id == OPT_PROXY_DIGEST {
+    cfg.proxy_auth_type = toggle_bit(cfg.proxy_auth_type, AUTH_DIGEST, enable);
+    return done();
+  }
+  if id == OPT_PROXY_BASIC {
+    cfg.proxy_auth_type = toggle_bit(cfg.proxy_auth_type, AUTH_BASIC, enable);
+    return done();
+  }
+  if id == OPT_PROXY_ANYAUTH {
+    cfg.proxy_auth_type = toggle_bit(cfg.proxy_auth_type, AUTH_ANY, enable);
+    return done();
+  }
   if id == OPT_COMPRESSED {
     if enable {
       return Result<i32, Failure>::Err(fail_with(NOT_BUILT_IN,
@@ -625,6 +669,14 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
   // OPT_GLOBOFF, OPT_TRACE_TIME, OPT_PROGRESS_BAR, OPT_NO_PROGRESS_METER and OPT_NO_BUFFER
   // change nothing that curl-vx does.
   return Result<i32, Failure>::Ok(0);
+}
+
+/// `bits` with `bit` set when `enable`, and cleared when not (curl's `togglebit`).
+fn toggle_bit(bits : i32, bit : i32, enable : bool) -> i32 {
+  if enable {
+    return bits | bit;
+  }
+  return bits & (AUTH_ANY - bit);
 }
 
 /// Parse the command-line arguments, without the program name, into a `Config`.

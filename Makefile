@@ -55,8 +55,9 @@ build/curl-vx: $(SRCS) $(TLS_DEPS)
 audit:
 	PATH="$(LLVM_BIN):$$PATH" $(VXC) $(PKGS) --audit src/main.vx
 
-unit:
-	VXC="$(VXC)" VX_LIBDIR="$(VX_LIBDIR)" LLVM_BIN="$(LLVM_BIN)" ./tests/unit/run.sh
+unit: $(TLS_DEPS)
+	VXC="$(VXC)" VX_LIBDIR="$(VX_LIBDIR)" LLVM_BIN="$(LLVM_BIN)" TLS_LIBS="$(TLS_LIBS)" \
+	  ./tests/unit/run.sh
 
 test: build/curl-vx
 	./tests/run-curl-tests.sh $(CURL_SRC) $(TESTS)
@@ -81,6 +82,13 @@ $(OPENSSL_STAMP):
 
 openssl: $(TLS_DEPS)
 
+# The headers and static libraries of the OpenSSL build, installed under build/openssl-dev, for
+# building curl's own test suite with a crypto library (README.md, "Run curl's test suite").
+OPENSSL_DEV = build/openssl-dev
+openssl-dev: $(OPENSSL_STAMP)
+	$(MAKE) -C $(OPENSSL_BUILD) install_dev DESTDIR=$(CURDIR)/$(OPENSSL_DEV) > $(OPENSSL_BUILD)/install.log
+	@echo "OpenSSL for cmake: -DOPENSSL_ROOT_DIR=$(CURDIR)/$(OPENSSL_DEV)/usr/local"
+
 # `clean` keeps the OpenSSL build, which takes minutes. `distclean` removes it too.
 clean:
 	rm -rf build/curl-vx build/curl-vx.o build/unit
@@ -88,4 +96,4 @@ clean:
 distclean:
 	rm -rf build
 
-.PHONY: all audit unit test test-supported test-tls clean distclean openssl
+.PHONY: all audit unit test test-supported test-tls clean distclean openssl openssl-dev

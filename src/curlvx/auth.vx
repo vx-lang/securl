@@ -1,0 +1,727 @@
+// HTTP authentication as libcurl does it: Basic and Digest (RFC 7616), the choice between the
+// methods that a server offers, and the Digest messages.
+//
+// A transfer keeps an `AuthState` and a `DigestState` from one request to the next:
+//
+// 1. Before a request, `output_auth` gives the Authorization header, if any. With `--digest`,
+//    the first request has none, because the server has not sent its nonce yet. A POST or a PUT
+//    then goes with an empty body, as a probe.
+// 2. Each `WWW-Authenticate` header of a 401 goes to `take_challenge`.
+// 3. After the headers, `auth_act` says whether to send the request again: after a 401 with a
+//    method that fits, or after a probe that needed no authentication.
+//
+// The hashes and the random client nonce come from OpenSSL, through `sys::hash`.
+import core::option;
+import std::vec;
+import sys::hash;
+import sys::text;
+import curlvx::bytes;
+import curlvx::encode;
+
+// Authentication methods, as bits. The values are libcurl's CURLAUTH_ values.
+const AUTH_NONE : i32 = 0;
+const AUTH_BASIC : i32 = 1;
+const AUTH_DIGEST : i32 = 2;
+// `--anyauth`: each method but the old Digest of Internet Explorer.
+const AUTH_ANY : i32 = 2147483631;
+// No method fits: send no credentials.
+const AUTH_PICKNONE : i32 = 1073741824;
+
+// What `decode_challenge` found.
+const DIGEST_OK : i32 = 0;
+// The challenge asks for something that curl-vx cannot do. Ignore it.
+const DIGEST_NOT_BUILT_IN : i32 = 1;
+// The challenge is wrong, or it says that the credentials were wrong.
+const DIGEST_BAD : i32 = 2;
+
+// libcurl's limits for one `key=value` of a challenge.
+const DIGEST_MAX_KEY_LENGTH : i32 = 256;
+const DIGEST_MAX_VALUE_LENGTH : i32 = 1024;
+
+/// The authentication of one side, the server (libcurl's `struct auth`).
+struct AuthState {
+  // The methods that the user allows (`--basic`, `--digest`, `--anyauth`).
+  want : i32,
+  // The method in use, or `AUTH_PICKNONE`.
+  picked : i32,
+  // The methods that the server offered in its last 401.
+  avail : i32,
+  // The method needs no more round trips.
+  done : bool,
+  // The method needs more than one request.
+  multipass : bool,
+}
+
+/// An `AuthState` before the first request, for the methods `want`.
+pub fn new_auth_state(want : i32) -> AuthState {
+  return AuthState {
+    want : want,
+    picked : AUTH_NONE,
+    avail : AUTH_NONE,
+    done : false,
+    multipass : false
+  };
+}
+
+/// What the last Digest challenge said (libcurl's `struct digestdata`).
+struct DigestState {
+  has_nonce : bool,
+  nonce : Vec<u8>,
+  realm : Vec<u8>,
+  has_opaque : bool,
+  opaque : Vec<u8>,
+  // "auth" or "auth-int", when the server asked for one.
+  has_qop : bool,
+  qop : Vec<u8>,
+  // The algorithm as the server wrote it, which the response repeats.
+  has_algorithm : bool,
+  algorithm : Vec<u8>,
+  // The hash function (`HASH_MD5` and so on) and whether it is a `-sess` variant.
+  hash : i32,
+  sess : bool,
+  stale : bool,
+  userhash : bool,
+  // The nonce count, for `qop`.
+  nc : i64,
+  has_cnonce : bool,
+  cnonce : Vec<u8>,
+  // The server (`host:port`) and the credentials that the state belongs to.
+  has_origin : bool,
+  origin : Vec<u8>,
+  has_creds : bool,
+  creds_user : Vec<u8>,
+  creds_password : Vec<u8>,
+}
+
+/// A `DigestState` with no challenge.
+pub fn new_digest_state() -> DigestState {
+  return DigestState {
+    has_nonce : false,
+    nonce : Vec<u8>::new(),
+    realm : Vec<u8>::new(),
+    has_opaque : false,
+    opaque : Vec<u8>::new(),
+    has_qop : false,
+    qop : Vec<u8>::new(),
+    has_algorithm : false,
+    algorithm : Vec<u8>::new(),
+    hash : HASH_MD5,
+    sess : false,
+    stale : false,
+    userhash : false,
+    nc : 0i64,
+    has_cnonce : false,
+    cnonce : Vec<u8>::new(),
+    has_origin : false,
+    origin : Vec<u8>::new(),
+    has_creds : false,
+    creds_user : Vec<u8>::new(),
+    creds_password : Vec<u8>::new()
+  };
+}
+
+/// Forget the challenge, the server and the credentials (libcurl's `Curl_auth_digest_cleanup`).
+fn reset_digest(d : &mut DigestState) -> void {
+  let fresh = new_digest_state();
+  *d = fresh;
+}
+
+fn skip_blanks(s : &Vec<u8>, at : i32) -> i32 {
+  let mut i = at;
+  while i < s.len() && is_blank(s.get(i)) {
+    i = i + 1;
+  }
+  return i;
+}
+
+fn is_alnum(b : u8) -> bool {
+  return is_digit(b) || (b >= 65u8 && b <= 90u8) || (b >= 97u8 && b <= 122u8);
+}
+
+/// Whether `s` has the method name `name` at `at`, with no letter or digit after it.
+fn method_at(s : &Vec<u8>, at : i32, name : *const i8) -> bool {
+  let n = lit(name);
+  let end = at + n.len();
+  if end > s.len() || !eq_nocase(&range_of(s, at, end), &n) {
+    return false;
+  }
+  return end == s.len() || !is_alnum(s.get(end));
+}
+
+/// One `key=value` or `key="value"` of a challenge.
+struct Pair {
+  ok : bool,
+  key : Vec<u8>,
+  value : Vec<u8>,
+  // Where the text after the pair starts.
+  next : i32,
+}
+
+fn no_pair() -> Pair {
+  return Pair {
+    ok : false,
+    key : Vec<u8>::new(),
+    value : Vec<u8>::new(),
+    next : 0
+  };
+}
+
+/// The pair at `at` of `s`, read as libcurl reads it (`Curl_auth_digest_get_pair`). A quoted
+/// value may hold `\"`. An unquoted value ends at a comma, which the pair takes.
+fn digest_pair(s : &Vec<u8>, at : i32) -> Pair {
+  let mut i = at;
+  while i < s.len() && s.get(i) != 61u8 {
+    i = i + 1;
+  }
+  let key_length = i - at;
+  if key_length == 0 || key_length > DIGEST_MAX_KEY_LENGTH || i >= s.len() {
+    return no_pair();
+  }
+  let key = range_of(s, at, i);
+  i = i + 1;
+  let mut quoted = false;
+  if i < s.len() && s.get(i) == 34u8 {
+    quoted = true;
+    i = i + 1;
+  }
+  let mut value = Vec<u8>::new();
+  let mut escape = false;
+  let mut budget = DIGEST_MAX_VALUE_LENGTH;
+  while i < s.len() && budget > 0 {
+    budget = budget - 1;
+    let b = s.get(i);
+    if !escape {
+      if b == 92u8 && quoted {
+        escape = true;
+        i = i + 1;
+        continue;
+      }
+      if b == 44u8 && !quoted {
+        i = i + 1;
+        break;
+      }
+      if b == 13u8 || b == 10u8 {
+        if quoted {
+          return no_pair();
+        }
+        i = i + 1;
+        break;
+      }
+      if b == 34u8 {
+        if !quoted {
+          return no_pair();
+        }
+        i = i + 1;
+        break;
+      }
+    }
+    if value.len() >= DIGEST_MAX_VALUE_LENGTH - 1 {
+      return no_pair();
+    }
+    escape = false;
+    value.push(b);
+    i = i + 1;
+  }
+  if escape {
+    return no_pair();
+  }
+  return Pair {
+    ok : true,
+    key : key,
+    value : value,
+    next : i
+  };
+}
+
+/// Read the `qop` list of a challenge: "auth" wins over "auth-int", and other values do not
+/// count.
+fn take_qop(value : &Vec<u8>, d : &mut DigestState) -> void {
+  let mut found_auth = false;
+  let mut found_auth_int = false;
+  let mut t = skip_blanks(value, 0);
+  loop {
+    let mut e = t;
+    while e < value.len() && value.get(e) != 44u8 {
+      e = e + 1;
+    }
+    if e == t || e - t > 32 {
+      break;
+    }
+    let token = range_of(value, t, e);
+    if eq_lit_nocase(&token, "auth") {
+      found_auth = true;
+    }
+    if eq_lit_nocase(&token, "auth-int") {
+      found_auth_int = true;
+    }
+    if e >= value.len() {
+      break;
+    }
+    t = skip_blanks(value, e + 1);
+  }
+  if found_auth {
+    d.has_qop = true;
+    d.qop = lit("auth");
+    return;
+  }
+  if found_auth_int {
+    d.has_qop = true;
+    d.qop = lit("auth-int");
+  }
+}
+
+/// Set the hash function of the algorithm `name`. False for an algorithm that curl does not
+/// know.
+fn take_algorithm(name : &Vec<u8>, d : &mut DigestState) -> bool {
+  d.has_algorithm = true;
+  d.algorithm = clone_bytes(name);
+  if eq_lit_nocase(name, "MD5") {
+    d.hash = HASH_MD5;
+    d.sess = false;
+    return true;
+  }
+  if eq_lit_nocase(name, "MD5-sess") {
+    d.hash = HASH_MD5;
+    d.sess = true;
+    return true;
+  }
+  if eq_lit_nocase(name, "SHA-256") {
+    d.hash = HASH_SHA256;
+    d.sess = false;
+    return true;
+  }
+  if eq_lit_nocase(name, "SHA-256-SESS") {
+    d.hash = HASH_SHA256;
+    d.sess = true;
+    return true;
+  }
+  if eq_lit_nocase(name, "SHA-512-256") {
+    d.hash = HASH_SHA512_256;
+    d.sess = false;
+    return true;
+  }
+  if eq_lit_nocase(name, "SHA-512-256-SESS") {
+    d.hash = HASH_SHA512_256;
+    d.sess = true;
+    return true;
+  }
+  return false;
+}
+
+/// Read the parameters of a Digest challenge, from `at` of `s` (after the word `Digest`), into
+/// `d` (libcurl's `Curl_auth_decode_digest_http_message`). A second nonce without `stale=true`
+/// means that the server refused the credentials.
+pub fn decode_challenge(s : &Vec<u8>, at : i32, d : &mut DigestState) -> i32 {
+  let before = d.has_nonce;
+  reset_digest(d);
+  let mut i = at;
+  loop {
+    i = skip_blanks(s, i);
+    let p = digest_pair(s, i);
+    if !p.ok {
+      break;
+    }
+    i = p.next;
+    if eq_lit_nocase(&p.key, "nonce") {
+      d.has_nonce = true;
+      d.nonce = clone_bytes(&p.value);
+    }
+    if eq_lit_nocase(&p.key, "stale") && eq_lit_nocase(&p.value, "true") {
+      d.stale = true;
+      d.nc = 1i64;
+    }
+    if eq_lit_nocase(&p.key, "realm") {
+      d.realm = clone_bytes(&p.value);
+    }
+    if eq_lit_nocase(&p.key, "opaque") {
+      d.has_opaque = true;
+      d.opaque = clone_bytes(&p.value);
+    }
+    if eq_lit_nocase(&p.key, "qop") {
+      take_qop(&p.value, d);
+    }
+    if eq_lit_nocase(&p.key, "algorithm") && !take_algorithm(&p.value, d) {
+      return DIGEST_BAD;
+    }
+    if eq_lit_nocase(&p.key, "userhash") && eq_lit_nocase(&p.value, "true") {
+      d.userhash = true;
+    }
+    i = skip_blanks(s, i);
+    if i < s.len() && s.get(i) == 44u8 {
+      i = i + 1;
+    }
+  }
+  if before && !d.stale {
+    return DIGEST_BAD;
+  }
+  if !d.has_nonce {
+    return DIGEST_BAD;
+  }
+  if !d.has_qop && d.sess {
+    return DIGEST_BAD;
+  }
+  return DIGEST_OK;
+}
+
+/// `bytes` in lower-case hexadecimal.
+fn hex_lower(bytes : &Vec<u8>) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  for b in bytes.iter() {
+    out.push(ascii_lower(hex_digit(*b / 16u8)));
+    out.push(ascii_lower(hex_digit(*b % 16u8)));
+  }
+  return out;
+}
+
+/// `s` as the inside of a quoted string: `"` and `\` get a `\`, and control bytes become `%XX`.
+fn quoted(s : &Vec<u8>) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  for b in s.iter() {
+    if *b == 34u8 || *b == 92u8 {
+      out.push(92u8);
+      out.push(*b);
+    } else {
+      if *b < 32u8 || *b == 127u8 {
+        out.push(37u8);
+        out.push(hex_digit(*b / 16u8));
+        out.push(hex_digit(*b % 16u8));
+      } else {
+        out.push(*b);
+      }
+    }
+  }
+  return out;
+}
+
+/// The hash of `d` over `text`, in hexadecimal.
+fn h(d : &DigestState, text : &Vec<u8>) -> Vec<u8> {
+  return hex_lower(&hash_bytes(d.hash, text));
+}
+
+/// `a:b`.
+fn joined(a : &Vec<u8>, b : &Vec<u8>) -> Vec<u8> {
+  let mut out = clone_bytes(a);
+  out.push(58u8);
+  append(&mut out, b);
+  return out;
+}
+
+/// `n` as 8 lower-case hexadecimal digits.
+fn nc_text(n : i64) -> Vec<u8> {
+  let mut reversed = Vec<u8>::new();
+  let mut v = n;
+  let mut i = 0;
+  while i < 8 {
+    reversed.push(ascii_lower(hex_digit((v % 16i64) as u8)));
+    v = v / 16i64;
+    i = i + 1;
+  }
+  let mut out = Vec<u8>::new();
+  i = 7;
+  while i >= 0 {
+    out.push(reversed.get(i));
+    i = i - 1;
+  }
+  return out;
+}
+
+/// The parameters of the Authorization header for the challenge in `d`, for the request
+/// `method` of `uri` (libcurl's `auth_create_digest_http_message`). It makes the client nonce
+/// when the state has none.
+pub fn digest_response(d : &mut DigestState, user : &Vec<u8>, password : &Vec<u8>,
+method : &Vec<u8>, uri : &Vec<u8>) -> Vec<u8> {
+  if d.nc == 0i64 {
+    d.nc = 1i64;
+  }
+  if !d.has_cnonce {
+    d.has_cnonce = true;
+    d.cnonce = base64(&random_bytes(12));
+  }
+  let mut shown_user = clone_bytes(user);
+  if d.userhash {
+    shown_user = h(d, &joined(user, &d.realm));
+  }
+  let mut ha1 = h(d, &joined(&joined(user, &d.realm), password));
+  if d.sess {
+    ha1 = h(d, &joined(&joined(&ha1, &d.nonce), &d.cnonce));
+  }
+  let mut a2 = joined(method, uri);
+  if d.has_qop && eq_lit_nocase(&d.qop, "auth-int") {
+    // libcurl hashes an empty body: it does not support auth-int for a POST or a PUT.
+    a2 = joined(&a2, &h(d, &Vec<u8>::new()));
+  }
+  let ha2 = h(d, &a2);
+  let nc = nc_text(d.nc);
+  let mut response = Vec<u8>::new();
+  if d.has_qop {
+    let mut text = joined(&joined(&ha1, &d.nonce), &nc);
+    text = joined(&joined(&joined(&text, &d.cnonce), &d.qop), &ha2);
+    response = h(d, &text);
+  } else {
+    response = h(d, &joined(&joined(&ha1, &d.nonce), &ha2));
+  }
+
+  let mut out = lit("username=\"");
+  append(&mut out, &quoted(&shown_user));
+  push_lit(&mut out, "\", realm=\"");
+  append(&mut out, &quoted(&d.realm));
+  push_lit(&mut out, "\", nonce=\"");
+  append(&mut out, &quoted(&d.nonce));
+  push_lit(&mut out, "\", uri=\"");
+  append(&mut out, &quoted(uri));
+  if d.has_qop {
+    push_lit(&mut out, "\", cnonce=\"");
+    append(&mut out, &d.cnonce);
+    push_lit(&mut out, "\", nc=");
+    append(&mut out, &nc);
+    push_lit(&mut out, ", qop=");
+    append(&mut out, &d.qop);
+    push_lit(&mut out, ", response=\"");
+    d.nc = d.nc + 1i64;
+  } else {
+    push_lit(&mut out, "\", response=\"");
+  }
+  append(&mut out, &response);
+  push_lit(&mut out, "\"");
+  if d.has_opaque {
+    push_lit(&mut out, ", opaque=\"");
+    append(&mut out, &quoted(&d.opaque));
+    push_lit(&mut out, "\"");
+  }
+  if d.has_algorithm {
+    push_lit(&mut out, ", algorithm=");
+    append(&mut out, &d.algorithm);
+  }
+  if d.userhash {
+    push_lit(&mut out, ", userhash=true");
+  }
+  return out;
+}
+
+/// Take the value of one `WWW-Authenticate` header of a 401 from the server `origin`
+/// (libcurl's `Curl_http_input_auth`). It notes the methods that the server offers in `a`, and
+/// a Digest challenge in `d`. `problem` turns true when the server refused the credentials.
+pub fn take_challenge(value : &Vec<u8>, a : &mut AuthState, d : &mut DigestState,
+origin : &Vec<u8>, problem : &mut bool) -> void {
+  let mut at = skip_blanks(value, 0);
+  while at < value.len() {
+    if method_at(value, at, "Digest") {
+      take_digest(value, at, a, d, origin, problem);
+    }
+    if method_at(value, at, "Basic") {
+      a.avail = a.avail | AUTH_BASIC;
+      if a.picked == AUTH_BASIC {
+        // The server refused the user name and password of Basic.
+        a.avail = AUTH_NONE;
+        *problem = true;
+      }
+    }
+    // A line can offer more methods, after a comma.
+    let comma = find_byte(value, 44u8, at);
+    if comma < 0 {
+      return;
+    }
+    at = skip_blanks(value, comma + 1);
+  }
+}
+
+fn take_digest(value : &Vec<u8>, at : i32, a : &mut AuthState, d : &mut DigestState,
+origin : &Vec<u8>, problem : &mut bool) -> void {
+  if (a.avail & AUTH_DIGEST) != 0 {
+    // libcurl ignores a second Digest header.
+    return;
+  }
+  let mut result = DIGEST_OK;
+  let after = at + 6;
+  if after >= value.len() || !is_blank(value.get(after)) {
+    reset_digest(d);
+    result = DIGEST_BAD;
+  } else {
+    result = decode_challenge(value, skip_blanks(value, after), d);
+  }
+  d.has_origin = true;
+  d.origin = clone_bytes(origin);
+  if result == DIGEST_NOT_BUILT_IN {
+    return;
+  }
+  a.avail = a.avail | AUTH_DIGEST;
+  if result != DIGEST_OK {
+    *problem = true;
+  }
+}
+
+/// Pick one method of those that the server offered and the user allows: Digest before Basic,
+/// as libcurl does (`pickoneauth`). False when none fits.
+pub fn pick_one(a : &mut AuthState, has_credentials : bool) -> bool {
+  let avail = a.avail & a.want;
+  let mut picked = true;
+  if (avail & AUTH_DIGEST) != 0 && has_credentials {
+    a.picked = AUTH_DIGEST;
+  } else {
+    if (avail & AUTH_BASIC) != 0 && has_credentials {
+      a.picked = AUTH_BASIC;
+    } else {
+      a.picked = AUTH_PICKNONE;
+      picked = false;
+    }
+  }
+  a.avail = AUTH_NONE;
+  return picked;
+}
+
+/// The Authorization header of a request, without its name.
+struct AuthHeader {
+  present : bool,
+  value : Vec<u8>,
+}
+
+/// The Authorization header of the next request to `origin` (libcurl's
+/// `Curl_http_output_auth` for the server). `allowed` says that credentials may go to this
+/// server. `custom` says that a `-H` gives an Authorization header, which replaces Basic.
+pub fn output_auth(a : &mut AuthState, d : &mut DigestState, allowed : bool, user : &Vec<u8>,
+password : &Vec<u8>, custom : bool, method : &Vec<u8>, uri : &Vec<u8>, origin : &Vec<u8>)
+-> AuthHeader {
+  let mut header = AuthHeader {
+    present : false,
+    value : Vec<u8>::new()
+  };
+  if !allowed {
+    a.done = true;
+    a.multipass = false;
+    return header;
+  }
+  if a.want != AUTH_NONE && a.picked == AUTH_NONE {
+    a.picked = a.want;
+  }
+  let mut used = false;
+  if a.picked == AUTH_DIGEST {
+    used = true;
+    // A Digest state belongs to one server and one set of credentials.
+    let same_creds = same_bytes(&d.creds_user, user) && same_bytes(&d.creds_password, password);
+    if !d.has_origin || !same_bytes(&d.origin, origin) || (d.has_creds && !same_creds) {
+      reset_digest(d);
+    }
+    d.has_origin = true;
+    d.origin = clone_bytes(origin);
+    d.has_creds = true;
+    d.creds_user = clone_bytes(user);
+    d.creds_password = clone_bytes(password);
+    if d.has_nonce {
+      header.present = true;
+      header.value = lit("Digest ");
+      append(&mut header.value, &digest_response(d, user, password, method, uri));
+      a.done = true;
+    } else {
+      a.done = false;
+    }
+  }
+  if a.picked == AUTH_BASIC {
+    if !custom {
+      used = true;
+      let mut pair = clone_bytes(user);
+      push_lit(&mut pair, ":");
+      append(&mut pair, password);
+      header.present = true;
+      header.value = lit("Basic ");
+      append(&mut header.value, &base64(&pair));
+    }
+    a.done = true;
+  }
+  a.multipass = used && !a.done;
+  return header;
+}
+
+/// The authentication of a transfer with the server and with an HTTP proxy, from one request
+/// to the next.
+struct AuthContext {
+  host : AuthState,
+  digest : DigestState,
+  proxy : AuthState,
+  proxy_digest : DigestState,
+  // The server or the proxy refused the credentials, or offered no method that fits: stop
+  // trying.
+  problem : bool,
+}
+
+/// An `AuthContext` before the first request. `want` and `proxy_want` are the methods that the
+/// user allows, or `AUTH_NONE` for libcurl's default, Basic.
+pub fn new_auth_context(want : i32, proxy_want : i32) -> AuthContext {
+  let mut host = want;
+  if host == AUTH_NONE {
+    host = AUTH_BASIC;
+  }
+  let mut proxy = proxy_want;
+  if proxy == AUTH_NONE {
+    proxy = AUTH_BASIC;
+  }
+  return AuthContext {
+    host : new_auth_state(host),
+    digest : new_digest_state(),
+    proxy : new_auth_state(proxy),
+    proxy_digest : new_digest_state(),
+    problem : false
+  };
+}
+
+/// Whether the next request with a body goes as a probe with an empty body: a method that needs
+/// more than one request has no answer from the server or the proxy yet.
+pub fn needs_probe(ctx : &AuthContext) -> bool {
+  return (ctx.host.multipass && !ctx.host.done) || (ctx.proxy.multipass && !ctx.proxy.done);
+}
+
+/// What to do after the headers of a response with `status` (libcurl's `Curl_http_auth_act`).
+/// `allowed` and `proxy_allowed` say that credentials went to the server and to the proxy.
+/// `probe` says that the request was a probe with an empty body, and `has_body` that the
+/// request is a POST or a PUT. Gives true when the same request must go again.
+pub fn auth_act(status : i32, allowed : bool, proxy_allowed : bool, ctx : &mut AuthContext,
+probe : bool, has_body : bool) -> bool {
+  if status >= 100 && status <= 199 {
+    return false;
+  }
+  if ctx.problem {
+    return false;
+  }
+  let mut picked = false;
+  if allowed && (status == 401 || (probe && status < 300)) {
+    if pick_one(&mut ctx.host, true) {
+      picked = true;
+    } else {
+      ctx.problem = true;
+    }
+  }
+  if proxy_allowed && (status == 407 || (probe && status < 300)) {
+    if pick_one(&mut ctx.proxy, true) {
+      picked = true;
+    } else {
+      ctx.problem = true;
+    }
+  }
+  if picked {
+    return true;
+  }
+  if status < 300 && !ctx.host.done && probe && has_body {
+    // The probe needed no authentication: send the request again, with its body.
+    ctx.host.done = true;
+    return true;
+  }
+  return false;
+}
+
+/// Whether `-f` makes the response `status` an error (libcurl's `http_should_fail`). A 401 or
+/// a 407 is one when no credentials went to the server or the proxy, or when they were refused.
+pub fn auth_should_fail(status : i32, fail : bool, allowed : bool, proxy_allowed : bool,
+problem : bool) -> bool {
+  if !fail || status < 400 {
+    return false;
+  }
+  if status != 401 && status != 407 {
+    return true;
+  }
+  if status == 401 && !allowed {
+    return true;
+  }
+  if status == 407 && !proxy_allowed {
+    return true;
+  }
+  return problem;
+}

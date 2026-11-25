@@ -4,8 +4,10 @@
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-# `make unit` passes the settings of config.mk.
+# `make unit` passes the settings of config.mk, and the OpenSSL libraries (TLS_LIBS) that the
+# hash functions of src/sys need.
 VXC=${VXC:-vxc}
+TLS_LIBS=${TLS_LIBS:--lssl -lcrypto}
 VX_LIBDIR=${VX_LIBDIR:-$HOME/.vx/current/lib}
 out=$root/build/unit
 mkdir -p "$out"
@@ -17,7 +19,8 @@ for t in "$here"/*.vx; do
       --no-trusted-code curlvx -c "$t" -o "$out/$name.o" > "$out/$name.log" 2>&1; then
     echo "FAIL (compile) $name"; grep -v '^\[JIT\]' "$out/$name.log" | head -20; fail=1; continue
   fi
-  cc "$out/$name.o" -L "$VX_LIBDIR" -lvx_std_core -Wl,-rpath,"$VX_LIBDIR" -o "$out/$name" || { fail=1; continue; }
+  # shellcheck disable=SC2086
+  cc "$out/$name.o" $TLS_LIBS -L "$VX_LIBDIR" -lvx_std_core -Wl,-rpath,"$VX_LIBDIR" -o "$out/$name" || { fail=1; continue; }
   if "$out/$name" > "$out/$name.stdout" 2>&1; then
     echo "ok   $name"
   else

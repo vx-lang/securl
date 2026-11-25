@@ -11,6 +11,7 @@ import std::time;
 import std::vec;
 import sys::text;
 import sys::tls;
+import curlvx::auth;
 import curlvx::bytes;
 import curlvx::conn;
 import curlvx::failure;
@@ -47,6 +48,8 @@ struct TransferInfo {
   // response says it (else -1). The message of a timeout gives both.
   hop_start_download : i64,
   expected_size : i64,
+  // A response of the transfer said HTTP/1.0, so the next requests of the transfer use 1.0.
+  received_http10 : bool,
 }
 
 /// A `TransferInfo` before the transfer starts.
@@ -71,7 +74,8 @@ pub fn new_info() -> TransferInfo {
     referer : Vec<u8>::new(),
     size_header_total : 0i64,
     hop_start_download : 0i64,
-    expected_size : -1i64
+    expected_size : -1i64,
+    received_http10 : false
   };
 }
 
@@ -375,6 +379,8 @@ struct Credentials {
 
 /// What one request and its response decided.
 struct Hop {
+  // The same request must go again, for authentication.
+  retry : bool,
   // The response is a redirect that `-L` follows.
   follow : bool,
   status : i32,
@@ -385,8 +391,8 @@ struct Hop {
 /// `sinks`, unless curl follows the redirect that the response gives.
 fn one_hop(network : &Network, tls : &TlsConfig, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
 req_kind : i32, body : &Vec<u8>, creds : &Credentials, same_host : bool, has_referer : bool,
-referer : &Vec<u8>, deadline : Instant, sinks : &mut Sinks, info : &mut TransferInfo)
--> Result<Hop, Failure> {
+referer : &Vec<u8>, deadline : Instant, auth : &mut AuthContext, sinks : &mut Sinks,
+info : &mut TransferInfo) -> Result<Hop, Failure> {
   let secure = eq_lit(&u.scheme, "https");
   let mut method = lit("GET");
   if cfg.has_method {
@@ -412,22 +418,45 @@ referer : &Vec<u8>, deadline : Instant, sinks : &mut Sinks, info : &mut Transfer
   // A `-H "Transfer-Encoding: chunked"` header, or an upload from standard input, whose
   // length curl does not know, sends the body in chunks.
   let custom_chunked = custom_header_has(headers, "Transfer-Encoding", "chunked");
-  let chunked_upload = custom_chunked || (req_kind == REQ_PUT && eq_lit(&cfg.upload, "-")
-    && !cfg.http10 && !has_custom(headers, "Content-Length"));
+  let unknown_length = req_kind == REQ_PUT && eq_lit(&cfg.upload, "-")
+    && !has_custom(headers, "Content-Length");
+  if unknown_length && info.received_http10 {
+    // The server speaks HTTP/1.0, which has no chunks.
+    return Result<Hop, Failure>::Err(fail_lit(UPLOAD_FAILED,
+      "Chunky upload is not supported by HTTP 1.0"));
+  }
+  let chunked_upload = custom_chunked || (unknown_length && !cfg.http10);
+  // Credentials go only to the first host, unless `--location-trusted`.
+  let trusted_host = same_host || cfg.location_trusted;
+  let allowed = creds.present && trusted_host;
+  let auth_header = output_auth(&mut auth.host, &mut auth.digest, allowed, &creds.user,
+    &creds.password, has_custom(headers, "Authorization"), &method, &u.path, &origin_of(u));
+  // The credentials of an HTTP proxy go with each request that goes through it. The CONNECT of
+  // a tunnel sends its own.
+  let via_proxy = proxy.used && !secure;
+  let proxy_allowed = via_proxy && proxy.has_credentials;
+  let proxy_header = output_auth(&mut auth.proxy, &mut auth.proxy_digest, proxy_allowed,
+    &proxy.user, &proxy.password, has_custom(headers, "Proxy-Authorization"), &method, &u.path,
+    &origin_of(&proxy.url));
+  // Before Digest has its nonce, a POST or a PUT goes with an empty body, as a probe.
+  let probe = needs_probe(auth) && sends_body;
+  let sends_body_now = sends_body && !probe;
   let mut body_length = -1i64;
   if sends_body {
     body_length = body.len() as i64;
+  }
+  if probe {
+    body_length = 0i64;
   }
   let req_info = RequestInfo {
     method : method,
     kind : req_kind,
     body_length : body_length,
-    http10 : cfg.http10,
+    http10 : cfg.http10 || info.received_http10,
     headers : clone_lines(headers),
-    has_credentials : creds.present,
-    user : clone_bytes(&creds.user),
-    password : clone_bytes(&creds.password),
-    trusted_host : same_host || cfg.location_trusted,
+    has_auth_header : auth_header.present,
+    auth_header : auth_header.value,
+    trusted_host : trusted_host,
     first_host : same_host,
     has_user_agent : cfg.has_user_agent,
     user_agent : clone_bytes(&cfg.user_agent),
@@ -437,12 +466,13 @@ referer : &Vec<u8>, deadline : Instant, sinks : &mut Sinks, info : &mut Transfer
     range : clone_bytes(&cfg.range),
     has_cookie : cfg.has_cookie,
     cookie : clone_bytes(&cfg.cookie),
-    via_proxy : proxy.used && !secure,
-    has_proxy_credentials : proxy.has_credentials,
-    proxy_user : clone_bytes(&proxy.user),
-    proxy_password : clone_bytes(&proxy.password),
-    chunked : sends_body && chunked_upload,
-    add_chunked_header : sends_body && chunked_upload && !has_custom(headers, "Transfer-Encoding")
+    via_proxy : via_proxy,
+    has_proxy_auth_header : proxy_header.present,
+    proxy_auth_header : proxy_header.value,
+    chunked : sends_body_now && chunked_upload,
+    add_chunked_header : sends_body_now && chunked_upload
+      && !has_custom(headers, "Transfer-Encoding"),
+    probe : probe
   };
 
   let mut address = Vec<u8>::new();
@@ -467,7 +497,7 @@ referer : &Vec<u8>, deadline : Instant, sinks : &mut Sinks, info : &mut Transfer
   }
   info.size_request = info.size_request + (request.len() as i64);
   let _sent = c.send(&request)?;
-  if sends_body {
+  if sends_body_now {
     if chunked_upload {
       let _sent_body = c.send(&chunk_encode(body))?;
     } else {
@@ -503,6 +533,9 @@ referer : &Vec<u8>, deadline : Instant, sinks : &mut Sinks, info : &mut Transfer
   }
   info.http_code = head.status;
   info.http_version = head.version;
+  if head.version == 10 {
+    info.received_http10 = true;
+  }
   info.num_headers = head.headers.len();
   info.headers = clone_lines(&head.headers);
   for h in head.headers.iter() {
@@ -517,9 +550,29 @@ referer : &Vec<u8>, deadline : Instant, sinks : &mut Sinks, info : &mut Transfer
     verbose_lines("< ", &head.raw);
   }
 
+  // The challenges of a 401, and whether to send the request again with credentials.
+  if head.status == 401 || head.status == 407 {
+    for line in head.headers.iter() {
+      let colon = find_byte(line, 58u8, 0);
+      if colon > 0 {
+        let name = range_of(line, 0, colon);
+        let value = trim_blanks(&rest_from(line, colon + 1));
+        if head.status == 401 && eq_lit_nocase(&name, "WWW-Authenticate") {
+          take_challenge(&value, &mut auth.host, &mut auth.digest, &origin_of(u),
+            &mut auth.problem);
+        }
+        if head.status == 407 && eq_lit_nocase(&name, "Proxy-Authenticate") {
+          take_challenge(&value, &mut auth.proxy, &mut auth.proxy_digest,
+            &origin_of(&proxy.url), &mut auth.problem);
+        }
+      }
+    }
+  }
+  let retry = auth_act(head.status, allowed, proxy_allowed, auth, probe, sends_body);
+
   let redirect = head.has_location && (head.status == 301 || head.status == 302
     || head.status == 303 || head.status == 307 || head.status == 308);
-  let follow = cfg.follow && redirect;
+  let follow = cfg.follow && redirect && !retry;
   if redirect && !follow {
     match resolve_location(u, &head.location) {
       Result<Url, Failure>::Ok(target) => {
@@ -530,7 +583,8 @@ referer : &Vec<u8>, deadline : Instant, sinks : &mut Sinks, info : &mut Transfer
     }
   }
 
-  let failed = head.status >= 400 && (cfg.fail || cfg.fail_with_body);
+  let failed = !retry && auth_should_fail(head.status, cfg.fail || cfg.fail_with_body, allowed,
+    proxy_allowed, auth.problem);
   if failed && !cfg.fail_with_body {
     return Result<Hop, Failure>::Err(http_error(head.status));
   }
@@ -547,9 +601,11 @@ referer : &Vec<u8>, deadline : Instant, sinks : &mut Sinks, info : &mut Transfer
   // curl does not wait for the body of a redirect that it follows when the connection closes
   // after it, or when the body has no known end.
   let unknown_end = (head.content_length < 0i64 || head.has_transfer_encoding) && !head.chunked;
-  let skip_body = follow && (head.close || unknown_end);
+  // The same goes for a response to a request that goes again for authentication.
+  let again = follow || retry;
+  let skip_body = again && (head.close || unknown_end);
   if !has_no_body(head.status, req_kind) && !skip_body {
-    if follow {
+    if again {
       let mut discard = null_output();
       let _b = read_body(&mut c, &head, cfg.raw, &mut discard, info, &mut trailers)?;
     } else {
@@ -574,10 +630,24 @@ referer : &Vec<u8>, deadline : Instant, sinks : &mut Sinks, info : &mut Transfer
     verbose_info(&m);
   }
   return Result<Hop, Failure>::Ok(Hop {
+    retry : retry,
     follow : follow,
     status : head.status,
     location : clone_bytes(&head.location)
   });
+}
+
+// How many times one transfer sends a request again for authentication.
+const MAX_AUTH_ROUNDS : i32 = 50;
+
+/// `scheme://host:port` of `u`: the server that a Digest state belongs to.
+fn origin_of(u : &Url) -> Vec<u8> {
+  let mut out = clone_bytes(&u.scheme);
+  push_lit(&mut out, "://");
+  append(&mut out, &u.host);
+  push_lit(&mut out, ":");
+  push_u64(&mut out, u.port as u64);
+  return out;
 }
 
 /// The time limit of the connect phase: `--connect-timeout`, or the 300 seconds of libcurl.
@@ -886,6 +956,9 @@ headers : &Vec<Vec<u8>>, url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, deadl
 sinks : &mut Sinks, info : &mut TransferInfo) -> Result<i32, Failure> {
   let first = parse_url(url_text, cfg.path_as_is)?;
   let mut creds = credentials_of(cfg, &first);
+  let mut auth = new_auth_context(cfg.auth_type, cfg.proxy_auth_type);
+  // A server that asks for new credentials again and again does not keep curl-vx forever.
+  let mut auth_rounds = 0;
   let first_port = first.port;
   let first_host = first.host;
   // The URL of the current request, as text. Each turn of the loop parses it again, so that no
@@ -910,7 +983,11 @@ sinks : &mut Sinks, info : &mut TransferInfo) -> Result<i32, Failure> {
       creds = credentials_of(cfg, &u);
     }
     let hop = one_hop(network, tls, cfg, headers, &u, req_kind, body, &creds, same_host, has_referer,
-      &referer, deadline, sinks, info)?;
+      &referer, deadline, &mut auth, sinks, info)?;
+    if hop.retry && auth_rounds < MAX_AUTH_ROUNDS {
+      auth_rounds = auth_rounds + 1;
+      continue;
+    }
     if !hop.follow {
       return Result<i32, Failure>::Ok(0);
     }

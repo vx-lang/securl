@@ -1,0 +1,91 @@
+// Checks the Digest messages of curlvx::auth against the examples of RFC 2617 and RFC 7616,
+// and how it reads challenges.
+import std::vec;
+import sys::console;
+import sys::text;
+import curlvx::auth;
+import curlvx::bytes;
+
+/// A state after the challenge `params` (the text after `Digest `), with the client nonce
+/// `cnonce`, as in the examples.
+fn challenged(params : *const i8, cnonce : *const i8) -> DigestState {
+  let mut d = new_digest_state();
+  let r = decode_challenge(&lit(params), 0, &mut d);
+  assert(r == DIGEST_OK, "the challenge should decode");
+  d.has_cnonce = true;
+  d.cnonce = lit(cnonce);
+  return d;
+}
+
+fn expect(got : &Vec<u8>, want : *const i8) -> void {
+  if !eq_lit(got, want) {
+    let mut m = lit("got:  ");
+    append(&mut m, got);
+    push_lit(&mut m, "\nwant: ");
+    append(&mut m, &lit(want));
+    push_lit(&mut m, "\n");
+    let _w = write_stderr(&m);
+    panic("a Digest message is wrong");
+  }
+}
+
+fn decodes(params : *const i8) -> i32 {
+  let mut d = new_digest_state();
+  return decode_challenge(&lit(params), 0, &mut d);
+}
+
+fn main() -> i32 {
+  // RFC 2617, section 3.5: MD5 with qop=auth.
+  let mut d = challenged(
+    "realm=\"testrealm@host.com\", qop=\"auth,auth-int\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", opaque=\"5ccc069c403ebaf9f0171e9517f40e41\"",
+    "0a4f113b");
+  let r1 = digest_response(&mut d, &lit("Mufasa"), &lit("Circle Of Life"), &lit("GET"),
+    &lit("/dir/index.html"));
+  expect(&r1,
+    "username=\"Mufasa\", realm=\"testrealm@host.com\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", uri=\"/dir/index.html\", cnonce=\"0a4f113b\", nc=00000001, qop=auth, response=\"6629fae49393a05397450978507c4ef1\", opaque=\"5ccc069c403ebaf9f0171e9517f40e41\"");
+  // The nonce count goes up with each request.
+  let r2 = digest_response(&mut d, &lit("Mufasa"), &lit("Circle Of Life"), &lit("GET"),
+    &lit("/dir/index.html"));
+  assert(find_seq(&r2, &lit("nc=00000002"), 0) > 0, "the second request should say nc=00000002");
+
+  // RFC 7616, section 3.9.1: SHA-256 and MD5.
+  let mut s = challenged(
+    "realm=\"http-auth@example.org\", qop=\"auth, auth-int\", algorithm=SHA-256, nonce=\"7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v\", opaque=\"FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS\"",
+    "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ");
+  let r3 = digest_response(&mut s, &lit("Mufasa"), &lit("Circle of Life"), &lit("GET"),
+    &lit("/dir/index.html"));
+  expect(&r3,
+    "username=\"Mufasa\", realm=\"http-auth@example.org\", nonce=\"7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v\", uri=\"/dir/index.html\", cnonce=\"f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ\", nc=00000001, qop=auth, response=\"753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1\", opaque=\"FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS\", algorithm=SHA-256");
+  let mut m = challenged(
+    "realm=\"http-auth@example.org\", qop=\"auth, auth-int\", algorithm=MD5, nonce=\"7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v\", opaque=\"FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS\"",
+    "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ");
+  let r4 = digest_response(&mut m, &lit("Mufasa"), &lit("Circle of Life"), &lit("GET"),
+    &lit("/dir/index.html"));
+  assert(find_seq(&r4, &lit("response=\"8ca523f5e9506fed4657c9700eebdbec\""), 0) > 0,
+    "the MD5 example of RFC 7616 should match");
+
+  // curl's test 64: no qop, and a `"` in the path, which the uri escapes.
+  let mut c = challenged("realm=\"testrealm\", nonce=\"1053604145\"", "unused");
+  let r5 = digest_response(&mut c, &lit("testuser"), &lit("testpass"), &lit("GET"),
+    &lit("/64\""));
+  expect(&r5,
+    "username=\"testuser\", realm=\"testrealm\", nonce=\"1053604145\", uri=\"/64\\\"\", response=\"1ee14b238b3259f17602e9ce41491ef9\"");
+
+  // Challenges that libcurl refuses.
+  assert(decodes("realm=\"r\"") == DIGEST_BAD, "a challenge needs a nonce");
+  assert(decodes("realm=\"r\", nonce=\"n\", algorithm=WHIRLPOOL") == DIGEST_BAD,
+    "an unknown algorithm is refused");
+  assert(decodes("nonce=\"n\", algorithm=MD5-sess") == DIGEST_BAD, "-sess needs qop");
+  assert(decodes("realm=r, nonce=n") == DIGEST_OK, "values may be unquoted");
+  assert(decodes("nonce=\"n\\\"x\"") == DIGEST_OK, "a quoted value may hold \\\"");
+  // A second nonce means that the server refused the credentials, unless it says stale=true.
+  let mut again = new_digest_state();
+  let _first = decode_challenge(&lit("nonce=\"1\""), 0, &mut again);
+  assert(decode_challenge(&lit("nonce=\"2\""), 0, &mut again) == DIGEST_BAD,
+    "a new nonce without stale=true means wrong credentials");
+  let mut stale = new_digest_state();
+  let _first2 = decode_challenge(&lit("nonce=\"1\""), 0, &mut stale);
+  assert(decode_challenge(&lit("nonce=\"2\", stale=true"), 0, &mut stale) == DIGEST_OK,
+    "stale=true asks for a new request with the new nonce");
+  return 0;
+}

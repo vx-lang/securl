@@ -1,0 +1,76 @@
+// Hash functions and random bytes, from OpenSSL. Digest authentication needs MD5, SHA-256 and
+// SHA-512/256, and a random client nonce.
+//
+// TRUSTED CODE. Each OpenSSL call is an `extern` function. The rest of curl-vx sees only
+// `hash_bytes` and `random_bytes`, which take and give byte lists.
+import core::ptr;
+import std::vec;
+
+extern "C" {
+  fn EVP_md5() -> *const i8;
+  fn EVP_sha256() -> *const i8;
+  fn EVP_sha512_256() -> *const i8;
+  // One-shot hash of `count` bytes at `data` into `md`. `size` and `engine` may be null.
+  fn EVP_Digest(data : *const u8, count : u64, md : *mut u8, size : *mut u32, md_type : *const i8,
+    engine : *mut i8) -> i32;
+  fn RAND_bytes(buffer : *mut u8, count : i32) -> i32;
+}
+
+// The hash functions that `hash_bytes` knows.
+const HASH_MD5 : i32 = 1;
+const HASH_SHA256 : i32 = 2;
+const HASH_SHA512_256 : i32 = 3;
+
+// The longest hash that `hash_bytes` gives, in bytes.
+const MAX_HASH_SIZE : i32 = 64;
+
+/// The size in bytes of the hash `algo`.
+pub fn hash_size(algo : i32) -> i32 {
+  if algo == HASH_MD5 {
+    return 16;
+  }
+  return 32;
+}
+
+/// The hash `algo` (`HASH_MD5`, `HASH_SHA256` or `HASH_SHA512_256`) of `data`.
+pub fn hash_bytes(algo : i32, data : &Vec<u8>) -> Vec<u8> {
+  let mut md = Vec<u8>::new();
+  let mut i = 0;
+  while i < MAX_HASH_SIZE {
+    md.push(0u8);
+    i = i + 1;
+  }
+  let mut md_type = unsafe { EVP_md5() };
+  if algo == HASH_SHA256 {
+    md_type = unsafe { EVP_sha256() };
+  }
+  if algo == HASH_SHA512_256 {
+    md_type = unsafe { EVP_sha512_256() };
+  }
+  let ok = unsafe {
+    EVP_Digest(data.as_mut_ptr() as *const u8, data.len() as u64, md.as_mut_ptr(),
+      0 as *mut u32, md_type, 0 as *mut i8)
+  };
+  assert(ok == 1, "EVP_Digest failed");
+  let mut out = Vec<u8>::new();
+  let n = hash_size(algo);
+  i = 0;
+  while i < n {
+    out.push(md.get(i));
+    i = i + 1;
+  }
+  return out;
+}
+
+/// `count` random bytes from the random generator of OpenSSL, which is good for keys.
+pub fn random_bytes(count : i32) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  let mut i = 0;
+  while i < count {
+    out.push(0u8);
+    i = i + 1;
+  }
+  let ok = unsafe { RAND_bytes(out.as_mut_ptr(), count) };
+  assert(ok == 1, "RAND_bytes failed");
+  return out;
+}

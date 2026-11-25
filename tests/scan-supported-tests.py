@@ -22,7 +22,8 @@ header max-time connect-timeout output range upload-file user write-out request 
 resolve connect-to trace-ascii trace http1.0 http1.1 fail fail-with-body get include
 show-headers head insecure location location-trusted remote-name remote-name-all disable silent
 show-error verbose version help globoff path-as-is trace-time progress-bar no-progress-meter
-buffer raw compressed proxy proxy-user noproxy output-dir
+buffer raw compressed proxy proxy-user noproxy output-dir digest basic anyauth proxy-digest
+proxy-basic proxy-anyauth
 """.split())
 SUPPORTED_SHORT = set("AbdDeHmorTuwXxU0fGiIkLOqsSvVhg#N")
 # The short options that take a value: the rest of the word is that value.

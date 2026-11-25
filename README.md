@@ -52,22 +52,25 @@ Vx main d3ed6cf0b.
 
 | Test set | Passed |
 |---|---|
-| All tests with the keyword `HTTP` that runtests.pl runs for curl-vx | 395 of 794 (50%) |
-| The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 341 of 422 (81%) |
+| All tests with the keyword `HTTP` that runtests.pl runs for curl-vx | 458 of 855 (54%) |
+| The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 399 of 478 (83%) |
 | TLS and time-limit tests against local servers (`tests/tls`) | 18 of 18 |
-| Unit tests (`tests/unit`) | 3 of 3 |
+| Unit tests (`tests/unit`) | 4 of 4 |
 
-runtests.pl skips 14 HTTPS tests here, because they need `stunnel`.
+runtests.pl skips 14 HTTPS tests here, because they need `stunnel`. The C build of the test
+suite has OpenSSL, so that runtests.pl runs 61 more tests, most of them Digest tests (see "Run
+curl's test suite"). Before Digest, curl-vx passed 409 of those 855.
 
 `vxc --audit` (`make audit`) lists the trusted code of the program:
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/curlvx/` (the package with all protocol code) | 3,790 | none, and `--no-trusted-code` enforces this |
+| `src/curlvx/` (the package with all protocol code) | 4,655 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx`, `src/disk.vx` | 512 | none |
-| `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 751 | 32 `extern` functions, 46 `unsafe` blocks |
+| `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 827 | 37 `extern` functions, 51 `unsafe` blocks |
 
-Of the trusted code in `src/sys/`, 67 of the 78 items are the OpenSSL binding in `tls.vx`.
+Of the trusted code in `src/sys/`, 77 of the 88 items are the OpenSSL bindings: TLS in `tls.vx`,
+and the hash functions and random bytes of Digest in `hash.vx`.
 `core` and `std` have trusted code too: the audit counts 965 `unsafe` blocks and 77 `extern`
 functions in the modules that the program uses. That is the trusted base of the language, as
 Rust's `std` is for a Rust program. OpenSSL itself is C.
@@ -109,14 +112,33 @@ of Vx ends the wait. The TLS code polls in slices of 20 ms and checks the clock 
 `within` takes a closure. The calls are in `src/sys` and not in `curlvx` only because of a Vx
 bug (below).
 
+## Authentication
+
+`-u` sends Basic credentials, as curl does by default. With `--digest`, the first request goes
+without credentials, and a POST or a PUT goes with an empty body, as a probe. The 401 brings
+the challenge, and the request goes again with the Digest response: MD5, SHA-256 and
+SHA-512/256, their `-sess` variants, `qop=auth` and `auth-int`, `userhash`, and the nonce
+count. `--anyauth` takes Digest when the server offers it, and else Basic. `--proxy-digest`
+and `--proxy-anyauth` do the same with an HTTP proxy and its 407.
+
+`src/curlvx/auth.vx` holds all of it, as libcurl's `http.c` and `vauth/digest.c` do it, with no
+trusted code. Only the hash functions and the random client nonce come from OpenSSL, through
+`src/sys/hash.vx`. The unit tests check the examples of RFC 2617 and RFC 7616.
+
 ## Run curl's test suite
 
+runtests.pl asks curl's own `curlinfo` program which hash functions the C build has, and skips
+the Digest tests when it has none. So the C build needs a crypto library. `make openssl-dev`
+installs the OpenSSL of the submodule for it:
+
 ```sh
+make openssl-dev       # prints the -DOPENSSL_ROOT_DIR for cmake
 git clone --depth 1 https://github.com/curl/curl ~/curl-src
 cd ~/curl-src
-cmake -B build -DCURL_ENABLE_SSL=OFF -DCURL_USE_LIBPSL=OFF -DUSE_LIBIDN2=OFF \
-  -DCURL_ZLIB=OFF -DCURL_BROTLI=OFF -DCURL_ZSTD=OFF -DUSE_NGHTTP2=OFF \
-  -DCURL_USE_LIBSSH2=OFF -DCURL_DISABLE_LDAP=ON -DBUILD_TESTING=ON
+cmake -B build -DCURL_ENABLE_SSL=ON -DCURL_USE_OPENSSL=ON -DOPENSSL_USE_STATIC_LIBS=ON \
+  -DOPENSSL_ROOT_DIR=$HOME/curl-vx/build/openssl-dev/usr/local \
+  -DCURL_USE_LIBPSL=OFF -DUSE_LIBIDN2=OFF -DCURL_ZLIB=OFF -DCURL_BROTLI=OFF -DCURL_ZSTD=OFF \
+  -DUSE_NGHTTP2=OFF -DCURL_USE_LIBSSH2=OFF -DCURL_DISABLE_LDAP=ON -DBUILD_TESTING=ON
 cmake --build build -j8 && cmake --build build --target testdeps -j8
 cd ~/curl-vx
 make test CURL_SRC=~/curl-src              # every HTTP test
@@ -133,11 +155,11 @@ missing options that block the most tests.
 `-A` `-b` (a cookie string) `-d` `--data-ascii` `--data-raw` `--data-binary` `--data-urlencode`
 `--json` `-D` `-e` (with `;auto`) `-f` `--fail-with-body` `-G` `-H` (with the `name:` and
 `name;` forms) `-I` `-i` `-k` `--cacert` `--capath` `-L` `--location-trusted` `--max-redirs`
-`-o` `-O` `--remote-name-all` `--output-dir` `-r` `-s` `-S` `-T` `-u` `-v` `-w` (most variables,
-`%header{}`, `%output{}`, `%{stderr}`) `-X` `-x` `-U` `--noproxy` `--resolve` `--connect-to`
+`-o` `-O` `--remote-name-all` `--output-dir` `-r` `-s` `-S` `-T` `-u` `--digest` `--basic`
+`--anyauth` `-v` `-w` (most variables, `%header{}`, `%output{}`, `%{stderr}`) `-X` `-x` `-U`
+`--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
 `--path-as-is` `--raw` `-0` `--url` `-m` `--connect-timeout` `-h` `-V`, and the options that
-runtests.pl adds: `-q`
-`--trace-ascii` `--trace-time`.
+runtests.pl adds: `-q` `--trace-ascii` `--trace-time`.
 
 The 2025 curl user survey asked for each user's favourite option. curl-vx accepts 18 of the top
 20 answers. It does not have `--libcurl` and `-F`. `-vv` and `-vvv` work as `-v`, and `-w` has no
@@ -149,8 +171,9 @@ In order of how much users need them:
 
 1. HTTP/2 (73% of survey users), connection reuse, compression (`--compressed`).
 1. URL globbing (`{a,b}` and `[1-9]`), the cookie engine (`-c`, cookie files), `-F` multipart
-   forms, `--digest`, `--next`, `-C` resume, `-K` config files, `http_proxy` and `NO_PROXY`
-   variables (Vx has no safe way to read the environment), HTTPS proxies.
+   forms, `--next`, `-J`, `-C` resume, `-K` config files, `--netrc`, `http_proxy` and
+   `NO_PROXY` variables (Vx has no safe way to read the environment), HTTPS proxies, and
+   Digest with the proxy of a CONNECT tunnel.
 1. HTTP/3.
 
 ## Vx issues found while writing curl-vx
@@ -180,9 +203,9 @@ The Vx project tracks these.
   E4009. The result of `url_text` holds no reference. `fetch.vx` carries the URL as text
   instead. Binding the result first (`let t = url_text(&u); info.url_effective = t;`) also
   works.
-- `--no-trusted-code` takes the body of each closure for an `unsafe` block (E5003), while
-  `--audit` lists nothing for it. So `curlvx` cannot pass a closure to
-  `std::sync::wait::within`, and `src/sys/tls.vx` holds those calls. A fix is under review.
+- [#4092](https://github.com/vx-lang/Vx/issues/4092) `--no-trusted-code` takes the body of each
+  closure for an `unsafe` block (E5003), while `--audit` lists nothing for it. So `curlvx`
+  cannot pass a closure to `std::sync::wait::within`, and `src/sys/tls.vx` holds those calls.
 
 ## License
 

@@ -135,9 +135,9 @@ struct RequestInfo {
   http10 : bool,
   // The `-H` headers, with the ones that `--json` adds.
   headers : Vec<Vec<u8>>,
-  has_credentials : bool,
-  user : Vec<u8>,
-  password : Vec<u8>,
+  // The value of the Authorization header (Basic or Digest), which `auth.vx` makes.
+  has_auth_header : bool,
+  auth_header : Vec<u8>,
   // Credentials and cookies may go to this host: it is the first host, or `--location-trusted`.
   trusted_host : bool,
   // A custom Host header may go to this host: it is the first host.
@@ -152,13 +152,17 @@ struct RequestInfo {
   cookie : Vec<u8>,
   // The request goes to an HTTP proxy, so the request line holds the whole URL.
   via_proxy : bool,
-  has_proxy_credentials : bool,
-  proxy_user : Vec<u8>,
-  proxy_password : Vec<u8>,
+  // The value of the Proxy-Authorization header (Basic or Digest), for a request that goes to
+  // an HTTP proxy.
+  has_proxy_auth_header : bool,
+  proxy_auth_header : Vec<u8>,
   // The body goes in chunks, with no Content-Length.
   chunked : bool,
   // curl adds `Transfer-Encoding: chunked` itself, because the length of the body is unknown.
   add_chunked_header : bool,
+  // The request is the probe of an authentication with an empty body: it says
+  // `Content-Length: 0`, and a custom Content-Length does not go.
+  probe : bool,
 }
 
 fn add_line(out : &mut Vec<u8>, name : *const i8, value : &Vec<u8>) -> void {
@@ -209,27 +213,30 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
     add_line(&mut out, "Host: ", &host_header_value(u));
   }
 
-  if info.via_proxy && info.has_proxy_credentials {
-    let mut pair = clone_bytes(&info.proxy_user);
-    push_lit(&mut pair, ":");
-    append(&mut pair, &info.proxy_password);
-    add_line(&mut out, "Proxy-Authorization: Basic ", &base64(&pair));
+  if info.via_proxy && info.has_proxy_auth_header {
+    add_line(&mut out, "Proxy-Authorization: ", &info.proxy_auth_header);
   }
 
-  if info.has_credentials && info.trusted_host && !has_custom(&info.headers, "Authorization") {
-    let mut pair = clone_bytes(&info.user);
-    push_lit(&mut pair, ":");
-    append(&mut pair, &info.password);
-    add_line(&mut out, "Authorization: Basic ", &base64(&pair));
+  if info.has_auth_header {
+    add_line(&mut out, "Authorization: ", &info.auth_header);
   }
 
-  if info.has_range && !has_custom(&info.headers, "Range") {
+  if info.has_range {
     // curl adds the `-` of an open range, so `-r 4` asks for byte 4 to the end.
     let mut range = clone_bytes(&info.range);
     if find_byte(&range, 45u8, 0) < 0 {
       range.push(45u8);
     }
-    add_line(&mut out, "Range: bytes=", &range);
+    let uploads = info.kind == REQ_POST || info.kind == REQ_PUT;
+    if !uploads && !has_custom(&info.headers, "Range") {
+      add_line(&mut out, "Range: bytes=", &range);
+    }
+    // An upload says which part of the file its body is, and the length of the body.
+    if uploads && !has_custom(&info.headers, "Content-Range") {
+      push_lit(&mut range, "/");
+      push_i64(&mut range, info.body_length);
+      add_line(&mut out, "Content-Range: bytes ", &range);
+    }
   }
 
   if !has_custom(&info.headers, "User-Agent") {
@@ -269,6 +276,7 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
     let h = split_header(line);
     let skip = h.ignored || h.remove || eq_lit_nocase(&h.name, "Host")
       || eq_lit_nocase(&h.name, "Connection")
+      || (info.probe && eq_lit_nocase(&h.name, "Content-Length"))
       || ((eq_lit_nocase(&h.name, "Authorization") || eq_lit_nocase(&h.name, "Cookie"))
           && !info.trusted_host);
     if !skip {
@@ -283,7 +291,8 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
   }
 
   if info.kind == REQ_POST || info.kind == REQ_PUT {
-    if info.body_length >= 0i64 && !info.chunked && !has_custom(&info.headers, "Content-Length") {
+    if info.body_length >= 0i64 && !info.chunked
+       && (info.probe || !has_custom(&info.headers, "Content-Length")) {
       let mut n = Vec<u8>::new();
       push_i64(&mut n, info.body_length);
       add_line(&mut out, "Content-Length: ", &n);
