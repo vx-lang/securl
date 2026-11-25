@@ -19,6 +19,7 @@ import sys::tls;
 import curlvx::body;
 import curlvx::encode;
 import curlvx::bytes;
+import curlvx::cookie;
 import curlvx::failure;
 import curlvx::form;
 import curlvx::http;
@@ -103,7 +104,9 @@ fn print_help() -> void {
   push_lit(&mut m, "     --anyauth              Pick any authentication method\n");
   push_lit(&mut m, " -A, --user-agent <name>    Send User-Agent <name> to server\n");
   push_lit(&mut m, " -e, --referer <URL>        Referrer URL\n");
-  push_lit(&mut m, " -b, --cookie <data>        Send cookies from string\n");
+  push_lit(&mut m, " -b, --cookie <data|filename> Send cookies from string/load from file\n");
+  push_lit(&mut m, " -c, --cookie-jar <filename> Save cookies to <filename> after operation\n");
+  push_lit(&mut m, " -j, --junk-session-cookies Ignore session cookies read from file\n");
   push_lit(&mut m, " -r, --range <range>        Retrieve only the bytes within RANGE\n");
   push_lit(&mut m, " -v, --verbose              Make the operation more talkative\n");
   push_lit(&mut m, " -w, --write-out <format>   Use output FORMAT after completion\n");
@@ -332,12 +335,29 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
     }
   }
 
+  // The cookie engine runs when `-b` names a file or `-c` a jar. `main` reads the files with
+  // its file right, and the transfers get the jar without that right.
+  let mut jar = new_jar(cfg.cookie_files.len() > 0 || cfg.has_cookie_jar);
+  for name in cfg.cookie_files.iter() {
+    match read_file(files, name) {
+      Result<Vec<u8>, Failure>::Ok(text) => {
+        load_cookie_text(&mut jar, &text, cfg.junk_session_cookies);
+      },
+      Result<Vec<u8>, Failure>::Err(_f) => {
+        // libcurl ignores a cookie file that it cannot read.
+      }
+    }
+  }
+  start_jar(&mut jar);
+
   // The TLS settings read the certificate authorities from files, so `main` makes them with its
   // file right. The transfers get them without that right.
   match TlsConfig::new(files, cfg.insecure, &cfg.cacert, &cfg.capath) {
     Result<TlsConfig, TlsError>::Ok(t) => {
-      return run_all(network, files, &t, cfg, &headers, &request_body, &upload_body, kind,
-        other_kind, &form_boundary);
+      let code = run_all(network, files, &t, cfg, &headers, &request_body, &upload_body, kind,
+        other_kind, &form_boundary, &mut jar);
+      save_jar(files, cfg, &mut jar);
+      return code;
     },
     Result<TlsConfig, TlsError>::Err(e) => {
       let f = fail_with(e.code, e.message);
@@ -347,10 +367,35 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
   }
 }
 
+/// Write the cookies to the jar file of `-c`, or to standard output for `-`. libcurl only notes
+/// a jar that it cannot write.
+fn save_jar(files : &Files, cfg : &Config, jar : &mut CookieJar) -> void {
+  if !cfg.has_cookie_jar {
+    return;
+  }
+  let text = jar_text(jar);
+  if eq_lit(&cfg.cookie_jar, "-") {
+    let _ok = write_stdout(&text);
+    return;
+  }
+  match append_to_file(files, &cfg.cookie_jar, false, &text) {
+    Result<i32, Failure>::Ok(_n) => {},
+    Result<i32, Failure>::Err(_f) => {
+      if cfg.verbose {
+        let mut m = lit("* WARNING: failed to save cookies in ");
+        append(&mut m, &cfg.cookie_jar);
+        push_lit(&mut m, "\n");
+        to_stderr(&m);
+      }
+      return;
+    }
+  }
+}
+
 /// Run the transfer of each URL, and give the exit code of the last one that failed.
 fn run_all(network : &Network, files : &Files, tls : &TlsConfig, cfg : &Config,
 headers : &Vec<Vec<u8>>, request_body : &Vec<u8>, upload_body : &Vec<u8>, kind : i32,
-other_kind : i32, form_boundary : &Vec<u8>) -> i32 {
+other_kind : i32, form_boundary : &Vec<u8>, jar : &mut CookieJar) -> i32 {
   let mut exit_code = 0;
   let mut i = 0;
   while i < cfg.urls.len() {
@@ -377,10 +422,10 @@ other_kind : i32, form_boundary : &Vec<u8>) -> i32 {
     let mut result = Result<i32, Failure>::Ok(0);
     if this_kind == REQ_PUT {
       result = transfer_one(network, files, tls, cfg, headers, &url_text, upload_body, this_kind,
-        form_boundary, i, &mut info);
+        form_boundary, jar, i, &mut info);
     } else {
       result = transfer_one(network, files, tls, cfg, headers, &url_text, request_body, this_kind,
-        form_boundary, i, &mut info);
+        form_boundary, jar, i, &mut info);
     }
     match result {
       Result<i32, Failure>::Ok(_v) => {},
@@ -439,8 +484,8 @@ fn write_pieces(files : &Files, pieces : &Vec<WriteOutPiece>) -> void {
 
 fn transfer_one(network : &Network, files : &Files, tls : &TlsConfig, cfg : &Config,
 headers : &Vec<Vec<u8>>,
-url_text : &Vec<u8>, request_body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>, index : i32,
-info : &mut TransferInfo) -> Result<i32, Failure> {
+url_text : &Vec<u8>, request_body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>,
+jar : &mut CookieJar, index : i32, info : &mut TransferInfo) -> Result<i32, Failure> {
   let body_output = open_output(files, cfg, index, url_text)?;
   let header_output = open_header_output(files, cfg)?;
   let mut sinks = Sinks {
@@ -449,5 +494,5 @@ info : &mut TransferInfo) -> Result<i32, Failure> {
     has_headers : cfg.has_dump_header
   };
   return run_transfer(network, tls, cfg, headers, url_text, request_body, kind, form_boundary,
-    &mut sinks, info);
+    jar, &mut sinks, info);
 }

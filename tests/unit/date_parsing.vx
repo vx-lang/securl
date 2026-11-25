@@ -1,0 +1,50 @@
+// Checks curlvx::date against the formats that libcurl's parsedate.c documents.
+import core::option;
+import std::vec;
+import sys::text;
+import curlvx::date;
+
+fn parses_to(text : *const i8, want : i64) -> void {
+  match parse_date(&lit(text)) {
+    Option<i64>::Some(t) => {
+      assert(t == want, "a date parsed to the wrong time");
+    },
+    Option<i64>::None() => {
+      panic("a date that should parse did not");
+    }
+  }
+}
+
+fn fails(text : *const i8) -> void {
+  match parse_date(&lit(text)) {
+    Option<i64>::Some(_t) => {
+      panic("a date that should not parse did");
+    },
+    Option<i64>::None() => {}
+  }
+}
+
+fn main() -> i32 {
+  // RFC 1123, RFC 850 and asctime.
+  parses_to("Sun, 06 Nov 1994 08:49:37 GMT", 784111777i64);
+  parses_to("Sunday, 06-Nov-94 08:49:37 GMT", 784111777i64);
+  parses_to("Sun Nov  6 08:49:37 1994", 784111777i64);
+  // Other orders and separators.
+  parses_to("1994 Nov 6 08:49:37", 784111777i64);
+  parses_to("GMT 08:49:37 06-Nov-94 Sunday", 784111777i64);
+  parses_to("94 6 Nov 08:49:37", 784111777i64);
+  parses_to("1994.Nov.6", 784080000i64);
+  parses_to("Sun/Nov/6/94/GMT", 784080000i64);
+  // Time zones as names and as numbers.
+  parses_to("06 Nov 1994 08:49:37 +0100", 784108177i64);
+  parses_to("Sun, 06 Nov 1994 09:49:37 CET", 784111777i64);
+  parses_to("20040912 15:05:58 -0700", 1095026758i64);
+  parses_to("20040911 +0200", 1094853600i64);
+  parses_to("Tue, 19 Jan 2038 03:14:08 GMT", 2147483648i64);
+  // libcurl reads time zone names in upper case only, and wants a day, a month and a year.
+  fails("Sun, 06 Nov 1994 08:49:37 gmt");
+  fails("06 Nov");
+  fails("Sun, 06 Foo 1994 08:49:37 GMT");
+  fails("Sun, 32 Nov 1994 08:49:37 GMT");
+  return 0;
+}

@@ -267,10 +267,8 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
     push_lit(&mut out, "Transfer-Encoding: chunked\r\n");
   }
 
-  // `-b name=value` sends a cookie. A value with no `=` names a cookie file, which curl-vx
-  // does not read yet.
-  if info.has_cookie && info.trusted_host && find_byte(&info.cookie, 61u8, 0) >= 0
-     && !has_custom(&info.headers, "Cookie") {
+  // The cookies of the cookie engine and of `-b name=value`, which `fetch.vx` puts together.
+  if info.has_cookie {
     add_line(&mut out, "Cookie: ", &info.cookie);
   }
 

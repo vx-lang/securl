@@ -14,6 +14,7 @@ import sys::tls;
 import curlvx::auth;
 import curlvx::bytes;
 import curlvx::conn;
+import curlvx::cookie;
 import curlvx::failure;
 import curlvx::http;
 import curlvx::options;
@@ -392,7 +393,7 @@ struct Hop {
 fn one_hop(network : &Network, tls : &TlsConfig, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
 req_kind : i32, body : &Vec<u8>, creds : &Credentials, same_host : bool, has_referer : bool,
 referer : &Vec<u8>, deadline : Instant, form_boundary : &Vec<u8>, auth : &mut AuthContext,
-sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop, Failure> {
+jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop, Failure> {
   let secure = eq_lit(&u.scheme, "https");
   let mut method = lit("GET");
   if cfg.has_method {
@@ -440,6 +441,19 @@ sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop, Failure> {
     &origin_of(&proxy.url));
   // Before Digest has its nonce, a POST or a PUT goes with an empty body, as a probe.
   let probe = needs_probe(auth) && sends_body;
+  // The cookies: those of the engine that match the host and the path, and the `-b` string,
+  // which goes only where credentials go.
+  let cookie_host = cookie_host_of(headers, u, same_host);
+  let cookie_path = path_of(&u.path);
+  let secure_context = secure || (!proxy.used && (eq_lit_nocase(&cookie_host, "localhost")
+    || eq_lit(&cookie_host, "127.0.0.1") || eq_lit(&cookie_host, "::1")));
+  let mut cookies = cookie_header(jar, &cookie_host, &cookie_path, secure_context);
+  if cfg.has_cookie && trusted_host && !has_custom(headers, "Cookie") {
+    if cookies.len() > 0 {
+      push_lit(&mut cookies, "; ");
+    }
+    append(&mut cookies, &cfg.cookie);
+  }
   let sends_body_now = sends_body && !probe;
   let mut body_length = -1i64;
   if sends_body {
@@ -464,8 +478,8 @@ sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop, Failure> {
     referer : clone_bytes(referer),
     has_range : cfg.has_range,
     range : clone_bytes(&cfg.range),
-    has_cookie : cfg.has_cookie,
-    cookie : clone_bytes(&cfg.cookie),
+    has_cookie : cookies.len() > 0,
+    cookie : cookies,
     via_proxy : via_proxy,
     has_proxy_auth_header : proxy_header.present,
     proxy_auth_header : proxy_header.value,
@@ -509,6 +523,7 @@ sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop, Failure> {
 
   // Skip each informational response, such as `100 Continue`. With `-i`, curl shows it.
   let mut head = read_head(&mut c, cfg.raw, &mut info.size_header_total)?;
+  let mut set_cookies = take_cookies(jar, &head, &cookie_host, &cookie_path, secure_context, 0);
   while head.error_code == 0 && head.status >= 100 && head.status < 200 && head.status != 101 {
     info.size_header = info.size_header + (head.raw.len() as i64);
     if cfg.verbose {
@@ -521,6 +536,8 @@ sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop, Failure> {
       let _w = sinks.headers.write(&head.raw)?;
     }
     head = read_head(&mut c, cfg.raw, &mut info.size_header_total)?;
+    set_cookies = take_cookies(jar, &head, &cookie_host, &cookie_path, secure_context,
+      set_cookies);
   }
   if head.error_code != 0 {
     // curl writes the headers before the bad one, and stops.
@@ -645,6 +662,66 @@ fn form_text(kind : i32, boundary : &Vec<u8>) -> Vec<u8> {
     return clone_bytes(boundary);
   }
   return Vec<u8>::new();
+}
+
+/// The host that cookies are for: the host of a custom Host header on the first host (without
+/// its port), or the host of the URL.
+fn cookie_host_of(headers : &Vec<Vec<u8>>, u : &Url, first_host : bool) -> Vec<u8> {
+  if first_host {
+    for line in headers.iter() {
+      let h = split_header(line);
+      if !h.ignored && !h.remove && eq_lit_nocase(&h.name, "Host") {
+        let v = trim_blanks(&h.value);
+        if v.len() == 0 {
+          return clone_bytes(&u.host);
+        }
+        if v.get(0) == 91u8 {
+          let close = find_byte(&v, 93u8, 0);
+          if close > 0 {
+            return range_of(&v, 1, close);
+          }
+          return rest_from(&v, 1);
+        }
+        let colon = find_byte(&v, 58u8, 0);
+        if colon >= 0 {
+          return range_of(&v, 0, colon);
+        }
+        return v;
+      }
+    }
+  }
+  return clone_bytes(&u.host);
+}
+
+/// The path of a request target, without its query.
+fn path_of(target : &Vec<u8>) -> Vec<u8> {
+  let q = find_byte(target, 63u8, 0);
+  if q >= 0 {
+    return range_of(target, 0, q);
+  }
+  return clone_bytes(target);
+}
+
+/// Give each Set-Cookie header of `head` to the jar, up to libcurl's 50 for one request.
+/// `count` is how many the request had so far. Gives the new count.
+fn take_cookies(jar : &mut CookieJar, head : &ResponseHead, host : &Vec<u8>, path : &Vec<u8>,
+secure : bool, count : i32) -> i32 {
+  let mut n = count;
+  if !jar.enabled {
+    return n;
+  }
+  let mut flags = COOKIE_HTTPHEADER;
+  if secure {
+    flags = flags | COOKIE_SECURE;
+  }
+  for line in head.headers.iter() {
+    let colon = find_byte(line, 58u8, 0);
+    if colon > 0 && eq_lit_nocase(&range_of(line, 0, colon), "Set-Cookie") && n < 50 {
+      add_cookie(jar, &trim_blanks(&rest_from(line, colon + 1)), true, host, path, flags);
+      n = n + 1;
+    }
+  }
+  return n;
 }
 
 // How many times one transfer sends a request again for authentication.
@@ -925,15 +1002,15 @@ fn credentials_of(cfg : &Config, u : &Url) -> Credentials {
 /// `REQ_GET`, `REQ_POST`, `REQ_PUT` or `REQ_HEAD`. With `-m`, the whole transfer, redirects
 /// included, has that time limit.
 pub fn run_transfer(network : &Network, tls : &TlsConfig, cfg : &Config, headers : &Vec<Vec<u8>>,
-url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>, sinks : &mut Sinks,
-info : &mut TransferInfo) -> Result<i32, Failure> {
+url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>, jar : &mut CookieJar,
+sinks : &mut Sinks, info : &mut TransferInfo) -> Result<i32, Failure> {
   let started = Instant::now();
   let mut deadline = Instant::never();
   if cfg.max_time_ms > 0i64 {
     deadline = deadline_after(Duration::from_millis(cfg.max_time_ms as u64));
   }
   match follow_redirects(network, tls, cfg, headers, url_text, body, kind, deadline, form_boundary,
-    sinks, info) {
+    jar, sinks, info) {
     Result<i32, Failure>::Ok(n) => {
       return Result<i32, Failure>::Ok(n);
     },
@@ -964,7 +1041,8 @@ fn timeout_message(f : Failure, started : &Instant, info : &TransferInfo) -> Fai
 /// The transfer of `url_text`, and of each redirect that it follows, until `deadline`.
 fn follow_redirects(network : &Network, tls : &TlsConfig, cfg : &Config,
 headers : &Vec<Vec<u8>>, url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, deadline : Instant,
-form_boundary : &Vec<u8>, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<i32, Failure> {
+form_boundary : &Vec<u8>, jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo)
+-> Result<i32, Failure> {
   let first = parse_url(url_text, cfg.path_as_is)?;
   let mut creds = credentials_of(cfg, &first);
   let mut auth = new_auth_context(cfg.auth_type, cfg.proxy_auth_type);
@@ -994,7 +1072,7 @@ form_boundary : &Vec<u8>, sinks : &mut Sinks, info : &mut TransferInfo) -> Resul
       creds = credentials_of(cfg, &u);
     }
     let hop = one_hop(network, tls, cfg, headers, &u, req_kind, body, &creds, same_host, has_referer,
-      &referer, deadline, form_boundary, &mut auth, sinks, info)?;
+      &referer, deadline, form_boundary, &mut auth, jar, sinks, info)?;
     if hop.retry && auth_rounds < MAX_AUTH_ROUNDS {
       auth_rounds = auth_rounds + 1;
       continue;

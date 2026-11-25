@@ -103,6 +103,13 @@ struct Config {
   forms : Vec<FormArg>,
   // `--form-escape`: escape names and file names with backslashes.
   form_escape : bool,
+  // The files of `-b` values with no `=`, which the cookie engine reads.
+  cookie_files : Vec<Vec<u8>>,
+  // `-c`: where the cookie engine writes its cookies at the end.
+  has_cookie_jar : bool,
+  cookie_jar : Vec<u8>,
+  // `-j`: do not read session cookies from the files.
+  junk_session_cookies : bool,
 }
 
 /// A `Config` with curl's defaults.
@@ -168,7 +175,11 @@ pub fn default_config() -> Config {
     auth_type : 0,
     proxy_auth_type : 0,
     forms : Vec<FormArg>::new(),
-    form_escape : false
+    form_escape : false,
+    cookie_files : Vec<Vec<u8>>::new(),
+    has_cookie_jar : false,
+    cookie_jar : Vec<u8>::new(),
+    junk_session_cookies : false
   };
 }
 
@@ -238,6 +249,8 @@ const OPT_PROXY_ANYAUTH : i32 = 63;
 const OPT_FORM : i32 = 64;
 const OPT_FORM_STRING : i32 = 65;
 const OPT_FORM_ESCAPE : i32 = 66;
+const OPT_COOKIE_JAR : i32 = 67;
+const OPT_JUNK_SESSION_COOKIES : i32 = 68;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -309,6 +322,8 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "form") { return OPT_FORM; }
   if eq_lit(name, "form-string") { return OPT_FORM_STRING; }
   if eq_lit(name, "form-escape") { return OPT_FORM_ESCAPE; }
+  if eq_lit(name, "cookie-jar") { return OPT_COOKIE_JAR; }
+  if eq_lit(name, "junk-session-cookies") { return OPT_JUNK_SESSION_COOKIES; }
   if eq_lit(name, "cacert") { return OPT_CACERT; }
   if eq_lit(name, "capath") { return OPT_CAPATH; }
   return OPT_UNKNOWN;
@@ -318,6 +333,8 @@ fn long_option(name : &Vec<u8>) -> i32 {
 fn short_option(letter : u8) -> i32 {
   if letter == 65u8 { return OPT_USER_AGENT; }      // A
   if letter == 70u8 { return OPT_FORM; }            // F
+  if letter == 99u8 { return OPT_COOKIE_JAR; }      // c
+  if letter == 106u8 { return OPT_JUNK_SESSION_COOKIES; } // j
   if letter == 98u8 { return OPT_COOKIE; }          // b
   if letter == 100u8 { return OPT_DATA; }           // d
   if letter == 68u8 { return OPT_DUMP_HEADER; }     // D
@@ -355,7 +372,7 @@ fn short_option(letter : u8) -> i32 {
 /// Whether the option takes a value.
 fn takes_value(id : i32) -> bool {
   return (id >= OPT_USER_AGENT && id <= OPT_OUTPUT_DIR) || id == OPT_CACERT || id == OPT_CAPATH
-    || id == OPT_FORM || id == OPT_FORM_STRING;
+    || id == OPT_FORM || id == OPT_FORM_STRING || id == OPT_COOKIE_JAR;
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -421,14 +438,28 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     return done();
   }
   if id == OPT_COOKIE {
-    // Each `-b name=value` adds to the Cookie header, after a `; `.
-    if cfg.has_cookie && find_byte(&cfg.cookie, 61u8, 0) >= 0 && find_byte(value, 61u8, 0) >= 0 {
+    // A value with `=` is a cookie string: each one adds to the Cookie header, after a `; `.
+    // A value with no `=` names a file for the cookie engine.
+    if find_byte(value, 61u8, 0) < 0 {
+      cfg.cookie_files.push(clone_bytes(value));
+      return done();
+    }
+    if cfg.has_cookie {
       push_lit(&mut cfg.cookie, "; ");
       append(&mut cfg.cookie, value);
     } else {
       cfg.has_cookie = true;
       cfg.cookie = clone_bytes(value);
     }
+    return done();
+  }
+  if id == OPT_COOKIE_JAR {
+    cfg.has_cookie_jar = true;
+    cfg.cookie_jar = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_JUNK_SESSION_COOKIES {
+    cfg.junk_session_cookies = enable;
     return done();
   }
   if id == OPT_DATA || id == OPT_DATA_ASCII {

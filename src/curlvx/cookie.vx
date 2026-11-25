@@ -1,0 +1,930 @@
+// The cookie engine, as libcurl's `cookie.c` does it: `Set-Cookie` headers and cookie files
+// in, a `Cookie` header and a cookie jar file out.
+//
+// `main` reads the cookie files of `-b` and writes the jar of `-c`, because only it has the
+// file right. A transfer gives each `Set-Cookie` to `add_cookie`, and asks `cookie_header` for
+// the cookies of a request.
+import core::option;
+import std::time;
+import std::vec;
+import sys::text;
+import curlvx::bytes;
+import curlvx::date;
+
+// How `add_cookie` reads a line.
+// The line is the value of a `Set-Cookie` header, not a line of a cookie file.
+const COOKIE_HTTPHEADER : i32 = 1;
+// The origin is secure, so the cookie may say `secure`.
+const COOKIE_SECURE : i32 = 2;
+// `-j`: do not load session cookies from files.
+const COOKIE_NOSESSION : i32 = 4;
+
+// libcurl's limits.
+const MAX_COOKIE_LINE : i32 = 5000;
+const MAX_NAME : i32 = 4096;
+const MAX_DATE_LENGTH : i32 = 80;
+const MAX_SET_COOKIE_AMOUNT : i32 = 50;
+const MAX_COOKIE_SEND_AMOUNT : i32 = 150;
+const MAX_COOKIE_HEADER_LEN : i32 = 8190;
+// A cookie expires at most 400 days from now.
+const COOKIES_MAXAGE : i64 = 34560000i64;
+const OFF_T_MAX : i64 = 9223372036854775807i64;
+
+struct Cookie {
+  name : Vec<u8>,
+  value : Vec<u8>,
+  path : Vec<u8>,
+  domain : Vec<u8>,
+  // Seconds since 1970, or 0 for a session cookie.
+  expires : i64,
+  creation : i64,
+  tailmatch : bool,
+  secure : bool,
+  // Set by a server, not read from a file.
+  live : bool,
+  httponly : bool,
+  prefix_secure : bool,
+  prefix_host : bool,
+  // libcurl keeps cookies in lists by the last two labels of their domain. This is that key,
+  // in lower case, or empty for an IP address or no domain.
+  bucket : Vec<u8>,
+}
+
+/// The cookies of a run.
+struct CookieJar {
+  // The engine is on: `-b` named a file, or `-c` a jar.
+  enabled : bool,
+  cookies : Vec<Cookie>,
+  last_creation : i64,
+  // The files are loaded, and the transfers run.
+  running : bool,
+}
+
+/// An empty jar. `enabled` turns the engine on.
+pub fn new_jar(enabled : bool) -> CookieJar {
+  return CookieJar {
+    enabled : enabled,
+    cookies : Vec<Cookie>::new(),
+    last_creation : 0i64,
+    running : false
+  };
+}
+
+/// The clock, in seconds since 1970.
+fn now_seconds() -> i64 {
+  return unix_timestamp() as i64;
+}
+
+fn empty_cookie() -> Cookie {
+  return Cookie {
+    name : Vec<u8>::new(),
+    value : Vec<u8>::new(),
+    path : Vec<u8>::new(),
+    domain : Vec<u8>::new(),
+    expires : 0i64,
+    creation : 0i64,
+    tailmatch : false,
+    secure : false,
+    live : false,
+    httponly : false,
+    prefix_secure : false,
+    prefix_host : false,
+    bucket : Vec<u8>::new()
+  };
+}
+
+fn copy_cookie(c : &Cookie) -> Cookie {
+  return Cookie {
+    name : clone_bytes(&c.name),
+    value : clone_bytes(&c.value),
+    path : clone_bytes(&c.path),
+    domain : clone_bytes(&c.domain),
+    expires : c.expires,
+    creation : c.creation,
+    tailmatch : c.tailmatch,
+    secure : c.secure,
+    live : c.live,
+    httponly : c.httponly,
+    prefix_secure : c.prefix_secure,
+    prefix_host : c.prefix_host,
+    bucket : clone_bytes(&c.bucket)
+  };
+}
+
+/// Whether the cookie domain `cd` matches the end of `host` at a label boundary.
+fn tailmatch(cd : &Vec<u8>, host : &Vec<u8>) -> bool {
+  if host.len() < cd.len() {
+    return false;
+  }
+  let start = host.len() - cd.len();
+  if !eq_nocase(&range_of(host, start, host.len()), cd) {
+    return false;
+  }
+  if start == 0 {
+    return true;
+  }
+  return host.get(start - 1) == 46u8;
+}
+
+/// Whether the cookie path matches the path of a request (RFC 6265, 5.1.4).
+fn pathmatch(cookie_path : &Vec<u8>, uri_path : &Vec<u8>) -> bool {
+  if cookie_path.len() == 1 {
+    return true;
+  }
+  let mut uri = clone_bytes(uri_path);
+  if uri.len() == 0 || uri.get(0) != 47u8 {
+    uri = lit("/");
+  }
+  if uri.len() < cookie_path.len() {
+    return false;
+  }
+  if !same_bytes(&range_of(&uri, 0, cookie_path.len()), cookie_path) {
+    return false;
+  }
+  if cookie_path.len() == uri.len() {
+    return true;
+  }
+  return uri.get(cookie_path.len()) == 47u8;
+}
+
+/// The last two labels of `domain`, in lower case: the key of its list.
+fn top_domain(domain : &Vec<u8>) -> Vec<u8> {
+  let last = rfind_byte(domain, 46u8);
+  if last < 0 {
+    return to_lower(domain);
+  }
+  let mut first = -1;
+  let mut i = last - 1;
+  while i >= 0 {
+    if domain.get(i) == 46u8 {
+      first = i;
+      break;
+    }
+    i = i - 1;
+  }
+  return to_lower(&rest_from(domain, first + 1));
+}
+
+/// Whether `host` is an IPv4 or IPv6 address.
+pub fn host_is_ip(host : &Vec<u8>) -> bool {
+  if host.len() == 0 {
+    return false;
+  }
+  if find_byte(host, 58u8, 0) >= 0 {
+    // IPv6: hex digits, colons and maybe a dotted IPv4 end.
+    for b in host.iter() {
+      if !is_digit(*b) && hex_value(*b) < 0 && *b != 58u8 && *b != 46u8 {
+        return false;
+      }
+    }
+    return true;
+  }
+  let mut dots = 0;
+  let mut digits = 0;
+  let mut value = 0;
+  for b in host.iter() {
+    if *b == 46u8 {
+      if digits == 0 {
+        return false;
+      }
+      dots = dots + 1;
+      digits = 0;
+      value = 0;
+    } else {
+      if !is_digit(*b) {
+        return false;
+      }
+      digits = digits + 1;
+      value = value * 10 + ((*b - 48u8) as i32);
+      if digits > 3 || value > 255 {
+        return false;
+      }
+    }
+  }
+  return dots == 3 && digits > 0;
+}
+
+/// The path of a cookie: no quotes, `/` when it does not start with one, and no `/` at its end.
+fn sanitize_path(p : &Vec<u8>) -> Vec<u8> {
+  let mut s = clone_bytes(p);
+  if s.len() > 0 && s.get(0) == 34u8 {
+    s = rest_from(&s, 1);
+    if s.len() > 0 && s.get(s.len() - 1) == 34u8 {
+      s = range_of(&s, 0, s.len() - 1);
+    }
+  }
+  if s.len() == 0 || s.get(0) != 47u8 {
+    return lit("/");
+  }
+  if s.len() > 1 && s.get(s.len() - 1) == 47u8 {
+    s = range_of(&s, 0, s.len() - 1);
+  }
+  return s;
+}
+
+/// A domain that cookies may not be set for: no dot inside it, and not `localhost`.
+fn bad_domain(d : &Vec<u8>) -> bool {
+  if eq_lit_nocase(d, "localhost") {
+    return false;
+  }
+  let dot = find_byte(d, 46u8, 0);
+  if dot >= 0 && d.len() - dot > 1 {
+    return false;
+  }
+  return true;
+}
+
+fn invalid_octets(s : &Vec<u8>) -> bool {
+  for b in s.iter() {
+    if *b < 32u8 || *b == 127u8 {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// A cookie expires at most 400 days from now, rounded to a minute.
+fn cap_expires(now : i64, c : &mut Cookie) -> void {
+  if c.expires != 0i64 && (OFF_T_MAX - COOKIES_MAXAGE - 30i64) > now {
+    let mut cap = now + COOKIES_MAXAGE;
+    if c.expires > cap {
+      cap = cap + 30i64;
+      c.expires = (cap / 60i64) * 60i64;
+    }
+  }
+}
+
+fn parse_max_age(c : &mut Cookie, value : &Vec<u8>, now : i64) -> void {
+  let mut v = clone_bytes(value);
+  if v.len() > 0 && v.get(0) == 34u8 {
+    v = rest_from(&v, 1);
+  }
+  // The digits at the start, as curlx_str_number reads them.
+  let mut end = 0;
+  while end < v.len() && is_digit(v.get(end)) {
+    end = end + 1;
+  }
+  if end == 0 {
+    // Negative or not a number: expire now.
+    c.expires = 1i64;
+  } else {
+    if end > 18 {
+      c.expires = OFF_T_MAX;
+    } else {
+      let mut n = 0i64;
+      let mut i = 0;
+      while i < end {
+        n = n * 10i64 + ((v.get(i) - 48u8) as i64);
+        i = i + 1;
+      }
+      if n == 0i64 {
+        c.expires = 1i64;
+      } else {
+        if OFF_T_MAX - now < n {
+          c.expires = OFF_T_MAX;
+        } else {
+          c.expires = n + now;
+        }
+      }
+    }
+  }
+  cap_expires(now, c);
+}
+
+fn parse_expires(c : &mut Cookie, value : &Vec<u8>, now : i64) -> void {
+  // max-age wins.
+  if c.expires != 0i64 || value.len() >= MAX_DATE_LENGTH {
+    return;
+  }
+  match parse_date(value) {
+    Option<i64>::Some(t) => {
+      if t == 0i64 {
+        c.expires = 1i64;
+      } else {
+        c.expires = t;
+      }
+    },
+    Option<i64>::None() => {
+      c.expires = 0i64;
+    }
+  }
+  cap_expires(now, c);
+}
+
+/// The end of a name or a value at `at`: the index of the end, the index after the last
+/// non-blank byte, and whether a byte that a cookie may not hold was in it.
+struct Span {
+  end : i32,
+  last : i32,
+  bad : bool,
+}
+
+fn scan_token(s : &Vec<u8>, at : i32, stop_at_equals : bool) -> Span {
+  let mut i = at;
+  let mut last = at;
+  let mut got_tab = false;
+  let mut bad = false;
+  while i < s.len() {
+    let c = s.get(i);
+    if c == 59u8 || c == 13u8 || c == 10u8 || (stop_at_equals && c == 61u8) {
+      break;
+    }
+    i = i + 1;
+    if c == 9u8 {
+      got_tab = true;
+    } else {
+      if c < 32u8 || c == 127u8 {
+        bad = true;
+      } else {
+        if got_tab && !is_blank(c) {
+          bad = true;
+        }
+      }
+    }
+    if !is_blank(c) {
+      last = i;
+    }
+  }
+  return Span {
+    end : i,
+    last : last,
+    bad : bad
+  };
+}
+
+/// Read the value of a `Set-Cookie` header into `c` (libcurl's `parse_cookie_header`).
+/// `domain` and `path` are the defaults: the host and the path of the request, or empty for a
+/// header line in a cookie file. False when the cookie is dropped.
+fn parse_header_cookie(c : &mut Cookie, s : &Vec<u8>, has_domain : bool, domain : &Vec<u8>,
+has_path : bool, path : &Vec<u8>, secure_origin : bool) -> bool {
+  if s.len() > MAX_COOKIE_LINE {
+    return false;
+  }
+  let now = now_seconds();
+  let mut have_name = false;
+  let mut attr_path = Vec<u8>::new();
+  let mut attr_domain = Vec<u8>::new();
+  let mut default_domain = clone_bytes(domain);
+  let mut has_default_domain = has_domain;
+  let mut i = 0;
+  while i < s.len() && s.get(i) != 13u8 && s.get(i) != 10u8 {
+    while i < s.len() && is_blank(s.get(i)) {
+      i = i + 1;
+    }
+    let name_start = i;
+    let n = scan_token(s, i, true);
+    if n.bad {
+      return false;
+    }
+    let name = range_of(s, name_start, n.last);
+    i = n.end;
+    let mut sep = false;
+    let mut value = Vec<u8>::new();
+    if i < s.len() && s.get(i) == 61u8 {
+      i = i + 1;
+      sep = true;
+      while i < s.len() && is_blank(s.get(i)) {
+        i = i + 1;
+      }
+      let value_start = i;
+      let v = scan_token(s, i, false);
+      if v.bad {
+        return false;
+      }
+      value = range_of(s, value_start, v.last);
+      i = v.end;
+    }
+    if !have_name {
+      if !sep || name.len() == 0 {
+        return false;
+      }
+      if name.len() + value.len() > MAX_NAME {
+        return false;
+      }
+      if starts_lit(&name, "__Secure-") {
+        c.prefix_secure = true;
+      } else {
+        if starts_lit(&name, "__Host-") {
+          c.prefix_host = true;
+        }
+      }
+      c.name = name;
+      c.value = value;
+      have_name = true;
+    } else {
+      if sep && eq_lit_nocase(&name, "path") {
+        attr_path = value;
+      } else {
+        if eq_lit_nocase(&name, "secure") {
+          if !secure_origin {
+            return false;
+          }
+          c.secure = true;
+        } else {
+          if sep && eq_lit_nocase(&name, "domain") {
+            if value.len() > 0 {
+              let mut v = clone_bytes(&value);
+              if v.get(0) == 46u8 {
+                v = rest_from(&v, 1);
+              }
+              if bad_domain(&v) {
+                has_default_domain = true;
+                default_domain = lit(":");
+              }
+              let mut checked = clone_bytes(&v);
+              if has_default_domain {
+                checked = clone_bytes(&default_domain);
+              }
+              let is_ip = host_is_ip(&checked);
+              let ok = !has_default_domain
+                || (is_ip && same_bytes(&v, &default_domain))
+                || (!is_ip && tailmatch(&v, &default_domain));
+              if !ok {
+                return false;
+              }
+              attr_domain = v;
+              if !is_ip {
+                c.tailmatch = true;
+              }
+            }
+          } else {
+            if sep && value.len() > 0 && eq_lit_nocase(&name, "max-age") {
+              parse_max_age(c, &value, now);
+            } else {
+              if sep && value.len() > 0 && eq_lit_nocase(&name, "expires") {
+                parse_expires(c, &value, now);
+              } else {
+                if eq_lit_nocase(&name, "httponly") {
+                  c.httponly = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if i < s.len() && s.get(i) == 59u8 {
+      i = i + 1;
+    } else {
+      break;
+    }
+  }
+  if !have_name {
+    return false;
+  }
+  // The path: the attribute, or the directory of the request path.
+  if attr_path.len() > 0 {
+    c.path = sanitize_path(&attr_path);
+  } else {
+    if has_path {
+      let slash = rfind_byte(path, 47u8);
+      if slash >= 0 {
+        c.path = sanitize_path(&range_of(path, 0, slash + 1));
+      } else {
+        c.path = sanitize_path(path);
+      }
+    } else {
+      c.path = lit("/");
+    }
+  }
+  if attr_domain.len() > 0 {
+    c.domain = attr_domain;
+  } else {
+    if has_default_domain {
+      c.domain = default_domain;
+    }
+  }
+  return true;
+}
+
+/// Whether the field of a cookie file is a prefix of `word`, as libcurl's `strnequal` with the
+/// length of the field compares them. `nocase` ignores case.
+fn field_is(field : &Vec<u8>, word : *const i8, nocase : bool) -> bool {
+  let w = lit(word);
+  if field.len() > w.len() {
+    return false;
+  }
+  let head = range_of(&w, 0, field.len());
+  if nocase {
+    return eq_nocase(field, &head);
+  }
+  return same_bytes(field, &head);
+}
+
+/// Read a line of a Netscape cookie file into `c` (libcurl's `parse_netscape`): domain,
+/// tailmatch, path, secure, expires, name and value, separated by tabs.
+fn parse_netscape(c : &mut Cookie, line : &Vec<u8>, secure_origin : bool, running : bool) -> bool {
+  let mut s = clone_bytes(line);
+  if starts_lit(&s, "#HttpOnly_") {
+    s = rest_from(&s, 10);
+    c.httponly = true;
+  }
+  if s.len() > 0 && s.get(0) == 35u8 {
+    return false;
+  }
+  // The end of the line.
+  let mut end = 0;
+  while end < s.len() && s.get(end) != 13u8 && s.get(end) != 10u8 {
+    end = end + 1;
+  }
+  let mut fields = 0;
+  let mut start = 0;
+  let mut more = true;
+  while more {
+    let mut stop = start;
+    while stop < end && s.get(stop) != 9u8 {
+      stop = stop + 1;
+    }
+    more = stop < end && s.get(stop) == 9u8;
+    let mut f = range_of(&s, start, stop);
+    if fields == 0 {
+      if f.len() > 0 && f.get(0) == 46u8 {
+        f = rest_from(&f, 1);
+      }
+      if f.len() == 0 {
+        return false;
+      }
+      c.domain = f;
+    } else {
+      if fields == 1 {
+        c.tailmatch = field_is(&f, "TRUE", true);
+      } else {
+        let mut secure_field = fields == 3;
+        if fields == 2 {
+          if !field_is(&f, "TRUE", false) && !field_is(&f, "FALSE", false) {
+            c.path = sanitize_path(&f);
+          } else {
+            // Not a path: make one up, and read this field as the secure flag.
+            c.path = lit("/");
+            fields = fields + 1;
+            secure_field = true;
+          }
+        }
+        if secure_field {
+          c.secure = false;
+          if field_is(&f, "TRUE", true) {
+            if secure_origin || running {
+              c.secure = true;
+            } else {
+              return false;
+            }
+          }
+        }
+        if fields == 4 {
+          let mut digits = 0;
+          while digits < f.len() && is_digit(f.get(digits)) {
+            digits = digits + 1;
+          }
+          if digits == 0 {
+            return false;
+          }
+          match parse_u64(&range_of(&f, 0, digits)) {
+            Option<u64>::Some(v) => {
+              c.expires = v as i64;
+            },
+            Option<u64>::None() => {
+              return false;
+            }
+          }
+        }
+        if fields == 5 {
+          if f.len() == 0 {
+            return false;
+          }
+          if starts_lit(&f, "__Secure-") {
+            c.prefix_secure = true;
+          } else {
+            if starts_lit(&f, "__Host-") {
+              c.prefix_host = true;
+            }
+          }
+          c.name = f;
+        } else {
+          if fields == 6 {
+            c.value = f;
+          }
+        }
+      }
+    }
+    fields = fields + 1;
+    start = stop + 1;
+  }
+  if fields == 6 {
+    c.value = Vec<u8>::new();
+    fields = 7;
+  }
+  if fields != 7 {
+    return false;
+  }
+  return !invalid_octets(&c.name) && !invalid_octets(&c.value);
+}
+
+/// Drop the cookies that have expired.
+fn remove_expired(jar : &mut CookieJar) -> void {
+  let now = now_seconds();
+  let mut kept = Vec<Cookie>::new();
+  for c in jar.cookies.iter() {
+    if c.expires == 0i64 || c.expires >= now {
+      kept.push(copy_cookie(c));
+    }
+  }
+  jar.cookies = kept;
+}
+
+/// Whether the jar takes the new cookie `co` (libcurl's `cookie_accept`), and the index of the
+/// cookie that it replaces, or -1. Gives -2 when the jar drops `co`.
+fn accept_cookie(jar : &CookieJar, co : &Cookie, flags : i32, live : bool) -> i32 {
+  let mut replace = -1;
+  let mut i = 0;
+  while i < jar.cookies.len() {
+    let old = jar.cookies.get_ref(i);
+    if same_bytes(&old.bucket, &co.bucket) && same_bytes(&old.name, &co.name) {
+      // A cookie that is not secure may not overlay a secure one.
+      if old.secure && !co.secure && (flags & COOKIE_SECURE) == 0 && co.path.len() > 0 {
+        let mut matching = false;
+        if old.domain.len() > 0 && co.domain.len() > 0 {
+          matching = tailmatch(&old.domain, &co.domain) || tailmatch(&co.domain, &old.domain);
+        } else {
+          matching = old.domain.len() == 0 && co.domain.len() == 0;
+        }
+        if matching {
+          let mut cllen = old.path.len();
+          if old.path.len() > 0 {
+            let sep = find_byte(&old.path, 47u8, 1);
+            if sep >= 0 {
+              cllen = sep;
+            }
+          }
+          if cllen <= co.path.len() && same_bytes(&range_of(&old.path, 0, cllen),
+              &range_of(&co.path, 0, cllen)) {
+            return -2;
+          }
+        }
+      }
+      if replace < 0 {
+        let mut same = false;
+        if old.domain.len() == co.domain.len() {
+          same = (co.domain.len() == 0 || eq_nocase(&old.domain, &co.domain))
+            && old.tailmatch == co.tailmatch;
+        }
+        if same {
+          if co.path.len() > 0 && same_bytes(&old.path, &co.path) {
+            if !live && old.live {
+              // A cookie from a server wins over one from a file.
+              return -2;
+            }
+            replace = i;
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return replace;
+}
+
+/// Add the cookie of `line` to the jar (libcurl's `Curl_cookie_add`). With `COOKIE_HTTPHEADER`
+/// the line is the value of a `Set-Cookie` header from `host` for `path`; else it is a line of
+/// a cookie file. `has_host` is false for a header line in a file.
+pub fn add_cookie(jar : &mut CookieJar, line : &Vec<u8>, has_host : bool, host : &Vec<u8>,
+path : &Vec<u8>, flags : i32) -> void {
+  let mut c = empty_cookie();
+  let secure_origin = (flags & COOKIE_SECURE) != 0;
+  let mut ok = false;
+  if (flags & COOKIE_HTTPHEADER) != 0 {
+    ok = parse_header_cookie(&mut c, line, has_host, host, has_host, path, secure_origin);
+  } else {
+    ok = parse_netscape(&mut c, line, secure_origin, jar.running);
+  }
+  if !ok {
+    return;
+  }
+  if c.prefix_secure && !c.secure {
+    return;
+  }
+  let ip_only = c.domain.len() > 0 && host_is_ip(&c.domain);
+  if c.prefix_host {
+    if !(c.secure && eq_lit(&c.path, "/") && !c.tailmatch) {
+      return;
+    }
+  }
+  if !jar.running && (flags & COOKIE_NOSESSION) != 0 && c.expires == 0i64 {
+    return;
+  }
+  if jar.running {
+    remove_expired(jar);
+  }
+  if !ip_only && c.domain.len() > 0 {
+    c.bucket = top_domain(&c.domain);
+  }
+  let live = jar.running;
+  let replace = accept_cookie(jar, &c, flags, live);
+  if replace == -2 {
+    return;
+  }
+  c.live = live;
+  if replace >= 0 {
+    // The new cookie takes the place of the old one at the end of the list, with its age.
+    // Bound first: assigning the call's result to a field directly gives E4009 (Vx #4010).
+    let created = jar.cookies.get_ref(replace).creation;
+    c.creation = created;
+    let mut kept = Vec<Cookie>::new();
+    let mut i = 0;
+    while i < jar.cookies.len() {
+      if i != replace {
+        kept.push(copy_cookie(jar.cookies.get_ref(i)));
+      }
+      i = i + 1;
+    }
+    jar.cookies = kept;
+  } else {
+    jar.last_creation = jar.last_creation + 1i64;
+    c.creation = jar.last_creation;
+  }
+  jar.cookies.push(c);
+}
+
+/// Load the text of a cookie file: Netscape lines, and `Set-Cookie:` header lines.
+/// `no_session` is `-j`.
+pub fn load_cookie_text(jar : &mut CookieJar, text : &Vec<u8>, no_session : bool) -> void {
+  jar.running = false;
+  let mut flags = COOKIE_SECURE;
+  if no_session {
+    flags = flags | COOKIE_NOSESSION;
+  }
+  let mut start = 0;
+  while start < text.len() {
+    let mut end = find_byte(text, 10u8, start);
+    if end < 0 {
+      end = text.len();
+    }
+    let line = range_of(text, start, end);
+    if starts_lit_nocase(&line, "Set-Cookie:") {
+      let mut at = 11;
+      while at < line.len() && is_blank(line.get(at)) {
+        at = at + 1;
+      }
+      add_cookie(jar, &rest_from(&line, at), false, &Vec<u8>::new(), &Vec<u8>::new(),
+        flags | COOKIE_HTTPHEADER);
+    } else {
+      add_cookie(jar, &line, false, &Vec<u8>::new(), &Vec<u8>::new(), flags);
+    }
+    start = end + 1;
+  }
+  remove_expired(jar);
+}
+
+/// The files are loaded: from now on, cookies come from servers.
+pub fn start_jar(jar : &mut CookieJar) -> void {
+  jar.running = true;
+}
+
+/// Whether `a` goes before `b` in a Cookie header: longer paths first, then longer domains,
+/// then longer names, then newer cookies.
+fn sorts_before(a : &Cookie, b : &Cookie) -> bool {
+  if a.path.len() != b.path.len() {
+    return a.path.len() > b.path.len();
+  }
+  if a.domain.len() != b.domain.len() {
+    return a.domain.len() > b.domain.len();
+  }
+  if a.name.len() != b.name.len() {
+    return a.name.len() > b.name.len();
+  }
+  return a.creation > b.creation;
+}
+
+/// The indexes of `list` sorted with `sorts_before` (an insertion sort: the lists are short).
+fn sorted(jar : &CookieJar, list : &Vec<i32>) -> Vec<i32> {
+  let mut out = Vec<i32>::new();
+  for idx in list.iter() {
+    let c = jar.cookies.get_ref(*idx);
+    let mut placed = Vec<i32>::new();
+    let mut done = false;
+    for o in out.iter() {
+      if !done && sorts_before(c, jar.cookies.get_ref(*o)) {
+        placed.push(*idx);
+        done = true;
+      }
+      placed.push(*o);
+    }
+    if !done {
+      placed.push(*idx);
+    }
+    out = placed;
+  }
+  return out;
+}
+
+/// The value of the Cookie header for a request to `host` for `path` (without the query), or
+/// an empty list (libcurl's `Curl_cookie_getlist` and `http_cookies`). `secure` says that the
+/// request goes over TLS, or to this machine with no proxy.
+pub fn cookie_header(jar : &CookieJar, host : &Vec<u8>, path : &Vec<u8>, secure : bool) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  if !jar.enabled {
+    return out;
+  }
+  let is_ip = host_is_ip(host);
+  let mut bucket = Vec<u8>::new();
+  if !is_ip {
+    bucket = top_domain(host);
+  }
+  let now = now_seconds();
+  let mut matches = Vec<i32>::new();
+  let mut i = 0;
+  while i < jar.cookies.len() && matches.len() < MAX_COOKIE_SEND_AMOUNT {
+    let c = jar.cookies.get_ref(i);
+    let fresh = c.expires == 0i64 || c.expires >= now;
+    if same_bytes(&c.bucket, &bucket) && fresh && (!c.secure || secure) {
+      let domain_ok = c.domain.len() == 0
+        || (c.tailmatch && !is_ip && tailmatch(&c.domain, host))
+        || ((!c.tailmatch || is_ip) && eq_nocase(host, &c.domain));
+      if domain_ok && pathmatch(&c.path, path) {
+        matches.push(i);
+      }
+    }
+    i = i + 1;
+  }
+  let order = sorted(jar, &matches);
+  let mut length = 8;
+  let mut count = 0;
+  for idx in order.iter() {
+    let c = jar.cookies.get_ref(*idx);
+    let add = c.name.len() + c.value.len() + 1;
+    if length + add >= MAX_COOKIE_HEADER_LEN {
+      break;
+    }
+    if count > 0 {
+      push_lit(&mut out, "; ");
+      length = length + 2;
+    }
+    append(&mut out, &c.name);
+    out.push(61u8);
+    append(&mut out, &c.value);
+    length = length + add;
+    count = count + 1;
+  }
+  return out;
+}
+
+/// The cookie jar file of `-c`, in the Netscape format, newest cookies first.
+pub fn jar_text(jar : &mut CookieJar) -> Vec<u8> {
+  remove_expired(jar);
+  let mut out = lit("# Netscape HTTP Cookie File\n");
+  push_lit(&mut out, "# https://curl.se/docs/http-cookies.html\n");
+  push_lit(&mut out, "# This file was generated by libcurl! Edit at your own risk.\n\n");
+  // Newest first.
+  let mut order = Vec<i32>::new();
+  let mut i = 0;
+  while i < jar.cookies.len() {
+    if jar.cookies.get_ref(i).domain.len() > 0 {
+      let mut placed = Vec<i32>::new();
+      let mut done = false;
+      let created = jar.cookies.get_ref(i).creation;
+      for o in order.iter() {
+        if !done && created > jar.cookies.get_ref(*o).creation {
+          placed.push(i);
+          done = true;
+        }
+        placed.push(*o);
+      }
+      if !done {
+        placed.push(i);
+      }
+      order = placed;
+    }
+    i = i + 1;
+  }
+  for idx in order.iter() {
+    let c = jar.cookies.get_ref(*idx);
+    if c.httponly {
+      push_lit(&mut out, "#HttpOnly_");
+    }
+    if c.tailmatch && c.domain.get(0) != 46u8 {
+      push_lit(&mut out, ".");
+    }
+    append(&mut out, &c.domain);
+    out.push(9u8);
+    if c.tailmatch {
+      push_lit(&mut out, "TRUE");
+    } else {
+      push_lit(&mut out, "FALSE");
+    }
+    out.push(9u8);
+    append(&mut out, &c.path);
+    out.push(9u8);
+    if c.secure {
+      push_lit(&mut out, "TRUE");
+    } else {
+      push_lit(&mut out, "FALSE");
+    }
+    out.push(9u8);
+    push_i64(&mut out, c.expires);
+    out.push(9u8);
+    append(&mut out, &c.name);
+    out.push(9u8);
+    append(&mut out, &c.value);
+    out.push(10u8);
+  }
+  return out;
+}

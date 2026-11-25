@@ -1,0 +1,406 @@
+// Dates as libcurl reads them (`parsedate.c`), for the `expires=` of a cookie. It takes the
+// formats of RFC 1123, RFC 850 and asctime, and many others: names of days and months, times,
+// numbers in any order, and time zones as names or as `+hhmm`.
+import core::option;
+import std::vec;
+import sys::text;
+import curlvx::bytes;
+
+const NO_VALUE : i64 = -1i64;
+
+/// What a date said so far. -1 is "not seen yet".
+struct When {
+  wday : i64,
+  mon : i64,
+  mday : i64,
+  dsecs : i64,
+  year : i64,
+  tzoff : i64,
+}
+
+fn is_alpha(b : u8) -> bool {
+  return (b >= 65u8 && b <= 90u8) || (b >= 97u8 && b <= 122u8);
+}
+
+fn lower3(s : &Vec<u8>, at : i32) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  let mut i = 0;
+  while i < 3 {
+    out.push(ascii_lower(s.get(at + i)));
+    i = i + 1;
+  }
+  return out;
+}
+
+/// The day of the week of the word at `at` with `len` letters (0 is Monday), or -1. Three
+/// letters or the whole name, in any case.
+fn check_day(s : &Vec<u8>, at : i32, len : i32) -> i64 {
+  if len < 3 {
+    return NO_VALUE;
+  }
+  let names = lit("monday   tuesday  wednesdaythursday friday   saturday sunday   ");
+  let first = lower3(s, at);
+  let mut day = 0;
+  while day < 7 {
+    let start = day * 9;
+    if same_bytes(&first, &range_of(&names, start, start + 3)) {
+      if len == 3 {
+        return day as i64;
+      }
+      let mut full = range_of(&names, start, start + 9);
+      while full.len() > 0 && full.get(full.len() - 1) == 32u8 {
+        full = range_of(&full, 0, full.len() - 1);
+      }
+      if len == full.len() && eq_nocase(&range_of(s, at, at + len), &full) {
+        return day as i64;
+      }
+      return NO_VALUE;
+    }
+    day = day + 1;
+  }
+  return NO_VALUE;
+}
+
+/// The month of the three-letter word at `at` (0 is January), in any case, or -1.
+fn check_month(s : &Vec<u8>, at : i32, len : i32) -> i64 {
+  if len != 3 {
+    return NO_VALUE;
+  }
+  let names = lit("janfebmaraprmayjunjulaugsepoctnovdec");
+  let word = lower3(s, at);
+  let mut m = 0;
+  while m < 12 {
+    if same_bytes(&word, &range_of(&names, m * 3, m * 3 + 3)) {
+      return m as i64;
+    }
+    m = m + 1;
+  }
+  return NO_VALUE;
+}
+
+// The time zones that libcurl knows, as offsets in minutes west of GMT. DST is -60.
+fn zone_minutes(name : &Vec<u8>) -> i64 {
+  let names = lit("ADT AST BST CAT CCT CDT CET CST EDT EET EST FST FWT GMT GST HDT HST JST MDT MET MST NZT PDT PST UTC WAT WET YDT YST AHSTCESTEADTEASTIDLEIDLWMESTMESZMEWTNZDTNZSTWADTWAST");
+  let mut offsets = Vec<i64>::new();
+  // ADT AST BST CAT CCT CDT CET CST EDT EET
+  offsets.push(180i64);
+  offsets.push(240i64);
+  offsets.push(-60i64);
+  offsets.push(600i64);
+  offsets.push(-480i64);
+  offsets.push(300i64);
+  offsets.push(-60i64);
+  offsets.push(360i64);
+  offsets.push(240i64);
+  offsets.push(-120i64);
+  // EST FST FWT GMT GST HDT HST JST MDT MET
+  offsets.push(300i64);
+  offsets.push(-120i64);
+  offsets.push(-60i64);
+  offsets.push(0i64);
+  offsets.push(-600i64);
+  offsets.push(540i64);
+  offsets.push(600i64);
+  offsets.push(-540i64);
+  offsets.push(360i64);
+  offsets.push(-60i64);
+  // MST NZT PDT PST UTC WAT WET YDT YST
+  offsets.push(420i64);
+  offsets.push(-720i64);
+  offsets.push(420i64);
+  offsets.push(480i64);
+  offsets.push(0i64);
+  offsets.push(60i64);
+  offsets.push(0i64);
+  offsets.push(480i64);
+  offsets.push(540i64);
+  // AHST CEST EADT EAST IDLE IDLW MEST MESZ MEWT NZDT NZST WADT WAST
+  offsets.push(600i64);
+  offsets.push(-120i64);
+  offsets.push(-660i64);
+  offsets.push(-600i64);
+  offsets.push(-720i64);
+  offsets.push(720i64);
+  offsets.push(-120i64);
+  offsets.push(-120i64);
+  offsets.push(-60i64);
+  offsets.push(-780i64);
+  offsets.push(-720i64);
+  offsets.push(-480i64);
+  offsets.push(-420i64);
+  let mut i = 0;
+  while i < offsets.len() {
+    let start = i * 4;
+    let mut entry = range_of(&names, start, start + 4);
+    if entry.get(3) == 32u8 {
+      entry = range_of(&entry, 0, 3);
+    }
+    if same_bytes(&entry, name) {
+      return offsets.get(i);
+    }
+    i = i + 1;
+  }
+  return 100000i64;
+}
+
+/// The time zone offset in seconds of the upper-case name at `at` with `len` letters, or -1.
+fn check_tz(s : &Vec<u8>, at : i32, len : i32) -> i64 {
+  if len > 4 || len == 0 {
+    return NO_VALUE;
+  }
+  let first = s.get(at);
+  if len == 1 {
+    // The military zones: A to I are -1 to -9 hours, K to M -10 to -12, N to Y +1 to +12, and
+    // Z is GMT.
+    if first < 65u8 || first > 90u8 || first == 74u8 {
+      return NO_VALUE;
+    }
+    let mut hours = 0i64;
+    if first <= 73u8 {
+      hours = -((first - 64u8) as i64);
+    }
+    if first >= 75u8 && first <= 77u8 {
+      hours = -((first - 65u8) as i64);
+    }
+    if first >= 78u8 && first <= 89u8 {
+      hours = (first - 77u8) as i64;
+    }
+    return hours * 3600i64;
+  }
+  if len == 2 {
+    if s.get(at + 1) == 84u8 {
+      if first == 78u8 {
+        return 11i64 * 3600i64;
+      }
+      if first == 85u8 {
+        return 0i64;
+      }
+    }
+    return NO_VALUE;
+  }
+  let minutes = zone_minutes(&range_of(s, at, at + len));
+  if minutes == 100000i64 {
+    return NO_VALUE;
+  }
+  return minutes * 60i64;
+}
+
+/// A word of letters at `at`: a day, a month or a time zone, in that order of preference.
+/// Gives the index after it, or -1 when it is none of them.
+fn date_string(s : &Vec<u8>, at : i32, w : &mut When) -> i32 {
+  let mut len = 0;
+  while at + len < s.len() && is_alpha(s.get(at + len)) && len < 10 {
+    len = len + 1;
+  }
+  if len == 10 {
+    return -1;
+  }
+  if w.wday == NO_VALUE {
+    w.wday = check_day(s, at, len);
+    if w.wday != NO_VALUE {
+      return at + len;
+    }
+  }
+  if w.mon == NO_VALUE {
+    w.mon = check_month(s, at, len);
+    if w.mon != NO_VALUE {
+      return at + len;
+    }
+  }
+  if w.tzoff == NO_VALUE {
+    w.tzoff = check_tz(s, at, len);
+    if w.tzoff != NO_VALUE {
+      return at + len;
+    }
+  }
+  return -1;
+}
+
+fn digit(s : &Vec<u8>, i : i32) -> i64 {
+  return (s.get(i) - 48u8) as i64;
+}
+
+fn digit_at(s : &Vec<u8>, i : i32) -> bool {
+  return i < s.len() && is_digit(s.get(i));
+}
+
+/// A time `hh:mm` or `hh:mm:ss` at `at`. Gives the index after it, or -1.
+fn match_time(s : &Vec<u8>, at : i32, w : &mut When) -> i32 {
+  let mut i = at;
+  if !digit_at(s, i) {
+    return -1;
+  }
+  let mut hh = digit(s, i);
+  i = i + 1;
+  if digit_at(s, i) {
+    hh = hh * 10i64 + digit(s, i);
+    i = i + 1;
+  }
+  if hh >= 24i64 || i >= s.len() || s.get(i) != 58u8 || !digit_at(s, i + 1) {
+    return -1;
+  }
+  i = i + 1;
+  let mut mm = digit(s, i);
+  i = i + 1;
+  if digit_at(s, i) {
+    mm = mm * 10i64 + digit(s, i);
+    i = i + 1;
+  }
+  if mm >= 60i64 {
+    return -1;
+  }
+  let mut ss = 0i64;
+  if i < s.len() && s.get(i) == 58u8 {
+    i = i + 1;
+    if !digit_at(s, i) {
+      return -1;
+    }
+    ss = digit(s, i);
+    i = i + 1;
+    if digit_at(s, i) {
+      ss = ss * 10i64 + digit(s, i);
+      i = i + 1;
+    }
+    if ss > 60i64 {
+      return -1;
+    }
+  }
+  w.dsecs = hh * 3600i64 + mm * 60i64 + ss;
+  return i;
+}
+
+/// A number at `at`: a time, a `+hhmm` time zone, a `yyyymmdd` date, a day of the month or a
+/// year. Gives the index after it, or -1.
+fn date_number(s : &Vec<u8>, at : i32, w : &mut When) -> i32 {
+  if w.dsecs == NO_VALUE {
+    let after = match_time(s, at, w);
+    if after >= 0 {
+      return after;
+    }
+  }
+  let mut i = at;
+  let mut val = 0i64;
+  while digit_at(s, i) && i - at < 9 {
+    val = val * 10i64 + digit(s, i);
+    i = i + 1;
+  }
+  if i - at == 9 {
+    // More than 8 digits.
+    return -1;
+  }
+  let digits = i - at;
+  let sign = byte_before(s, at);
+  if digits == 4 && (sign == 43u8 || sign == 45u8) && w.tzoff == NO_VALUE && val <= 1400i64 {
+    let off = ((val / 100i64) * 60i64 + (val % 100i64)) * 60i64;
+    if sign == 43u8 {
+      w.tzoff = -off;
+    } else {
+      w.tzoff = off;
+    }
+    return i;
+  }
+  if digits == 8 {
+    if w.year == NO_VALUE && w.mon == NO_VALUE && w.mday == NO_VALUE {
+      w.year = val / 10000i64;
+      w.mon = ((val % 10000i64) / 100i64) - 1i64;
+      if w.mon > 11i64 {
+        return -1;
+      }
+      w.mday = val % 100i64;
+      return i;
+    }
+    return -1;
+  }
+  if w.mday == NO_VALUE && val > 0i64 && val < 32i64 {
+    w.mday = val;
+    return i;
+  }
+  if w.year == NO_VALUE {
+    w.year = val;
+    if w.year < 100i64 {
+      if w.year >= 70i64 {
+        w.year = w.year + 1900i64;
+      } else {
+        w.year = w.year + 2000i64;
+      }
+    }
+    return i;
+  }
+  return -1;
+}
+
+fn byte_before(s : &Vec<u8>, at : i32) -> u8 {
+  if at > 0 {
+    return s.get(at - 1);
+  }
+  return 0u8;
+}
+
+/// Seconds since 1970 of the date in `w`, in GMT before the time zone.
+fn time_to_epoch(w : &When) -> i64 {
+  let mut days_before = Vec<i64>::new();
+  days_before.push(0i64);
+  days_before.push(31i64);
+  days_before.push(59i64);
+  days_before.push(90i64);
+  days_before.push(120i64);
+  days_before.push(151i64);
+  days_before.push(181i64);
+  days_before.push(212i64);
+  days_before.push(243i64);
+  days_before.push(273i64);
+  days_before.push(304i64);
+  days_before.push(334i64);
+  let mut y = w.year;
+  if w.mon <= 1i64 {
+    y = y - 1i64;
+  }
+  let leap_days = (y / 4i64) - (y / 100i64) + (y / 400i64) - 477i64;
+  let days = (w.year - 1970i64) * 365i64 + leap_days + days_before.get(w.mon as i32) + w.mday
+    - 1i64;
+  return days * 86400i64 + w.dsecs;
+}
+
+/// The time of the date `text` in seconds since 1970, or None when libcurl cannot read it.
+pub fn parse_date(text : &Vec<u8>) -> Option<i64> {
+  let mut w = When {
+    wday : NO_VALUE,
+    mon : NO_VALUE,
+    mday : NO_VALUE,
+    dsecs : NO_VALUE,
+    year : NO_VALUE,
+    tzoff : NO_VALUE
+  };
+  let mut i = 0;
+  let mut part = 0;
+  while i < text.len() && part < 6 {
+    while i < text.len() && !is_alpha(text.get(i)) && !is_digit(text.get(i)) {
+      i = i + 1;
+    }
+    if i < text.len() {
+      let mut next = i;
+      if is_alpha(text.get(i)) {
+        next = date_string(text, i, &mut w);
+      } else {
+        next = date_number(text, i, &mut w);
+      }
+      if next < 0 {
+        return Option<i64>::None;
+      }
+      i = next;
+    }
+    part = part + 1;
+  }
+  if w.dsecs == NO_VALUE {
+    w.dsecs = 0i64;
+  }
+  if w.mday == NO_VALUE || w.mon == NO_VALUE || w.year == NO_VALUE || w.year < 1583i64
+     || w.mday > 31i64 {
+    return Option<i64>::None;
+  }
+  let mut seconds = time_to_epoch(&w);
+  if w.tzoff != NO_VALUE {
+    seconds = seconds + w.tzoff;
+  }
+  return Option<i64>::Some(seconds);
+}

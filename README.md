@@ -52,10 +52,10 @@ Vx main d3ed6cf0b.
 
 | Test set | Passed |
 |---|---|
-| All tests with the keyword `HTTP` that runtests.pl runs for curl-vx | 472 of 855 (55%) |
-| The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 414 of 498 (83%) |
+| All tests with the keyword `HTTP` that runtests.pl runs for curl-vx | 510 of 855 (60%) |
+| The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 452 of 522 (87%) |
 | TLS and time-limit tests against local servers (`tests/tls`) | 18 of 18 |
-| Unit tests (`tests/unit`) | 4 of 4 |
+| Unit tests (`tests/unit`) | 5 of 5 |
 
 runtests.pl skips 14 HTTPS tests here, because they need `stunnel`. The C build of the test
 suite has OpenSSL, so that runtests.pl runs 61 more tests, most of them Digest tests (see "Run
@@ -65,8 +65,8 @@ curl's test suite"). Before Digest, curl-vx passed 409 of those 855.
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/curlvx/` (the package with all protocol code) | 5,267 | none, and `--no-trusted-code` enforces this |
-| `src/main.vx`, `src/disk.vx` | 569 | none |
+| `src/curlvx/` (the package with all protocol code) | 6,710 | none, and `--no-trusted-code` enforces this |
+| `src/main.vx`, `src/disk.vx` | 614 | none |
 | `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 827 | 37 `extern` functions, 51 `unsafe` blocks |
 
 Of the trusted code in `src/sys/`, 77 of the 88 items are the OpenSSL bindings: TLS in `tls.vx`,
@@ -125,6 +125,17 @@ and `--proxy-anyauth` do the same with an HTTP proxy and its 407.
 trusted code. Only the hash functions and the random client nonce come from OpenSSL, through
 `src/sys/hash.vx`. The unit tests check the examples of RFC 2617 and RFC 7616.
 
+## Cookies
+
+`-b` with a file name, or `-c`, turns on the cookie engine, a port of libcurl's `cookie.c` in
+`src/curlvx/cookie.vx`. It reads Netscape cookie files and `Set-Cookie:` lines, takes the
+`Set-Cookie` headers of each response, redirects included, and sends the cookies that match the
+host, the path and the security of each request, in libcurl's order. It follows libcurl's rules
+for `domain`, `path`, `secure`, `httponly`, `max-age` and `expires` (with a port of libcurl's
+date parser in `src/curlvx/date.vx`), the `__Secure-` and `__Host-` prefixes, and the limits.
+`-c` writes the jar in the Netscape format at the end. Without libpsl, as in a libcurl without
+it, a cookie for a domain with no dot is refused.
+
 ## Run curl's test suite
 
 runtests.pl asks curl's own `curlinfo` program which hash functions the C build has, and skips
@@ -152,7 +163,8 @@ missing options that block the most tests.
 
 ## Options
 
-`-A` `-b` (a cookie string) `-d` `--data-ascii` `--data-raw` `--data-binary` `--data-urlencode`
+`-A` `-b` (a cookie string or a cookie file) `-c` `-j` `-d` `--data-ascii` `--data-raw`
+`--data-binary` `--data-urlencode`
 `--json` `-F` (with `@file`, `<file`, `type=`, `filename=` and `headers=`) `--form-string`
 `--form-escape` `-D` `-e` (with `;auto`) `-f` `--fail-with-body` `-G` `-H` (with the `name:` and
 `name;` forms) `-I` `-i` `-k` `--cacert` `--capath` `-L` `--location-trusted` `--max-redirs`
@@ -171,10 +183,10 @@ time variables yet.
 In order of how much users need them:
 
 1. HTTP/2 (73% of survey users), connection reuse, compression (`--compressed`).
-1. URL globbing (`{a,b}` and `[1-9]`), the cookie engine (`-c`, cookie files), `--next`, `-J`,
-   `-C` resume, `-K` config files, `--netrc`, several files in one `-F` field, nested
-   multipart forms and `-F` encoders, `http_proxy` and `NO_PROXY` variables (Vx has no safe
-   way to read the environment), HTTPS proxies, and Digest with the proxy of a CONNECT tunnel.
+1. URL globbing (`{a,b}` and `[1-9]`), `--next`, `-J`, `-C` resume, `-K` config files,
+   `--netrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
+   encoders, `http_proxy` and `NO_PROXY` variables (Vx has no safe way to read the
+   environment), HTTPS proxies, and Digest with the proxy of a CONNECT tunnel.
 1. HTTP/3.
 
 ## Vx issues found while writing curl-vx
