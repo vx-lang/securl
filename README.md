@@ -52,13 +52,19 @@ parsers away from the disk and the network.
 
 ## Build
 
-You need a `vxc` built from Vx main (the capability types are recent), and its `libvx_std_core`.
+You need a `vxc` built from Vx main (the capability types are recent), and its runtime
+library `libvx_std_core`. Put their paths in `config.mk`, which git ignores:
+
+```make
+VXC       = /path/to/Vx/target/release/vxc
+VX_LIBDIR = /path/to/Vx/target/release
+LLVM_BIN  = /usr/lib/llvm-22/bin
+```
 
 ```sh
-make                                      # builds build/curl-vx
-make VXDIST=/path/to/dir/with/vxc         # another toolchain
-make audit                                # lists the trusted code
-./tests/unit/run.sh                       # unit tests
+make            # builds build/curl-vx
+make audit      # lists the trusted code
+make unit       # unit tests
 ```
 
 ## Run curl's test suite
