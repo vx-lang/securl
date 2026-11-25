@@ -1,6 +1,7 @@
 #!/bin/sh
-# The TLS tests of curl-vx: each case runs build/curl-vx against the servers of servers.py and
-# checks the exit code and the output. They need python3, and no network but 127.0.0.1.
+# The TLS and time-limit tests of curl-vx: each case runs build/curl-vx against the servers of
+# servers.py and checks the exit code and the output. They need python3, and no network but
+# 127.0.0.1.
 #
 #   tests/tls/run.sh
 set -u
@@ -21,7 +22,7 @@ while [ ! -s "$work/ports" ] && [ $tries -lt 50 ]; do
   sleep 0.1
   tries=$((tries + 1))
 done
-read -r https http proxy < "$work/ports"
+read -r https http proxy mute < "$work/ports"
 
 fail=0
 # check NAME EXPECTED_EXIT EXPECTED_STDOUT CURL_ARGUMENTS...
@@ -38,6 +39,17 @@ check() {
     fail=1
   else
     echo "ok   $name"
+  fi
+}
+
+# stderr_has NAME TEXT: the standard error of the last check holds TEXT.
+stderr_has() {
+  if grep -qF "$2" "$work/stderr"; then
+    echo "ok   $1"
+  else
+    echo "FAIL $1: no '$2' in the standard error:"
+    sed 's/^/     /' "$work/stderr"
+    fail=1
   fi
 }
 
@@ -68,4 +80,17 @@ else
   sed 's/^/     /' "$work/proxy.log"
   fail=1
 fi
+
+check "-m stops a stalled body" 28 "" \
+  -sS -m 1 -o "$work/stalled" "http://127.0.0.1:$http/stall"
+stderr_has "  with curl's message" "with 10 out of 100 bytes received"
+check "-m stops a stalled body over TLS" 28 "" \
+  -sS -m 1 --cacert "$certs/ca.pem" -o "$work/stalled" "https://localhost:$https/stall"
+stderr_has "  with curl's message" "with 10 out of 100 bytes received"
+check "--connect-timeout stops a TLS handshake" 28 "" \
+  -sS --connect-timeout 1 "https://127.0.0.1:$mute/"
+stderr_has "  with curl's message" "Connection timed out after"
+check "--connect-timeout leaves a slow body alone" 28 "" \
+  -sS --connect-timeout 1 -m 2 -o "$work/stalled" "http://127.0.0.1:$http/stall"
+stderr_has "  and -m ends it" "Operation timed out after"
 exit $fail

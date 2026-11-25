@@ -3,13 +3,17 @@
 
     python3 tests/tls/servers.py CERT_DIR PORT_FILE PROXY_LOG
 
-It starts three servers on free ports of 127.0.0.1 and writes their ports to PORT_FILE as
-"https http proxy":
+It starts four servers on free ports of 127.0.0.1 and writes their ports to PORT_FILE as
+"https http proxy mute":
 
 - an HTTPS server with the certificate in CERT_DIR. `/` answers "hello over tls", and `/big`
   answers 1 MiB in chunks, so that TLS reads have to wait for more data.
 - a plain HTTP server whose `/to-https` redirects to the HTTPS server.
 - an HTTP proxy that only does CONNECT. It writes the first line of each request to PROXY_LOG.
+- a server that accepts connections and never sends a byte, for the time limits of TLS.
+
+On both HTTP servers, `/stall` sends 10 of the 100 bytes of its body and then waits, for the
+time limits of reads.
 
 It runs until it is killed.
 """
@@ -20,6 +24,7 @@ import socketserver
 import ssl
 import sys
 import threading
+import time
 
 CERT_DIR, PORT_FILE, PROXY_LOG = sys.argv[1], sys.argv[2], sys.argv[3]
 
@@ -48,6 +53,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for _ in range(64):
                 self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
             self.wfile.write(b"0\r\n\r\n")
+        elif self.path == "/stall":
+            self.send_response(200)
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.write(b"0123456789")
+            self.wfile.flush()
+            time.sleep(10)
         elif self.path == "/to-https":
             https_port = self.server.https_port
             self.send_response(302)
@@ -109,6 +121,11 @@ class Proxy(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
 
 
+class MuteHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        time.sleep(10)
+
+
 def main():
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(os.path.join(CERT_DIR, "server.pem"),
@@ -118,10 +135,12 @@ def main():
     plain = Server(("127.0.0.1", 0), Handler)
     plain.https_port = https.server_address[1]
     proxy = Proxy(("127.0.0.1", 0), ProxyHandler)
-    for server in (https, plain, proxy):
+    mute = Proxy(("127.0.0.1", 0), MuteHandler)
+    for server in (https, plain, proxy, mute):
         threading.Thread(target=server.serve_forever, daemon=True).start()
     with open(PORT_FILE + ".tmp", "w") as f:
-        f.write(f"{https.server_address[1]} {plain.server_address[1]} {proxy.server_address[1]}\n")
+        f.write(f"{https.server_address[1]} {plain.server_address[1]} {proxy.server_address[1]} "
+                f"{mute.server_address[1]}\n")
     os.replace(PORT_FILE + ".tmp", PORT_FILE)
     threading.Event().wait()
 

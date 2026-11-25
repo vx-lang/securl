@@ -4,7 +4,10 @@
 // file, because it gets no `&Files`.
 import core::option;
 import core::result;
+import core::time;
 import std::net;
+import std::sync::wait;
+import std::time;
 import std::vec;
 import sys::text;
 import sys::tls;
@@ -40,6 +43,10 @@ struct TransferInfo {
   referer : Vec<u8>,
   // The header bytes of all responses of the transfer, for curl's limit.
   size_header_total : i64,
+  // `size_download` when the last request started, and the length of its body when the
+  // response says it (else -1). The message of a timeout gives both.
+  hop_start_download : i64,
+  expected_size : i64,
 }
 
 /// A `TransferInfo` before the transfer starts.
@@ -62,7 +69,9 @@ pub fn new_info() -> TransferInfo {
     all_headers : Vec<Vec<u8>>::new(),
     remote_address : Vec<u8>::new(),
     referer : Vec<u8>::new(),
-    size_header_total : 0i64
+    size_header_total : 0i64,
+    hop_start_download : 0i64,
+    expected_size : -1i64
   };
 }
 
@@ -376,7 +385,8 @@ struct Hop {
 /// `sinks`, unless curl follows the redirect that the response gives.
 fn one_hop(network : &Network, tls : &TlsConfig, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
 req_kind : i32, body : &Vec<u8>, creds : &Credentials, same_host : bool, has_referer : bool,
-referer : &Vec<u8>, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop, Failure> {
+referer : &Vec<u8>, deadline : Instant, sinks : &mut Sinks, info : &mut TransferInfo)
+-> Result<Hop, Failure> {
   let secure = eq_lit(&u.scheme, "https");
   let mut method = lit("GET");
   if cfg.has_method {
@@ -441,31 +451,16 @@ referer : &Vec<u8>, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop,
   } else {
     address = connect_address(cfg, u)?;
   }
-  if cfg.verbose {
-    let mut m = lit("  Trying ");
-    append(&mut m, &address);
-    push_lit(&mut m, "...");
-    verbose_info(&m);
-  }
-  let mut c = open_conn(network, &address, &u.host, u.port)?;
-  info.num_connects = info.num_connects + 1;
-  info.remote_address = clone_bytes(&address);
-  if cfg.verbose {
-    let mut m = lit("Connected to ");
-    append(&mut m, &host_text(u));
-    push_lit(&mut m, " port ");
-    push_u64(&mut m, u.port as u64);
-    verbose_info(&m);
-  }
-  if secure {
-    if proxy.used {
-      open_tunnel(&mut c, cfg, u, &proxy, info)?;
-    }
-    let _tls = c.start_tls(tls, &u.host)?;
-    if cfg.verbose {
-      verbose_info(&lit("TLS handshake done"));
-    }
-  }
+  info.hop_start_download = info.size_download;
+  info.expected_size = -1i64;
+  // The connect, the CONNECT of a proxy and the TLS handshake end at the deadline of
+  // `--connect-timeout`, or at the deadline of `-m` when it is earlier.
+  let connect_started = Instant::now();
+  let connect_deadline = earliest(deadline,
+    deadline_after(Duration::from_millis(connect_limit_ms(cfg) as u64)));
+  let mut c = connected(connect_phase(network, tls, cfg, u, &proxy, &address, secure,
+    connect_deadline, info), &connect_started)?;
+  c.set_deadline(deadline);
   let request = build_request(u, &req_info);
   if cfg.verbose {
     verbose_lines("> ", &request);
@@ -515,6 +510,9 @@ referer : &Vec<u8>, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop,
   }
   info.content_type = clone_bytes(&head.content_type);
   info.size_header = info.size_header + (head.raw.len() as i64);
+  if head.content_length >= 0i64 && !head.has_transfer_encoding {
+    info.expected_size = head.content_length;
+  }
   if cfg.verbose {
     verbose_lines("< ", &head.raw);
   }
@@ -580,6 +578,73 @@ referer : &Vec<u8>, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop,
     status : head.status,
     location : clone_bytes(&head.location)
   });
+}
+
+/// The time limit of the connect phase: `--connect-timeout`, or the 300 seconds of libcurl.
+fn connect_limit_ms(cfg : &Config) -> i64 {
+  if cfg.connect_timeout_ms > 0i64 {
+    return cfg.connect_timeout_ms;
+  }
+  return 300000i64;
+}
+
+/// The earlier of two deadlines.
+fn earliest(a : Instant, b : Instant) -> Instant {
+  if a < b {
+    return a;
+  }
+  return b;
+}
+
+/// Connect to `address`, then make the tunnel of a proxy and start TLS when `secure`. Each step
+/// gives up at `deadline`.
+fn connect_phase(network : &Network, tls : &TlsConfig, cfg : &Config, u : &Url, proxy : &Proxy,
+address : &Vec<u8>, secure : bool, deadline : Instant, info : &mut TransferInfo)
+-> Result<Conn, Failure> {
+  if cfg.verbose {
+    let mut m = lit("  Trying ");
+    append(&mut m, address);
+    push_lit(&mut m, "...");
+    verbose_info(&m);
+  }
+  let mut c = open_conn(network, address, &u.host, u.port, deadline)?;
+  info.num_connects = info.num_connects + 1;
+  info.remote_address = clone_bytes(address);
+  if cfg.verbose {
+    let mut m = lit("Connected to ");
+    append(&mut m, &host_text(u));
+    push_lit(&mut m, " port ");
+    push_u64(&mut m, u.port as u64);
+    verbose_info(&m);
+  }
+  if secure {
+    if proxy.used {
+      open_tunnel(&mut c, cfg, u, proxy, info)?;
+    }
+    let _tls = c.start_tls(tls, &u.host)?;
+    if cfg.verbose {
+      verbose_info(&lit("TLS handshake done"));
+    }
+  }
+  return Result<Conn, Failure>::Ok(c);
+}
+
+/// The result of `connect_phase`, with curl's message for a timeout in it.
+fn connected(opened : Result<Conn, Failure>, started : &Instant) -> Result<Conn, Failure> {
+  match opened {
+    Result<Conn, Failure>::Ok(c) => {
+      return Result<Conn, Failure>::Ok(c);
+    },
+    Result<Conn, Failure>::Err(f) => {
+      if f.code != OPERATION_TIMEDOUT {
+        return Result<Conn, Failure>::Err(f);
+      }
+      let mut m = lit("Connection timed out after ");
+      push_u64(&mut m, started.elapsed().as_millis());
+      push_lit(&mut m, " milliseconds");
+      return Result<Conn, Failure>::Err(fail_with(OPERATION_TIMEDOUT, m));
+    }
+  }
 }
 
 /// `body` as one chunk and the last chunk, for `Transfer-Encoding: chunked`.
@@ -777,10 +842,48 @@ fn credentials_of(cfg : &Config, u : &Url) -> Credentials {
 }
 
 /// Run the transfer of `url_text`. `body` is the request body for a POST or a PUT. `kind` is
-/// `REQ_GET`, `REQ_POST`, `REQ_PUT` or `REQ_HEAD`.
+/// `REQ_GET`, `REQ_POST`, `REQ_PUT` or `REQ_HEAD`. With `-m`, the whole transfer, redirects
+/// included, has that time limit.
 pub fn run_transfer(network : &Network, tls : &TlsConfig, cfg : &Config, headers : &Vec<Vec<u8>>,
 url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, sinks : &mut Sinks, info : &mut TransferInfo)
 -> Result<i32, Failure> {
+  let started = Instant::now();
+  let mut deadline = Instant::never();
+  if cfg.max_time_ms > 0i64 {
+    deadline = deadline_after(Duration::from_millis(cfg.max_time_ms as u64));
+  }
+  match follow_redirects(network, tls, cfg, headers, url_text, body, kind, deadline, sinks, info) {
+    Result<i32, Failure>::Ok(n) => {
+      return Result<i32, Failure>::Ok(n);
+    },
+    Result<i32, Failure>::Err(f) => {
+      return Result<i32, Failure>::Err(timeout_message(f, &started, info));
+    }
+  }
+}
+
+/// `f` with curl's message when a time limit ended the transfer after the connect phase:
+/// how long it took, and how many bytes of the body arrived.
+fn timeout_message(f : Failure, started : &Instant, info : &TransferInfo) -> Failure {
+  if f.code != OPERATION_TIMEDOUT || !eq_lit(&f.message, "Operation timed out") {
+    return f;
+  }
+  let mut m = lit("Operation timed out after ");
+  push_u64(&mut m, started.elapsed().as_millis());
+  push_lit(&mut m, " milliseconds with ");
+  push_i64(&mut m, info.size_download - info.hop_start_download);
+  if info.expected_size >= 0i64 {
+    push_lit(&mut m, " out of ");
+    push_i64(&mut m, info.expected_size);
+  }
+  push_lit(&mut m, " bytes received");
+  return fail_with(OPERATION_TIMEDOUT, m);
+}
+
+/// The transfer of `url_text`, and of each redirect that it follows, until `deadline`.
+fn follow_redirects(network : &Network, tls : &TlsConfig, cfg : &Config,
+headers : &Vec<Vec<u8>>, url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, deadline : Instant,
+sinks : &mut Sinks, info : &mut TransferInfo) -> Result<i32, Failure> {
   let first = parse_url(url_text, cfg.path_as_is)?;
   let mut creds = credentials_of(cfg, &first);
   let first_port = first.port;
@@ -807,7 +910,7 @@ url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, sinks : &mut Sinks, info : &mu
       creds = credentials_of(cfg, &u);
     }
     let hop = one_hop(network, tls, cfg, headers, &u, req_kind, body, &creds, same_host, has_referer,
-      &referer, sinks, info)?;
+      &referer, deadline, sinks, info)?;
     if !hop.follow {
       return Result<i32, Failure>::Ok(0);
     }

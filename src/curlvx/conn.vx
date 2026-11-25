@@ -4,6 +4,7 @@ import core::option;
 import core::result;
 import std::net;
 import std::string;
+import std::time;
 import std::vec;
 import sys::text;
 import sys::tls;
@@ -28,10 +29,11 @@ fn failure_of(e : TlsError) -> Failure {
   return fail_with(e.code, e.message);
 }
 
-/// Connect to `address`, written as `host:port`. `host` and `port` are for the messages.
-/// The caller needs the network right.
-pub fn open_conn(network : &Network, address : &Vec<u8>, host : &Vec<u8>, port : i32)
--> Result<Conn, Failure> {
+/// Connect to `address`, written as `host:port`. `host` and `port` are for the messages. The
+/// connect, and each wait of the connection after it, give up at `deadline`, which
+/// `Instant::never()` turns off. The caller needs the network right.
+pub fn open_conn(network : &Network, address : &Vec<u8>, host : &Vec<u8>, port : i32,
+deadline : Instant) -> Result<Conn, Failure> {
   let mut target = String::new();
   match to_string(address) {
     Option<String>::Some(s) => {
@@ -42,7 +44,7 @@ pub fn open_conn(network : &Network, address : &Vec<u8>, host : &Vec<u8>, port :
         "URL rejected: Malformed input to a URL function"));
     }
   }
-  match TcpStream::connect(network, &target) {
+  match connect_by(network, &target, deadline) {
     Result<TcpStream, NetError>::Ok(stream) => {
       let mut buffer = Vec<u8>::new();
       let mut i = 0;
@@ -50,8 +52,10 @@ pub fn open_conn(network : &Network, address : &Vec<u8>, host : &Vec<u8>, port :
         buffer.push(0u8);
         i = i + 1;
       }
+      let mut net = NetStream::plain(stream);
+      net.set_deadline(deadline);
       return Result<Conn, Failure>::Ok(Conn {
-        stream : NetStream::plain(stream),
+        stream : net,
         buffer : buffer,
         start : 0,
         end : 0,
@@ -64,6 +68,10 @@ pub fn open_conn(network : &Network, address : &Vec<u8>, host : &Vec<u8>, port :
           let mut m = lit("Could not resolve host: ");
           append(&mut m, host);
           return Result<Conn, Failure>::Err(fail_with(COULDNT_RESOLVE_HOST, m));
+        },
+        NetError::Cancelled() => {
+          // The time limit of the caller ended the wait. The caller words the message.
+          return Result<Conn, Failure>::Err(fail_lit(OPERATION_TIMEDOUT, "Operation timed out"));
         },
         _ => {
           let mut m = lit("Failed to connect to ");
@@ -79,6 +87,11 @@ pub fn open_conn(network : &Network, address : &Vec<u8>, host : &Vec<u8>, port :
 }
 
 impl Conn {
+  /// Make each wait of the connection from now on give up at `at`.
+  pub fn set_deadline(self : &mut Conn, at : Instant) -> void {
+    self.stream.set_deadline(at);
+  }
+
   /// Send all of `bytes`.
   pub fn send(self : &mut Conn, bytes : &Vec<u8>) -> Result<i32, Failure> {
     if bytes.len() == 0 {

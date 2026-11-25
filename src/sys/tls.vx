@@ -11,11 +11,21 @@
 // The sockets of `std::net` do not block: a read that has to wait parks the task. OpenSSL works
 // on the file descriptor of the socket, so it gives "want read" or "want write" when the socket
 // is not ready. Then this file waits with `poll` and tries again.
+//
+// Time limits. Each `NetStream` has a deadline, which the caller sets. A wait of the
+// `TcpStream` runs in `std::sync::wait::within`, so it gives `NetError::Cancelled` at the
+// deadline. `poll` does not know the deadline, so this file polls in short slices and checks
+// the clock between them. A wait that passes the deadline gives `CURLE_OPERATION_TIMEDOUT`.
+// (The calls of `within` are here and not in `curlvx` because of a bug of Vx: the compiler
+// takes each closure body for an `unsafe` block, which `--no-trusted-code` refuses.)
 import core::option;
 import core::ptr;
 import core::result;
+import core::time;
 import std::fs;
 import std::net;
+import std::sync::wait;
+import std::time;
 import std::vec;
 import sys::text;
 
@@ -95,6 +105,10 @@ const CURLE_RECV_ERROR : i32 = 56;
 const CURLE_SSL_CONNECT_ERROR : i32 = 35;
 const CURLE_PEER_FAILED_VERIFICATION : i32 = 60;
 const CURLE_SSL_CACERT_BADFILE : i32 = 77;
+const CURLE_OPERATION_TIMEDOUT : i32 = 28;
+
+// How long one `poll` waits before this file checks the time limit again, in milliseconds.
+const POLL_SLICE_MS : i32 = 20;
 
 /// Why a TLS step did not work: curl's exit code for it, and its message.
 struct TlsError {
@@ -151,13 +165,82 @@ fn openssl_error_text() -> Vec<u8> {
   return bytes_of_c_string(buffer.as_mut_ptr() as *const i8);
 }
 
-/// Wait until `fd` is ready for a read (`POLLIN`) or a write (`POLLOUT`).
-fn wait_for(fd : i32, events : i32) -> bool {
+/// Wait until `fd` is ready for a read (`POLLIN`) or a write (`POLLOUT`). Gives false when
+/// `deadline` passed first.
+fn wait_for(fd : i32, events : i32, deadline : Instant) -> bool {
   let mut pollfd = Vec<i32>::new();
   pollfd.push(fd);
   pollfd.push(events);
-  let n = unsafe { poll(pollfd.as_mut_ptr(), 1u64, -1) };
-  return n > 0;
+  loop {
+    if cancelled() || past_deadline(deadline) {
+      return false;
+    }
+    let n = unsafe { poll(pollfd.as_mut_ptr(), 1u64, POLL_SLICE_MS) };
+    if n != 0 {
+      // Ready, or an error that the next call of OpenSSL reports.
+      return true;
+    }
+  }
+}
+
+/// Connect to `address`, written as `host:port`, and give up at `deadline`.
+pub fn connect_by(network : &Network, address : &String, deadline : Instant)
+-> Result<TcpStream, NetError> {
+  if deadline == Instant::never() {
+    return TcpStream::connect(network, address);
+  }
+  if past_deadline(deadline) {
+    return Result<TcpStream, NetError>::Err(NetError::Cancelled);
+  }
+  return within(deadline - Instant::now(), || -> Result<TcpStream, NetError> {
+    return TcpStream::connect(network, address);
+  });
+}
+
+/// `tcp.read(buffer)`, which gives up at `deadline`.
+fn read_by(tcp : &mut TcpStream, buffer : &mut Vec<u8>, deadline : Instant)
+-> Result<u64, NetError> {
+  if deadline == Instant::never() {
+    return tcp.read(buffer);
+  }
+  if past_deadline(deadline) {
+    return Result<u64, NetError>::Err(NetError::Cancelled);
+  }
+  return within(deadline - Instant::now(), || -> Result<u64, NetError> {
+    return tcp.read(buffer);
+  });
+}
+
+/// `tcp.write_all(bytes)`, which gives up at `deadline`.
+fn write_all_by(tcp : &mut TcpStream, bytes : &Vec<u8>, deadline : Instant)
+-> Result<u64, NetError> {
+  if deadline == Instant::never() {
+    return tcp.write_all(bytes);
+  }
+  if past_deadline(deadline) {
+    return Result<u64, NetError>::Err(NetError::Cancelled);
+  }
+  return within(deadline - Instant::now(), || -> Result<u64, NetError> {
+    return tcp.write_all(bytes);
+  });
+}
+
+/// The error of a wait that the time limit ended.
+fn timed_out() -> TlsError {
+  return tls_error(CURLE_OPERATION_TIMEDOUT, lit("Operation timed out"));
+}
+
+/// The error of a failed read or write of a plain `TcpStream`: `code` and `message`, or a
+/// timeout when the time limit ended the wait.
+fn tcp_error(e : NetError, code : i32, message : *const i8) -> TlsError {
+  match e {
+    NetError::Cancelled() => {
+      return timed_out();
+    },
+    _ => {
+      return tls_error(code, lit(message));
+    }
+  }
 }
 
 /// The settings of TLS that all connections of a run share: the certificate authorities that
@@ -280,6 +363,8 @@ struct NetStream {
   tcp : TcpStream,
   // The OpenSSL connection, or null for plain TCP.
   ssl : *mut i8,
+  // Each wait gives up at this time. `Instant::never()` means no time limit.
+  deadline : Instant,
 
   invariant true,
 }
@@ -309,8 +394,14 @@ impl NetStream {
   pub fn plain(tcp : TcpStream) -> NetStream {
     return NetStream {
       tcp : tcp,
-      ssl : unsafe { 0 as *mut i8 }
+      ssl : unsafe { 0 as *mut i8 },
+      deadline : Instant::never()
     };
+  }
+
+  /// Make each wait of the stream from now on give up at `at`.
+  pub fn set_deadline(self : &mut NetStream, at : Instant) -> void {
+    self.deadline = at;
   }
 
   /// Start TLS on this plain connection, for the server `host`, with the settings of `config`.
@@ -371,11 +462,15 @@ impl NetStream {
       }
       let e = unsafe { SSL_get_error(ssl, r) };
       if e == SSL_ERROR_WANT_READ {
-        let _ready = wait_for(fd, POLLIN);
+        if !wait_for(fd, POLLIN, self.deadline) {
+          return Result<i32, TlsError>::Err(timed_out());
+        }
         continue;
       }
       if e == SSL_ERROR_WANT_WRITE {
-        let _ready = wait_for(fd, POLLOUT);
+        if !wait_for(fd, POLLOUT, self.deadline) {
+          return Result<i32, TlsError>::Err(timed_out());
+        }
         continue;
       }
       let verify_result = unsafe { SSL_get_verify_result(ssl) };
@@ -405,13 +500,13 @@ impl NetStream {
   /// server closed the connection.
   pub fn read(self : &mut NetStream, buffer : &mut Vec<u8>) -> Result<u64, TlsError> {
     if !self.is_tls() {
-      match self.tcp.read(buffer) {
+      match read_by(&mut self.tcp, buffer, self.deadline) {
         Result<u64, NetError>::Ok(n) => {
           return Result<u64, TlsError>::Ok(n);
         },
-        Result<u64, NetError>::Err(_e) => {
-          return Result<u64, TlsError>::Err(tls_error(CURLE_RECV_ERROR,
-            lit("Recv failure: Connection reset by peer")));
+        Result<u64, NetError>::Err(e) => {
+          return Result<u64, TlsError>::Err(tcp_error(e, CURLE_RECV_ERROR,
+            "Recv failure: Connection reset by peer"));
         }
       }
     }
@@ -423,11 +518,15 @@ impl NetStream {
       }
       let e = unsafe { SSL_get_error(self.ssl, r) };
       if e == SSL_ERROR_WANT_READ {
-        let _ready = wait_for(fd, POLLIN);
+        if !wait_for(fd, POLLIN, self.deadline) {
+          return Result<u64, TlsError>::Err(timed_out());
+        }
         continue;
       }
       if e == SSL_ERROR_WANT_WRITE {
-        let _ready = wait_for(fd, POLLOUT);
+        if !wait_for(fd, POLLOUT, self.deadline) {
+          return Result<u64, TlsError>::Err(timed_out());
+        }
         continue;
       }
       if e == SSL_ERROR_ZERO_RETURN {
@@ -447,13 +546,13 @@ impl NetStream {
   /// Write all of `bytes`.
   pub fn write_all(self : &mut NetStream, bytes : &Vec<u8>) -> Result<u64, TlsError> {
     if !self.is_tls() {
-      match self.tcp.write_all(bytes) {
+      match write_all_by(&mut self.tcp, bytes, self.deadline) {
         Result<u64, NetError>::Ok(n) => {
           return Result<u64, TlsError>::Ok(n);
         },
-        Result<u64, NetError>::Err(_e) => {
-          return Result<u64, TlsError>::Err(tls_error(CURLE_SEND_ERROR,
-            lit("Send failure: Connection reset by peer")));
+        Result<u64, NetError>::Err(e) => {
+          return Result<u64, TlsError>::Err(tcp_error(e, CURLE_SEND_ERROR,
+            "Send failure: Connection reset by peer"));
         }
       }
     }
@@ -468,11 +567,15 @@ impl NetStream {
       }
       let e = unsafe { SSL_get_error(self.ssl, r) };
       if e == SSL_ERROR_WANT_READ {
-        let _ready = wait_for(fd, POLLIN);
+        if !wait_for(fd, POLLIN, self.deadline) {
+          return Result<u64, TlsError>::Err(timed_out());
+        }
         continue;
       }
       if e == SSL_ERROR_WANT_WRITE {
-        let _ready = wait_for(fd, POLLOUT);
+        if !wait_for(fd, POLLOUT, self.deadline) {
+          return Result<u64, TlsError>::Err(timed_out());
+        }
         continue;
       }
       let mut m = lit("OpenSSL SSL_write: ");

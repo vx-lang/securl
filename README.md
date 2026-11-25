@@ -41,7 +41,7 @@ LLVM_BIN  = /usr/lib/llvm-22/bin
 make            # builds OpenSSL once (build/openssl), then build/curl-vx
 make audit      # lists the trusted code
 make unit       # unit tests
-make test-tls   # HTTPS tests against local servers (needs python3)
+make test-tls   # HTTPS and time-limit tests against local servers (needs python3)
 ```
 
 ## Status (2026-11-25)
@@ -52,9 +52,9 @@ Vx main d3ed6cf0b.
 
 | Test set | Passed |
 |---|---|
-| All tests with the keyword `HTTP` that runtests.pl runs for curl-vx | 394 of 794 (50%) |
-| The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 340 of 422 (81%) |
-| TLS tests against local servers (`tests/tls`) | 10 of 10 |
+| All tests with the keyword `HTTP` that runtests.pl runs for curl-vx | 395 of 794 (50%) |
+| The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 341 of 422 (81%) |
+| TLS and time-limit tests against local servers (`tests/tls`) | 18 of 18 |
 | Unit tests (`tests/unit`) | 3 of 3 |
 
 runtests.pl skips 14 HTTPS tests here, because they need `stunnel`.
@@ -63,9 +63,9 @@ runtests.pl skips 14 HTTPS tests here, because they need `stunnel`.
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/curlvx/` (the package with all protocol code) | 3,674 | none, and `--no-trusted-code` enforces this |
+| `src/curlvx/` (the package with all protocol code) | 3,790 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx`, `src/disk.vx` | 512 | none |
-| `src/sys/` (OpenSSL calls and shims for what `std` lacks) | 648 | 32 `extern` functions, 46 `unsafe` blocks |
+| `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 751 | 32 `extern` functions, 46 `unsafe` blocks |
 
 Of the trusted code in `src/sys/`, 67 of the 78 items are the OpenSSL binding in `tls.vx`.
 `core` and `std` have trusted code too: the audit counts 965 `unsafe` blocks and 77 `extern`
@@ -95,6 +95,20 @@ macOS, and the paths that OpenSSL knows, including `SSL_CERT_FILE` and `SSL_CERT
 an HTTP proxy uses a CONNECT tunnel. The exit codes are curl's: 60 for a certificate problem, 35
 for a failed handshake, and 77 for a file of certificate authorities that cannot be read.
 
+## Time limits
+
+`-m` limits the whole transfer, redirects included. `--connect-timeout` limits the connect, the
+CONNECT of a proxy and the TLS handshake, and is 300 seconds by default, as in libcurl. Both
+give exit code 28 with curl's messages: `Connection timed out after N milliseconds`, or
+`Operation timed out after N milliseconds with B out of T bytes received`. The lookup of a host
+name has no time limit yet.
+
+`curlvx` turns each limit into a deadline (`std::time::Instant`) for the connection. A socket
+call in `src/sys/tls.vx` runs in `std::sync::wait::within` until that deadline, so the runtime
+of Vx ends the wait. The TLS code polls in slices of 20 ms and checks the clock between them.
+`within` takes a closure. The calls are in `src/sys` and not in `curlvx` only because of a Vx
+bug (below).
+
 ## Run curl's test suite
 
 ```sh
@@ -121,7 +135,8 @@ missing options that block the most tests.
 `name;` forms) `-I` `-i` `-k` `--cacert` `--capath` `-L` `--location-trusted` `--max-redirs`
 `-o` `-O` `--remote-name-all` `--output-dir` `-r` `-s` `-S` `-T` `-u` `-v` `-w` (most variables,
 `%header{}`, `%output{}`, `%{stderr}`) `-X` `-x` `-U` `--noproxy` `--resolve` `--connect-to`
-`--path-as-is` `--raw` `-0` `--url` `-h` `-V`, and the options that runtests.pl adds: `-q`
+`--path-as-is` `--raw` `-0` `--url` `-m` `--connect-timeout` `-h` `-V`, and the options that
+runtests.pl adds: `-q`
 `--trace-ascii` `--trace-time`.
 
 The 2025 curl user survey asked for each user's favourite option. curl-vx accepts 18 of the top
@@ -132,8 +147,6 @@ time variables yet.
 
 In order of how much users need them:
 
-1. Timeouts (`-m`, `--connect-timeout`). `poll` in `tls.vx` and `std::sync::wait::within` can
-   bound a read. Nothing bounds `TcpStream::connect` yet.
 1. HTTP/2 (73% of survey users), connection reuse, compression (`--compressed`).
 1. URL globbing (`{a,b}` and `[1-9]`), the cookie engine (`-c`, cookie files), `-F` multipart
    forms, `--digest`, `--next`, `-C` resume, `-K` config files, `http_proxy` and `NO_PROXY`
@@ -167,6 +180,9 @@ The Vx project tracks these.
   E4009. The result of `url_text` holds no reference. `fetch.vx` carries the URL as text
   instead. Binding the result first (`let t = url_text(&u); info.url_effective = t;`) also
   works.
+- `--no-trusted-code` takes the body of each closure for an `unsafe` block (E5003), while
+  `--audit` lists nothing for it. So `curlvx` cannot pass a closure to
+  `std::sync::wait::within`, and `src/sys/tls.vx` holds those calls. A fix is under review.
 
 ## License
 
