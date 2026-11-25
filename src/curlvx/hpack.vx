@@ -1,0 +1,614 @@
+// HPACK (RFC 7541): the header compression of HTTP/2.
+//
+// The decoder reads every representation of RFC 7541: indexed fields, literals with and
+// without indexing, never-indexed literals, table size updates, and Huffman-coded strings. Its
+// dynamic table follows the size limits of section 4. The encoder writes the headers of a
+// request with the static table and plain literals, without indexing, which every decoder
+// takes.
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import curlvx::bytes;
+import curlvx::failure;
+
+// The header table size that curl-vx allows the server (SETTINGS_HEADER_TABLE_SIZE).
+const HPACK_TABLE_SIZE : i32 = 4096;
+// Header lists longer than this are refused, as a defense against a server that sends too much.
+const HPACK_MAX_LIST : i32 = 1048576;
+
+/// One header field: a name in lower case and its value.
+struct HeaderField {
+  name : Vec<u8>,
+  value : Vec<u8>,
+}
+
+/// The state of one direction of HPACK: the static table, the dynamic table and the Huffman
+/// code.
+struct Hpack {
+  static_names : Vec<Vec<u8>>,
+  static_values : Vec<Vec<u8>>,
+  // The dynamic table in the order of insertion: the entries from `dyn_start` on are live,
+  // and the newest is the last.
+  dyn_names : Vec<Vec<u8>>,
+  dyn_values : Vec<Vec<u8>>,
+  dyn_start : i32,
+  dyn_size : i32,
+  // The size limit that the last table size update set, at most `HPACK_TABLE_SIZE`.
+  max_size : i32,
+  huff_symbols : Vec<i32>,
+  huff_lengths : Vec<i64>,
+}
+
+/// An HPACK state with empty dynamic tables.
+pub fn new_hpack() -> Hpack {
+  let mut names = Vec<Vec<u8>>::new();
+  let mut values = Vec<Vec<u8>>::new();
+  let table = static_table_text();
+  let mut start = 0;
+  while start < table.len() {
+    let end = find_byte(&table, 10u8, start);
+    let space = find_byte(&table, 32u8, start);
+    names.push(range_of(&table, start, space));
+    values.push(range_of(&table, space + 1, end));
+    start = end + 1;
+  }
+  let digits = huffman_symbols_text();
+  let mut symbols = Vec<i32>::new();
+  let mut i = 0;
+  while i + 2 < digits.len() {
+    let d0 = (digits.get(i) - 48u8) as i32;
+    let d1 = (digits.get(i + 1) - 48u8) as i32;
+    let d2 = (digits.get(i + 2) - 48u8) as i32;
+    symbols.push(d0 * 100 + d1 * 10 + d2);
+    i = i + 3;
+  }
+  return Hpack {
+    static_names : names,
+    static_values : values,
+    dyn_names : Vec<Vec<u8>>::new(),
+    dyn_values : Vec<Vec<u8>>::new(),
+    dyn_start : 0,
+    dyn_size : 0,
+    max_size : HPACK_TABLE_SIZE,
+    huff_symbols : symbols,
+    huff_lengths : huffman_lengths()
+  };
+}
+
+fn hpack_error(what : *const i8) -> Failure {
+  let mut m = lit("HPACK: ");
+  push_lit(&mut m, what);
+  return fail_with(HTTP2_ERROR, m);
+}
+
+fn entry_size(name : &Vec<u8>, value : &Vec<u8>) -> i32 {
+  return name.len() + value.len() + 32;
+}
+
+fn dyn_count(h : &Hpack) -> i32 {
+  return h.dyn_names.len() - h.dyn_start;
+}
+
+/// Drop the oldest entries until `needed` more bytes fit.
+fn evict(h : &mut Hpack, needed : i32) -> void {
+  while dyn_count(h) > 0 && h.dyn_size + needed > h.max_size {
+    let size = entry_size(h.dyn_names.get_ref(h.dyn_start), h.dyn_values.get_ref(h.dyn_start));
+    h.dyn_size = h.dyn_size - size;
+    h.dyn_start = h.dyn_start + 1;
+  }
+  if dyn_count(h) == 0 && h.dyn_start > 0 {
+    h.dyn_names = Vec<Vec<u8>>::new();
+    h.dyn_values = Vec<Vec<u8>>::new();
+    h.dyn_start = 0;
+  }
+}
+
+/// Add an entry to the dynamic table (RFC 7541, 4.4). An entry larger than the table empties it.
+fn add_entry(h : &mut Hpack, name : &Vec<u8>, value : &Vec<u8>) -> void {
+  let size = entry_size(name, value);
+  if size > h.max_size {
+    evict(h, h.max_size + 1);
+    return;
+  }
+  evict(h, size);
+  h.dyn_names.push(clone_bytes(name));
+  h.dyn_values.push(clone_bytes(value));
+  h.dyn_size = h.dyn_size + size;
+}
+
+/// The entry `index` of the static table (1 to 61) or of the dynamic table (62 on, newest
+/// first).
+fn lookup(h : &Hpack, index : i64) -> Option<HeaderField> {
+  if index >= 1i64 && index <= 61i64 {
+    let i = (index - 1i64) as i32;
+    return Option<HeaderField>::Some(HeaderField {
+      name : clone_bytes(h.static_names.get_ref(i)),
+      value : clone_bytes(h.static_values.get_ref(i))
+    });
+  }
+  let d = index - 62i64;
+  if d >= 0i64 && d < (dyn_count(h) as i64) {
+    let i = h.dyn_names.len() - 1 - (d as i32);
+    return Option<HeaderField>::Some(HeaderField {
+      name : clone_bytes(h.dyn_names.get_ref(i)),
+      value : clone_bytes(h.dyn_values.get_ref(i))
+    });
+  }
+  return Option<HeaderField>::None;
+}
+
+/// A decoded integer and the index after it, or `next` -1 on an error.
+struct Decoded {
+  value : i64,
+  next : i32,
+}
+
+/// The integer with an `n`-bit prefix at `pos` (RFC 7541, 5.1).
+fn decode_int(s : &Vec<u8>, pos : i32, n : i32) -> Decoded {
+  let mut mask = 1;
+  let mut k = 0;
+  while k < n {
+    mask = mask * 2;
+    k = k + 1;
+  }
+  mask = mask - 1;
+  let mut value = ((s.get(pos) as i32) & mask) as i64;
+  let mut i = pos + 1;
+  if value < (mask as i64) {
+    return Decoded {
+      value : value,
+      next : i
+    };
+  }
+  let mut scale = 1i64;
+  loop {
+    if i >= s.len() || scale > 268435456i64 {
+      return Decoded {
+        value : 0i64,
+        next : -1
+      };
+    }
+    let b = s.get(i) as i64;
+    i = i + 1;
+    value = value + (b % 128i64) * scale;
+    scale = scale * 128i64;
+    if b < 128i64 {
+      break;
+    }
+  }
+  return Decoded {
+    value : value,
+    next : i
+  };
+}
+
+/// Decode a Huffman-coded string (RFC 7541, 5.2 and Appendix B). None for a code that is not in
+/// the table, the EOS symbol, or padding that is longer than 7 bits or not all ones.
+fn huffman_decode(h : &Hpack, data : &Vec<u8>) -> Option<Vec<u8>> {
+  let mut out = Vec<u8>::new();
+  let mut code = 0i64;
+  let mut len = 0;
+  for byte in data.iter() {
+    let mut bit = 128;
+    while bit > 0 {
+      code = code * 2i64;
+      if ((*byte as i32) & bit) != 0 {
+        code = code + 1i64;
+      }
+      len = len + 1;
+      if len > 30 {
+        return Option<Vec<u8>>::None;
+      }
+      let first = h.huff_lengths.get((len - 1) * 3);
+      let index = h.huff_lengths.get((len - 1) * 3 + 1);
+      let count = h.huff_lengths.get((len - 1) * 3 + 2);
+      if count > 0i64 && code >= first && code < first + count {
+        let symbol = h.huff_symbols.get((index + code - first) as i32);
+        if symbol == 256 {
+          return Option<Vec<u8>>::None;
+        }
+        out.push(symbol as u8);
+        code = 0i64;
+        len = 0;
+      }
+      bit = bit / 2;
+    }
+  }
+  // The padding: the high bits of EOS, so all ones, and shorter than a byte.
+  if len > 7 {
+    return Option<Vec<u8>>::None;
+  }
+  let mut ones = 0i64;
+  let mut k = 0;
+  while k < len {
+    ones = ones * 2i64 + 1i64;
+    k = k + 1;
+  }
+  if code != ones {
+    return Option<Vec<u8>>::None;
+  }
+  return Option<Vec<u8>>::Some(out);
+}
+
+/// A decoded string and the index after it.
+struct DecodedString {
+  ok : bool,
+  bytes : Vec<u8>,
+  next : i32,
+}
+
+fn bad_string() -> DecodedString {
+  return DecodedString {
+    ok : false,
+    bytes : Vec<u8>::new(),
+    next : 0
+  };
+}
+
+/// The string literal at `pos` (RFC 7541, 5.2).
+fn decode_string(h : &Hpack, s : &Vec<u8>, pos : i32) -> DecodedString {
+  if pos >= s.len() {
+    return bad_string();
+  }
+  let huffman = ((s.get(pos) as i32) & 128) != 0;
+  let n = decode_int(s, pos, 7);
+  if n.next < 0 || n.value > ((s.len() - n.next) as i64) {
+    return bad_string();
+  }
+  let end = n.next + (n.value as i32);
+  let raw = range_of(s, n.next, end);
+  if !huffman {
+    return DecodedString {
+      ok : true,
+      bytes : raw,
+      next : end
+    };
+  }
+  match huffman_decode(h, &raw) {
+    Option<Vec<u8>>::Some(text) => {
+      return DecodedString {
+        ok : true,
+        bytes : text,
+        next : end
+      };
+    },
+    Option<Vec<u8>>::None() => {
+      return bad_string();
+    }
+  }
+}
+
+/// Decode a header block (RFC 7541, section 6). An error is a COMPRESSION_ERROR of the whole
+/// connection.
+pub fn decode_block(h : &mut Hpack, s : &Vec<u8>) -> Result<Vec<HeaderField>, Failure> {
+  let mut fields = Vec<HeaderField>::new();
+  let mut total = 0;
+  let mut pos = 0;
+  let mut fields_seen = false;
+  while pos < s.len() {
+    let b = s.get(pos) as i32;
+    if (b & 128) != 0 {
+      // An indexed field.
+      let n = decode_int(s, pos, 7);
+      if n.next < 0 || n.value == 0i64 {
+        return Result<Vec<HeaderField>, Failure>::Err(hpack_error("bad index"));
+      }
+      match lookup(h, n.value) {
+        Option<HeaderField>::Some(f) => {
+          total = total + entry_size(&f.name, &f.value);
+          fields.push(f);
+        },
+        Option<HeaderField>::None() => {
+          return Result<Vec<HeaderField>, Failure>::Err(hpack_error("index out of range"));
+        }
+      }
+      pos = n.next;
+      fields_seen = true;
+    } else {
+      if (b & 224) == 32 {
+        // A dynamic table size update, only before the first field of a block.
+        let n = decode_int(s, pos, 5);
+        if n.next < 0 || fields_seen || n.value > (HPACK_TABLE_SIZE as i64) {
+          return Result<Vec<HeaderField>, Failure>::Err(hpack_error("bad table size update"));
+        }
+        h.max_size = n.value as i32;
+        evict(h, 0);
+        pos = n.next;
+      } else {
+        // A literal: with incremental indexing (01), or without indexing or never indexed
+        // (000x).
+        let indexing = (b & 192) == 64;
+        let mut prefix = 4;
+        if indexing {
+          prefix = 6;
+        }
+        let n = decode_int(s, pos, prefix);
+        if n.next < 0 {
+          return Result<Vec<HeaderField>, Failure>::Err(hpack_error("bad literal"));
+        }
+        pos = n.next;
+        let mut name = Vec<u8>::new();
+        if n.value > 0i64 {
+          match lookup(h, n.value) {
+            Option<HeaderField>::Some(f) => {
+              name = f.name;
+            },
+            Option<HeaderField>::None() => {
+              return Result<Vec<HeaderField>, Failure>::Err(hpack_error("name index out of range"));
+            }
+          }
+        } else {
+          let ns = decode_string(h, s, pos);
+          if !ns.ok {
+            return Result<Vec<HeaderField>, Failure>::Err(hpack_error("bad name"));
+          }
+          name = ns.bytes;
+          pos = ns.next;
+        }
+        let vs = decode_string(h, s, pos);
+        if !vs.ok {
+          return Result<Vec<HeaderField>, Failure>::Err(hpack_error("bad value"));
+        }
+        pos = vs.next;
+        if indexing {
+          add_entry(h, &name, &vs.bytes);
+        }
+        total = total + entry_size(&name, &vs.bytes);
+        fields.push(HeaderField {
+          name : name,
+          value : vs.bytes
+        });
+        fields_seen = true;
+      }
+    }
+    if total > HPACK_MAX_LIST {
+      return Result<Vec<HeaderField>, Failure>::Err(hpack_error("header list too large"));
+    }
+  }
+  return Result<Vec<HeaderField>, Failure>::Ok(fields);
+}
+
+/// Append the integer `value` with an `n`-bit prefix and the high bits `flags`.
+fn encode_int(out : &mut Vec<u8>, value : i64, n : i32, flags : i32) -> void {
+  let mut mask = 1;
+  let mut k = 0;
+  while k < n {
+    mask = mask * 2;
+    k = k + 1;
+  }
+  mask = mask - 1;
+  if value < (mask as i64) {
+    out.push((flags + (value as i32)) as u8);
+    return;
+  }
+  out.push((flags + mask) as u8);
+  let mut v = value - (mask as i64);
+  while v >= 128i64 {
+    out.push(((v % 128i64) + 128i64) as u8);
+    v = v / 128i64;
+  }
+  out.push(v as u8);
+}
+
+fn encode_string(out : &mut Vec<u8>, s : &Vec<u8>) -> void {
+  encode_int(out, s.len() as i64, 7, 0);
+  append(out, s);
+}
+
+/// Encode the fields of a request. Names must be in lower case. Each field is an index of the
+/// static table when one matches, or a literal without indexing.
+pub fn encode_fields(h : &Hpack, fields : &Vec<HeaderField>) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  for f in fields.iter() {
+    let mut exact = 0;
+    let mut by_name = 0;
+    let mut i = 0;
+    while i < h.static_names.len() && exact == 0 {
+      if same_bytes(h.static_names.get_ref(i), &f.name) {
+        if by_name == 0 {
+          by_name = i + 1;
+        }
+        if same_bytes(h.static_values.get_ref(i), &f.value) {
+          exact = i + 1;
+        }
+      }
+      i = i + 1;
+    }
+    if exact > 0 {
+      encode_int(&mut out, exact as i64, 7, 128);
+    } else {
+      if by_name > 0 {
+        encode_int(&mut out, by_name as i64, 4, 0);
+      } else {
+        out.push(0u8);
+        encode_string(&mut out, &f.name);
+      }
+      encode_string(&mut out, &f.value);
+    }
+  }
+  return out;
+}
+
+// Generated from the text of RFC 7541 by a script: Appendix A (the static table) and
+// Appendix B (the Huffman code, which is canonical).
+
+/// The static table: `name value` lines, one for each index from 1 to 61.
+fn static_table_text() -> Vec<u8> {
+  let mut t = Vec<u8>::new();
+  push_lit(&mut t, ":authority \n");
+  push_lit(&mut t, ":method GET\n");
+  push_lit(&mut t, ":method POST\n");
+  push_lit(&mut t, ":path /\n");
+  push_lit(&mut t, ":path /index.html\n");
+  push_lit(&mut t, ":scheme http\n");
+  push_lit(&mut t, ":scheme https\n");
+  push_lit(&mut t, ":status 200\n");
+  push_lit(&mut t, ":status 204\n");
+  push_lit(&mut t, ":status 206\n");
+  push_lit(&mut t, ":status 304\n");
+  push_lit(&mut t, ":status 400\n");
+  push_lit(&mut t, ":status 404\n");
+  push_lit(&mut t, ":status 500\n");
+  push_lit(&mut t, "accept-charset \n");
+  push_lit(&mut t, "accept-encoding gzip, deflate\n");
+  push_lit(&mut t, "accept-language \n");
+  push_lit(&mut t, "accept-ranges \n");
+  push_lit(&mut t, "accept \n");
+  push_lit(&mut t, "access-control-allow-origin \n");
+  push_lit(&mut t, "age \n");
+  push_lit(&mut t, "allow \n");
+  push_lit(&mut t, "authorization \n");
+  push_lit(&mut t, "cache-control \n");
+  push_lit(&mut t, "content-disposition \n");
+  push_lit(&mut t, "content-encoding \n");
+  push_lit(&mut t, "content-language \n");
+  push_lit(&mut t, "content-length \n");
+  push_lit(&mut t, "content-location \n");
+  push_lit(&mut t, "content-range \n");
+  push_lit(&mut t, "content-type \n");
+  push_lit(&mut t, "cookie \n");
+  push_lit(&mut t, "date \n");
+  push_lit(&mut t, "etag \n");
+  push_lit(&mut t, "expect \n");
+  push_lit(&mut t, "expires \n");
+  push_lit(&mut t, "from \n");
+  push_lit(&mut t, "host \n");
+  push_lit(&mut t, "if-match \n");
+  push_lit(&mut t, "if-modified-since \n");
+  push_lit(&mut t, "if-none-match \n");
+  push_lit(&mut t, "if-range \n");
+  push_lit(&mut t, "if-unmodified-since \n");
+  push_lit(&mut t, "last-modified \n");
+  push_lit(&mut t, "link \n");
+  push_lit(&mut t, "location \n");
+  push_lit(&mut t, "max-forwards \n");
+  push_lit(&mut t, "proxy-authenticate \n");
+  push_lit(&mut t, "proxy-authorization \n");
+  push_lit(&mut t, "range \n");
+  push_lit(&mut t, "referer \n");
+  push_lit(&mut t, "refresh \n");
+  push_lit(&mut t, "retry-after \n");
+  push_lit(&mut t, "server \n");
+  push_lit(&mut t, "set-cookie \n");
+  push_lit(&mut t, "strict-transport-security \n");
+  push_lit(&mut t, "transfer-encoding \n");
+  push_lit(&mut t, "user-agent \n");
+  push_lit(&mut t, "vary \n");
+  push_lit(&mut t, "via \n");
+  push_lit(&mut t, "www-authenticate \n");
+  return t;
+}
+
+/// The symbols of the Huffman code in canonical order (by code length, then by symbol), each
+/// as three decimal digits. 256 is EOS.
+fn huffman_symbols_text() -> Vec<u8> {
+  let mut t = Vec<u8>::new();
+  push_lit(&mut t, "048049050097099101105111115116032037045046047051052053054055056057061065095098100102103104");
+  push_lit(&mut t, "108109110112114117058066067068069070071072073074075076077078079080081082083084085086087089");
+  push_lit(&mut t, "106107113118119120121122038042044059088090033034040041063039043124035062000036064091093126");
+  push_lit(&mut t, "094125060096123092195208128130131162184194224226153161167172176177179209216217227229230129");
+  push_lit(&mut t, "132133134136146154156160163164169170173178181185186187189190196198228232233001135137138139");
+  push_lit(&mut t, "140141143147149150151152155157158165166168174175180182183188191197231239009142144145148159");
+  push_lit(&mut t, "171206215225236237199207234235192193200201202205210213218219238240242243255203204211212214");
+  push_lit(&mut t, "221222223241244245246247248250251252253254002003004005006007008011012014015016017018019020");
+  push_lit(&mut t, "021023024025026027028029030031127220249010013022256");
+  return t;
+}
+
+/// For each code length from 1 to 30: the first code of that length, the index of its symbol in
+/// `huffman_symbols_text`, and how many codes have that length.
+fn huffman_lengths() -> Vec<i64> {
+  let mut t = Vec<i64>::new();
+  t.push(0i64);
+  t.push(0i64);
+  t.push(0i64);
+  t.push(0i64);
+  t.push(0i64);
+  t.push(0i64);
+  t.push(0i64);
+  t.push(0i64);
+  t.push(0i64);
+  t.push(0i64);
+  t.push(0i64);
+  t.push(0i64);
+  t.push(0i64);
+  t.push(0i64);
+  t.push(10i64);
+  t.push(20i64);
+  t.push(10i64);
+  t.push(26i64);
+  t.push(92i64);
+  t.push(36i64);
+  t.push(32i64);
+  t.push(248i64);
+  t.push(68i64);
+  t.push(6i64);
+  t.push(0i64);
+  t.push(74i64);
+  t.push(0i64);
+  t.push(1016i64);
+  t.push(74i64);
+  t.push(5i64);
+  t.push(2042i64);
+  t.push(79i64);
+  t.push(3i64);
+  t.push(4090i64);
+  t.push(82i64);
+  t.push(2i64);
+  t.push(8184i64);
+  t.push(84i64);
+  t.push(6i64);
+  t.push(16380i64);
+  t.push(90i64);
+  t.push(2i64);
+  t.push(32764i64);
+  t.push(92i64);
+  t.push(3i64);
+  t.push(0i64);
+  t.push(95i64);
+  t.push(0i64);
+  t.push(0i64);
+  t.push(95i64);
+  t.push(0i64);
+  t.push(0i64);
+  t.push(95i64);
+  t.push(0i64);
+  t.push(524272i64);
+  t.push(95i64);
+  t.push(3i64);
+  t.push(1048550i64);
+  t.push(98i64);
+  t.push(8i64);
+  t.push(2097116i64);
+  t.push(106i64);
+  t.push(13i64);
+  t.push(4194258i64);
+  t.push(119i64);
+  t.push(26i64);
+  t.push(8388568i64);
+  t.push(145i64);
+  t.push(29i64);
+  t.push(16777194i64);
+  t.push(174i64);
+  t.push(12i64);
+  t.push(33554412i64);
+  t.push(186i64);
+  t.push(4i64);
+  t.push(67108832i64);
+  t.push(190i64);
+  t.push(15i64);
+  t.push(134217694i64);
+  t.push(205i64);
+  t.push(19i64);
+  t.push(268435426i64);
+  t.push(224i64);
+  t.push(29i64);
+  t.push(0i64);
+  t.push(253i64);
+  t.push(0i64);
+  t.push(1073741820i64);
+  t.push(253i64);
+  t.push(4i64);
+  return t;
+}

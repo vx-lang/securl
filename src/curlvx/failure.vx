@@ -46,3 +46,6 @@ const BAD_CONTENT_ENCODING : i32 = 61;
 const UPLOAD_FAILED : i32 = 25;
 const TOO_LARGE : i32 = 100;
 const SETOPT_OPTION_SYNTAX : i32 = 49;
+// An error of the HTTP/2 framing layer, and an error of one HTTP/2 stream.
+const HTTP2_ERROR : i32 = 16;
+const HTTP2_STREAM_ERROR : i32 = 92;
