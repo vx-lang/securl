@@ -1,0 +1,608 @@
+// HTTP/2 (RFC 9113) for one request on one connection, as curl does it for a transfer.
+//
+// The request is the HTTP/1.1 request that `build_request` makes, turned into HTTP/2 fields:
+// the request line and the Host header become `:method`, `:scheme`, `:authority` and `:path`,
+// and the headers that HTTP/2 forbids go away. So the authentication, the cookies and the `-H`
+// headers have one code path for both versions.
+//
+// The response head becomes a `ResponseHead` with the status line `HTTP/2 200 `, as curl writes
+// it, so the rest of a transfer does not care about the version. `next_data` gives the body.
+//
+// Flow control: curl-vx gives the server a window of 1 MiB on the stream and on the
+// connection, and sends WINDOW_UPDATE when half of it is used. It sends its own body within
+// the windows of the server, and waits for WINDOW_UPDATE when they are empty.
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import curlvx::bytes;
+import curlvx::conn;
+import curlvx::failure;
+import curlvx::hpack;
+import curlvx::http;
+
+// Frame types and flags (RFC 9113, section 6).
+const FRAME_DATA : i32 = 0;
+const FRAME_HEADERS : i32 = 1;
+const FRAME_PRIORITY : i32 = 2;
+const FRAME_RST_STREAM : i32 = 3;
+const FRAME_SETTINGS : i32 = 4;
+const FRAME_PUSH_PROMISE : i32 = 5;
+const FRAME_PING : i32 = 6;
+const FRAME_GOAWAY : i32 = 7;
+const FRAME_WINDOW_UPDATE : i32 = 8;
+const FRAME_CONTINUATION : i32 = 9;
+const FLAG_END_STREAM : i32 = 1;
+const FLAG_ACK : i32 = 1;
+const FLAG_END_HEADERS : i32 = 4;
+const FLAG_PADDED : i32 = 8;
+const FLAG_PRIORITY : i32 = 32;
+
+// The stream of the request.
+const STREAM : i32 = 1;
+// The largest frame that curl-vx takes: the default of SETTINGS_MAX_FRAME_SIZE.
+const MAX_FRAME_IN : i32 = 16384;
+// The window that curl-vx gives the server, on the stream and on the connection.
+const RECV_WINDOW : i64 = 1048576i64;
+// The window of a new stream and connection before SETTINGS say more.
+const DEFAULT_WINDOW : i64 = 65535i64;
+const MAX_WINDOW : i64 = 2147483647i64;
+
+/// The state of the HTTP/2 connection and of its one stream.
+struct H2 {
+  hpack_in : Hpack,
+  hpack_out : Hpack,
+  // SETTINGS_MAX_FRAME_SIZE of the server.
+  peer_max_frame : i32,
+  // SETTINGS_INITIAL_WINDOW_SIZE of the server.
+  peer_initial_window : i64,
+  // What curl-vx may still send: on the connection and on the stream.
+  send_conn : i64,
+  send_stream : i64,
+  // What the server sent since the last WINDOW_UPDATE of curl-vx.
+  recv_conn_used : i64,
+  recv_stream_used : i64,
+  // The server ended the stream.
+  end_stream : bool,
+  // The header lines of the trailers, as `name: value\r\n`.
+  trailers : Vec<u8>,
+  // A frame of the response that arrived while curl-vx still sent the body.
+  has_pending : bool,
+  pending : Frame,
+}
+
+pub fn new_h2() -> H2 {
+  return H2 {
+    hpack_in : new_hpack(),
+    hpack_out : new_hpack(),
+    peer_max_frame : 16384,
+    peer_initial_window : DEFAULT_WINDOW,
+    send_conn : DEFAULT_WINDOW,
+    send_stream : DEFAULT_WINDOW,
+    recv_conn_used : 0i64,
+    recv_stream_used : 0i64,
+    end_stream : false,
+    trailers : Vec<u8>::new(),
+    has_pending : false,
+    pending : Frame {
+      kind : 0,
+      flags : 0,
+      stream : 0,
+      payload : Vec<u8>::new()
+    }
+  };
+}
+
+/// The frame that arrived early, or else the next frame from the server.
+fn next_frame(h : &mut H2, c : &mut Conn) -> Result<Frame, Failure> {
+  if h.has_pending {
+    h.has_pending = false;
+    let f = Frame {
+      kind : h.pending.kind,
+      flags : h.pending.flags,
+      stream : h.pending.stream,
+      payload : clone_bytes(&h.pending.payload)
+    };
+    return Result<Frame, Failure>::Ok(f);
+  }
+  return read_frame(c);
+}
+
+/// One frame.
+struct Frame {
+  kind : i32,
+  flags : i32,
+  stream : i32,
+  payload : Vec<u8>,
+}
+
+fn h2_fail(message : *const i8) -> Failure {
+  return fail_lit(HTTP2_ERROR, message);
+}
+
+fn push_u32(out : &mut Vec<u8>, v : i64) -> void {
+  out.push(((v / 16777216i64) % 256i64) as u8);
+  out.push(((v / 65536i64) % 256i64) as u8);
+  out.push(((v / 256i64) % 256i64) as u8);
+  out.push((v % 256i64) as u8);
+}
+
+fn read_u32(s : &Vec<u8>, at : i32) -> i64 {
+  return (s.get(at) as i64) * 16777216i64 + (s.get(at + 1) as i64) * 65536i64
+    + (s.get(at + 2) as i64) * 256i64 + (s.get(at + 3) as i64);
+}
+
+/// Send one frame.
+fn write_frame(c : &mut Conn, kind : i32, flags : i32, stream : i32, payload : &Vec<u8>)
+-> Result<i32, Failure> {
+  let mut out = Vec<u8>::new();
+  let n = payload.len();
+  out.push(((n / 65536) % 256) as u8);
+  out.push(((n / 256) % 256) as u8);
+  out.push((n % 256) as u8);
+  out.push(kind as u8);
+  out.push(flags as u8);
+  push_u32(&mut out, stream as i64);
+  append(&mut out, payload);
+  return c.send(&out);
+}
+
+/// Exactly `n` bytes from the connection.
+fn read_exact(c : &mut Conn, n : i32) -> Result<Vec<u8>, Failure> {
+  let mut out = Vec<u8>::new();
+  while out.len() < n {
+    let part = c.read_some((n - out.len()) as i64)?;
+    if part.len() == 0 {
+      return Result<Vec<u8>, Failure>::Err(fail_lit(HTTP2_STREAM_ERROR,
+        "HTTP/2 stream 1 was not closed cleanly before end of the underlying stream"));
+    }
+    append(&mut out, &part);
+  }
+  return Result<Vec<u8>, Failure>::Ok(out);
+}
+
+/// The next frame from the server.
+fn read_frame(c : &mut Conn) -> Result<Frame, Failure> {
+  let head = read_exact(c, 9)?;
+  let length = (head.get(0) as i32) * 65536 + (head.get(1) as i32) * 256 + (head.get(2) as i32);
+  if length > MAX_FRAME_IN {
+    return Result<Frame, Failure>::Err(h2_fail("HTTP/2: frame too large"));
+  }
+  let stream = (read_u32(&head, 5) % 2147483648i64) as i32;
+  let payload = read_exact(c, length)?;
+  return Result<Frame, Failure>::Ok(Frame {
+    kind : head.get(3) as i32,
+    flags : head.get(4) as i32,
+    stream : stream,
+    payload : payload
+  });
+}
+
+/// Start the connection: the client preface, the SETTINGS of curl-vx, and a larger window on
+/// the connection.
+pub fn h2_start(h : &mut H2, c : &mut Conn) -> Result<i32, Failure> {
+  let preface = lit("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+  let mut settings = Vec<u8>::new();
+  // SETTINGS_ENABLE_PUSH = 0, SETTINGS_MAX_CONCURRENT_STREAMS = 100,
+  // SETTINGS_INITIAL_WINDOW_SIZE = RECV_WINDOW.
+  settings.push(0u8);
+  settings.push(2u8);
+  push_u32(&mut settings, 0i64);
+  settings.push(0u8);
+  settings.push(3u8);
+  push_u32(&mut settings, 100i64);
+  settings.push(0u8);
+  settings.push(4u8);
+  push_u32(&mut settings, RECV_WINDOW);
+  let _p = c.send(&preface)?;
+  let _s = write_frame(c, FRAME_SETTINGS, 0, 0, &settings)?;
+  let mut inc = Vec<u8>::new();
+  push_u32(&mut inc, RECV_WINDOW - DEFAULT_WINDOW);
+  let _w = write_frame(c, FRAME_WINDOW_UPDATE, 0, 0, &inc)?;
+  return Result<i32, Failure>::Ok(0);
+}
+
+/// The name of an HTTP/2 error code, as curl says it.
+fn error_name(code : i64) -> Vec<u8> {
+  let names = lit("NO_ERROR PROTOCOL_ERROR INTERNAL_ERROR FLOW_CONTROL_ERROR SETTINGS_TIMEOUT STREAM_CLOSED FRAME_SIZE_ERROR REFUSED_STREAM CANCEL COMPRESSION_ERROR CONNECT_ERROR ENHANCE_YOUR_CALM INADEQUATE_SECURITY HTTP_1_1_REQUIRED");
+  let mut start = 0;
+  let mut i = 0i64;
+  while start < names.len() {
+    let mut end = find_byte(&names, 32u8, start);
+    if end < 0 {
+      end = names.len();
+    }
+    if i == code {
+      return range_of(&names, start, end);
+    }
+    i = i + 1i64;
+    start = end + 1;
+  }
+  return lit("unknown");
+}
+
+/// Handle a frame that is not about the data of the stream: SETTINGS, PING, WINDOW_UPDATE,
+/// RST_STREAM, GOAWAY, PRIORITY and frames of unknown types.
+fn handle_control(h : &mut H2, c : &mut Conn, f : &Frame) -> Result<i32, Failure> {
+  if f.kind == FRAME_SETTINGS {
+    if (f.flags & FLAG_ACK) != 0 || f.stream != 0 {
+      return Result<i32, Failure>::Ok(0);
+    }
+    if f.payload.len() % 6 != 0 {
+      return Result<i32, Failure>::Err(h2_fail("HTTP/2: bad SETTINGS frame"));
+    }
+    let mut i = 0;
+    while i + 6 <= f.payload.len() {
+      let id = (f.payload.get(i) as i32) * 256 + (f.payload.get(i + 1) as i32);
+      let value = read_u32(&f.payload, i + 2);
+      if id == 4 {
+        if value > MAX_WINDOW {
+          return Result<i32, Failure>::Err(h2_fail("HTTP/2: bad initial window size"));
+        }
+        // A new initial window moves the window of the open stream by the difference.
+        h.send_stream = h.send_stream + (value - h.peer_initial_window);
+        h.peer_initial_window = value;
+      }
+      if id == 5 {
+        if value < 16384i64 || value > 16777215i64 {
+          return Result<i32, Failure>::Err(h2_fail("HTTP/2: bad max frame size"));
+        }
+        h.peer_max_frame = value as i32;
+      }
+      i = i + 6;
+    }
+    let _a = write_frame(c, FRAME_SETTINGS, FLAG_ACK, 0, &Vec<u8>::new())?;
+    return Result<i32, Failure>::Ok(0);
+  }
+  if f.kind == FRAME_PING {
+    if (f.flags & FLAG_ACK) == 0 {
+      let _p = write_frame(c, FRAME_PING, FLAG_ACK, 0, &f.payload)?;
+    }
+    return Result<i32, Failure>::Ok(0);
+  }
+  if f.kind == FRAME_WINDOW_UPDATE {
+    if f.payload.len() != 4 {
+      return Result<i32, Failure>::Err(h2_fail("HTTP/2: bad WINDOW_UPDATE frame"));
+    }
+    let inc = read_u32(&f.payload, 0) % 2147483648i64;
+    if f.stream == 0 {
+      h.send_conn = h.send_conn + inc;
+    }
+    if f.stream == STREAM {
+      h.send_stream = h.send_stream + inc;
+    }
+    return Result<i32, Failure>::Ok(0);
+  }
+  if f.kind == FRAME_RST_STREAM && f.stream == STREAM {
+    let mut code = 0i64;
+    if f.payload.len() >= 4 {
+      code = read_u32(&f.payload, 0);
+    }
+    let mut m = lit("HTTP/2 stream 1 was not closed cleanly: ");
+    append(&mut m, &error_name(code));
+    push_lit(&mut m, " (err ");
+    push_i64(&mut m, code);
+    push_lit(&mut m, ")");
+    return Result<i32, Failure>::Err(fail_with(HTTP2_STREAM_ERROR, m));
+  }
+  if f.kind == FRAME_GOAWAY {
+    // The server stops. Stream 1 still runs when the last stream that it takes is 1 or more.
+    if f.payload.len() >= 8 && (read_u32(&f.payload, 0) % 2147483648i64) >= 1i64 {
+      return Result<i32, Failure>::Ok(0);
+    }
+    return Result<i32, Failure>::Err(fail_lit(HTTP2_ERROR,
+      "Received HTTP/2 GOAWAY before the response"));
+  }
+  if f.kind == FRAME_PUSH_PROMISE {
+    return Result<i32, Failure>::Err(h2_fail("HTTP/2: PUSH_PROMISE although push is off"));
+  }
+  // PRIORITY, and frames of unknown types, change nothing.
+  return Result<i32, Failure>::Ok(0);
+}
+
+/// The header block of a HEADERS frame: no padding and no priority fields.
+fn headers_payload(f : &Frame) -> Result<Vec<u8>, Failure> {
+  let mut start = 0;
+  let mut end = f.payload.len();
+  if (f.flags & FLAG_PADDED) != 0 {
+    if f.payload.len() < 1 {
+      return Result<Vec<u8>, Failure>::Err(h2_fail("HTTP/2: bad padding"));
+    }
+    end = end - (f.payload.get(0) as i32);
+    start = 1;
+  }
+  if (f.flags & FLAG_PRIORITY) != 0 {
+    start = start + 5;
+  }
+  if start > end {
+    return Result<Vec<u8>, Failure>::Err(h2_fail("HTTP/2: bad padding"));
+  }
+  return Result<Vec<u8>, Failure>::Ok(range_of(&f.payload, start, end));
+}
+
+/// The fields of the header block that starts with the HEADERS frame `first`, with its
+/// CONTINUATION frames.
+fn read_header_block(h : &mut H2, c : &mut Conn, first : &Frame)
+-> Result<Vec<HeaderField>, Failure> {
+  let mut block = headers_payload(first)?;
+  let mut done = (first.flags & FLAG_END_HEADERS) != 0;
+  while !done {
+    let f = read_frame(c)?;
+    if f.kind != FRAME_CONTINUATION || f.stream != first.stream {
+      return Result<Vec<HeaderField>, Failure>::Err(h2_fail("HTTP/2: expected CONTINUATION"));
+    }
+    append(&mut block, &f.payload);
+    done = (f.flags & FLAG_END_HEADERS) != 0;
+  }
+  return decode_block(&mut h.hpack_in, &block);
+}
+
+/// Whether an HTTP/2 request may carry the header `name` (in lower case) with `value`.
+fn allowed_in_h2(name : &Vec<u8>, value : &Vec<u8>) -> bool {
+  if eq_lit(name, "connection") || eq_lit(name, "keep-alive") || eq_lit(name, "proxy-connection")
+     || eq_lit(name, "transfer-encoding") || eq_lit(name, "upgrade") || eq_lit(name, "host") {
+    return false;
+  }
+  if eq_lit(name, "te") {
+    return eq_lit_nocase(&trim_blanks(value), "trailers");
+  }
+  return true;
+}
+
+/// The HTTP/2 fields of the HTTP/1.1 request `request` for `scheme`.
+pub fn request_fields(request : &Vec<u8>, scheme : &Vec<u8>) -> Vec<HeaderField> {
+  let mut lines = Vec<Vec<u8>>::new();
+  let mut start = 0;
+  while start < request.len() {
+    let mut end = find_byte(request, 10u8, start);
+    if end < 0 {
+      end = request.len();
+    }
+    let line = trim_newline(&range_of(request, start, end + 1));
+    if line.len() > 0 {
+      lines.push(line);
+    }
+    start = end + 1;
+  }
+  let first = lines.get_ref(0);
+  let sp1 = find_byte(first, 32u8, 0);
+  let sp2 = rfind_byte(first, 32u8);
+  let mut authority = Vec<u8>::new();
+  let mut i = 1;
+  while i < lines.len() {
+    let line = lines.get_ref(i);
+    let colon = find_byte(line, 58u8, 0);
+    if colon > 0 && eq_lit_nocase(&range_of(line, 0, colon), "Host") {
+      authority = trim_blanks(&rest_from(line, colon + 1));
+    }
+    i = i + 1;
+  }
+  let mut fields = Vec<HeaderField>::new();
+  fields.push(HeaderField {
+    name : lit(":method"),
+    value : range_of(first, 0, sp1)
+  });
+  fields.push(HeaderField {
+    name : lit(":scheme"),
+    value : clone_bytes(scheme)
+  });
+  fields.push(HeaderField {
+    name : lit(":authority"),
+    value : authority
+  });
+  fields.push(HeaderField {
+    name : lit(":path"),
+    value : range_of(first, sp1 + 1, sp2)
+  });
+  i = 1;
+  while i < lines.len() {
+    let line = lines.get_ref(i);
+    let colon = find_byte(line, 58u8, 0);
+    if colon > 0 {
+      let name = to_lower(&trim_blanks(&range_of(line, 0, colon)));
+      let value = trim_blanks(&rest_from(line, colon + 1));
+      if allowed_in_h2(&name, &value) {
+        fields.push(HeaderField {
+          name : name,
+          value : value
+        });
+      }
+    }
+    i = i + 1;
+  }
+  return fields;
+}
+
+/// Send the request: its HEADERS (with CONTINUATION when the block is large) and its body in
+/// DATA frames, within the windows of the server.
+pub fn h2_send_request(h : &mut H2, c : &mut Conn, request : &Vec<u8>, scheme : &Vec<u8>,
+body : &Vec<u8>, has_body : bool) -> Result<i32, Failure> {
+  let fields = request_fields(request, scheme);
+  let block = encode_fields(&h.hpack_out, &fields);
+  let sends_data = has_body && body.len() > 0;
+  let mut flags = 0;
+  if !sends_data {
+    flags = FLAG_END_STREAM;
+  }
+  let mut at = 0;
+  let mut first = true;
+  while first || at < block.len() {
+    let mut end = at + h.peer_max_frame;
+    if end > block.len() {
+      end = block.len();
+    }
+    let mut f = 0;
+    if end == block.len() {
+      f = FLAG_END_HEADERS;
+    }
+    if first {
+      let _h = write_frame(c, FRAME_HEADERS, flags + f, STREAM, &range_of(&block, at, end))?;
+    } else {
+      let _k = write_frame(c, FRAME_CONTINUATION, f, STREAM, &range_of(&block, at, end))?;
+    }
+    first = false;
+    at = end;
+  }
+  if !sends_data {
+    return Result<i32, Failure>::Ok(0);
+  }
+  let mut sent = 0;
+  while sent < body.len() {
+    // Wait for room in both windows.
+    while h.send_conn <= 0i64 || h.send_stream <= 0i64 {
+      let f = read_frame(c)?;
+      if (f.kind == FRAME_DATA || f.kind == FRAME_HEADERS) && f.stream == STREAM {
+        // The server answers before it took the whole body, as curl allows: stop sending, and
+        // keep the frame for the response.
+        h.has_pending = true;
+        h.pending = f;
+        return Result<i32, Failure>::Ok(0);
+      }
+      let _c = handle_control(h, c, &f)?;
+    }
+    let mut size = (body.len() - sent) as i64;
+    if size > (h.peer_max_frame as i64) {
+      size = h.peer_max_frame as i64;
+    }
+    if size > h.send_conn {
+      size = h.send_conn;
+    }
+    if size > h.send_stream {
+      size = h.send_stream;
+    }
+    let end = sent + (size as i32);
+    let mut f = 0;
+    if end == body.len() {
+      f = FLAG_END_STREAM;
+    }
+    let _d = write_frame(c, FRAME_DATA, f, STREAM, &range_of(body, sent, end))?;
+    h.send_conn = h.send_conn - size;
+    h.send_stream = h.send_stream - size;
+    sent = end;
+  }
+  return Result<i32, Failure>::Ok(0);
+}
+
+/// The next response head on the stream, informational (1xx) or final, as a `ResponseHead`.
+pub fn h2_read_head(h : &mut H2, c : &mut Conn) -> Result<ResponseHead, Failure> {
+  loop {
+    let f = next_frame(h, c)?;
+    if f.kind == FRAME_HEADERS && f.stream == STREAM {
+      let fields = read_header_block(h, c, &f)?;
+      if (f.flags & FLAG_END_STREAM) != 0 {
+        h.end_stream = true;
+      }
+      return head_of(&fields);
+    }
+    if f.kind == FRAME_DATA {
+      return Result<ResponseHead, Failure>::Err(h2_fail("HTTP/2: DATA before the response head"));
+    }
+    let _c = handle_control(h, c, &f)?;
+  }
+}
+
+/// A `ResponseHead` from the fields of a response head.
+fn head_of(fields : &Vec<HeaderField>) -> Result<ResponseHead, Failure> {
+  let mut head = empty_head();
+  head.version = 20;
+  let mut status = -1;
+  for f in fields.iter() {
+    if eq_lit(&f.name, ":status") && f.value.len() == 3 && is_digit(f.value.get(0))
+       && is_digit(f.value.get(1)) && is_digit(f.value.get(2)) {
+      status = ((f.value.get(0) - 48u8) as i32) * 100 + ((f.value.get(1) - 48u8) as i32) * 10
+        + ((f.value.get(2) - 48u8) as i32);
+    }
+  }
+  if status < 0 {
+    return Result<ResponseHead, Failure>::Err(fail_lit(HTTP2_STREAM_ERROR,
+      "HTTP/2 stream 1 was reset: no :status in the response"));
+  }
+  head.status = status;
+  push_lit(&mut head.raw, "HTTP/2 ");
+  push_i64(&mut head.raw, status as i64);
+  push_lit(&mut head.raw, " \r\n");
+  let mut index = 1;
+  for f in fields.iter() {
+    if f.name.len() > 0 && f.name.get(0) != 58u8 {
+      let mut line = clone_bytes(&f.name);
+      push_lit(&mut line, ": ");
+      append(&mut line, &f.value);
+      push_lit(&mut line, "\r\n");
+      index = index + 1;
+      parse_header_line(&line, index, false, &mut head);
+      if head.error_code != 0 {
+        return Result<ResponseHead, Failure>::Ok(head);
+      }
+      append(&mut head.raw, &line);
+    }
+  }
+  push_lit(&mut head.raw, "\r\n");
+  // HTTP/2 has no chunks and no Connection header.
+  head.chunked = false;
+  head.has_transfer_encoding = false;
+  head.close = false;
+  return Result<ResponseHead, Failure>::Ok(head);
+}
+
+/// Give back `used` bytes of window to the server, when half of a window is used.
+fn update_windows(h : &mut H2, c : &mut Conn, used : i64) -> Result<i32, Failure> {
+  h.recv_conn_used = h.recv_conn_used + used;
+  h.recv_stream_used = h.recv_stream_used + used;
+  if h.recv_conn_used >= RECV_WINDOW / 2i64 {
+    let mut inc = Vec<u8>::new();
+    push_u32(&mut inc, h.recv_conn_used);
+    let _w = write_frame(c, FRAME_WINDOW_UPDATE, 0, 0, &inc)?;
+    h.recv_conn_used = 0i64;
+  }
+  if h.recv_stream_used >= RECV_WINDOW / 2i64 && !h.end_stream {
+    let mut inc = Vec<u8>::new();
+    push_u32(&mut inc, h.recv_stream_used);
+    let _w = write_frame(c, FRAME_WINDOW_UPDATE, 0, STREAM, &inc)?;
+    h.recv_stream_used = 0i64;
+  }
+  return Result<i32, Failure>::Ok(0);
+}
+
+/// The next bytes of the body. Empty means that the stream ended; then `trailers` holds the
+/// trailers, if any.
+pub fn h2_next_data(h : &mut H2, c : &mut Conn) -> Result<Vec<u8>, Failure> {
+  while !h.end_stream {
+    let f = next_frame(h, c)?;
+    if f.kind == FRAME_DATA && f.stream == STREAM {
+      let mut start = 0;
+      let mut end = f.payload.len();
+      if (f.flags & FLAG_PADDED) != 0 {
+        if f.payload.len() < 1 || (f.payload.get(0) as i32) >= f.payload.len() {
+          return Result<Vec<u8>, Failure>::Err(h2_fail("HTTP/2: bad padding"));
+        }
+        end = end - (f.payload.get(0) as i32);
+        start = 1;
+      }
+      if (f.flags & FLAG_END_STREAM) != 0 {
+        h.end_stream = true;
+      }
+      let _u = update_windows(h, c, f.payload.len() as i64)?;
+      if end > start {
+        return Result<Vec<u8>, Failure>::Ok(range_of(&f.payload, start, end));
+      }
+      continue;
+    }
+    if f.kind == FRAME_HEADERS && f.stream == STREAM {
+      // Trailers.
+      let fields = read_header_block(h, c, &f)?;
+      for t in fields.iter() {
+        append(&mut h.trailers, &t.name);
+        push_lit(&mut h.trailers, ": ");
+        append(&mut h.trailers, &t.value);
+        push_lit(&mut h.trailers, "\r\n");
+      }
+      if (f.flags & FLAG_END_STREAM) == 0 {
+        return Result<Vec<u8>, Failure>::Err(h2_fail("HTTP/2: trailers without END_STREAM"));
+      }
+      h.end_stream = true;
+      continue;
+    }
+    let _c = handle_control(h, c, &f)?;
+  }
+  return Result<Vec<u8>, Failure>::Ok(Vec<u8>::new());
+}

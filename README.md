@@ -1,8 +1,8 @@
 # curl-vx
 
-The curl command-line tool, rewritten in [Vx](https://github.com/vx-lang/Vx). It speaks HTTP/1.1
-and HTTPS, and it implements the options that curl users use most. TLS comes from OpenSSL, which
-is a git submodule.
+The curl command-line tool, rewritten in [Vx](https://github.com/vx-lang/Vx). It speaks HTTP/1.1,
+HTTP/2 and HTTPS, and it implements the options that curl users use most. TLS comes from OpenSSL,
+which is a git submodule. HTTP/2 is written in Vx.
 
 The goal is to show what Vx's type system buys a network tool:
 
@@ -42,6 +42,7 @@ make            # builds OpenSSL once (build/openssl), then build/curl-vx
 make audit      # lists the trusted code
 make unit       # unit tests
 make test-tls   # HTTPS and time-limit tests against local servers (needs python3)
+make test-h2    # HTTP/2 tests against a local server (makes a virtualenv with h2 from PyPI)
 ```
 
 ## Status (2026-11-25)
@@ -52,10 +53,11 @@ Vx main d3ed6cf0b.
 
 | Test set | Passed |
 |---|---|
-| All tests with the keyword `HTTP` that runtests.pl runs for curl-vx | 510 of 855 (60%) |
+| All tests with the keyword `HTTP` that runtests.pl runs for curl-vx | 511 of 855 (60%) |
 | The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 452 of 522 (87%) |
 | TLS and time-limit tests against local servers (`tests/tls`) | 18 of 18 |
-| Unit tests (`tests/unit`) | 5 of 5 |
+| HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 23 of 23 |
+| Unit tests (`tests/unit`) | 6 of 6 |
 
 runtests.pl skips 14 HTTPS tests here, because they need `stunnel`. The C build of the test
 suite has OpenSSL, so that runtests.pl runs 61 more tests, most of them Digest tests (see "Run
@@ -65,12 +67,13 @@ curl's test suite"). Before Digest, curl-vx passed 409 of those 855.
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/curlvx/` (the package with all protocol code) | 6,710 | none, and `--no-trusted-code` enforces this |
-| `src/main.vx`, `src/disk.vx` | 614 | none |
-| `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 827 | 37 `extern` functions, 51 `unsafe` blocks |
+| `src/curlvx/` (the package with all protocol code) | 8,022 | none, and `--no-trusted-code` enforces this |
+| `src/main.vx`, `src/disk.vx` | 618 | none |
+| `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 872 | 39 `extern` functions, 55 `unsafe` blocks |
 
-Of the trusted code in `src/sys/`, 77 of the 88 items are the OpenSSL bindings: TLS in `tls.vx`,
-and the hash functions and random bytes of Digest in `hash.vx`.
+Of the trusted code in `src/sys/`, 81 of the 94 items are the OpenSSL bindings: TLS (with the
+ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
+`hash.vx`.
 `core` and `std` have trusted code too: the audit counts 965 `unsafe` blocks and 77 `extern`
 functions in the modules that the program uses. That is the trusted base of the language, as
 Rust's `std` is for a Rust program. OpenSSL itself is C.
@@ -111,6 +114,25 @@ call in `src/sys/tls.vx` runs in `std::sync::wait::within` until that deadline, 
 of Vx ends the wait. The TLS code polls in slices of 20 ms and checks the clock between them.
 `within` takes a closure. The calls are in `src/sys` and not in `curlvx` only because of a Vx
 bug (below).
+
+## HTTP/2
+
+curl-vx speaks HTTP/2 (RFC 9113) over TLS when the server takes it with ALPN, as curl does by
+default, and over plain TCP with `--http2-prior-knowledge`. `--http1.1` turns it off. All of it
+is in `src/curlvx/`, with no trusted code; only the ALPN choice comes from OpenSSL:
+
+- `hpack.vx`: HPACK (RFC 7541) with the Huffman code and the dynamic table. Its tables come
+  from the text of the RFC (`tools/gen-hpack-tables.py`), and a unit test decodes all the
+  examples of its Appendix C.
+- `h2.vx`: the frames, SETTINGS, PING, GOAWAY, RST_STREAM, CONTINUATION, padding, trailers, and
+  flow control in both directions: a window of 1 MiB for the server, and the body of a request
+  within the windows of the server. The request is the HTTP/1.1 request of `http.vx` turned
+  into HTTP/2 fields, so authentication, cookies and `-H` work the same on both versions. The
+  response head looks like curl's: `HTTP/2 200 ` and the header names in lower case.
+
+curl's own HTTP/2 tests need `nghttpx`, so `tests/h2` tests against a server built on the `h2`
+package of python-hyper instead, an independent implementation. curl-vx also fetches real
+sites over HTTP/2, such as Cloudflare's 1.3 MB home page.
 
 ## Authentication
 
@@ -171,7 +193,8 @@ missing options that block the most tests.
 `-o` `-O` `--remote-name-all` `--output-dir` `-r` `-s` `-S` `-T` `-u` `--digest` `--basic`
 `--anyauth` `-v` `-w` (most variables, `%header{}`, `%output{}`, `%{stderr}`) `-X` `-x` `-U`
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
-`--path-as-is` `--raw` `-0` `--url` `-m` `--connect-timeout` `-h` `-V`, and the options that
+`--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
+`--connect-timeout` `-h` `-V`, and the options that
 runtests.pl adds: `-q` `--trace-ascii` `--trace-time`.
 
 The 2025 curl user survey asked for each user's favourite option. curl-vx accepts 19 of the top
@@ -182,7 +205,8 @@ time variables yet.
 
 In order of how much users need them:
 
-1. HTTP/2 (73% of survey users), connection reuse, compression (`--compressed`).
+1. Connection reuse (and with it, HTTP/2 multiplexing), compression (`--compressed`), the
+   `Upgrade: h2c` of `--http2` on plain HTTP, and HTTP/2 through an HTTP proxy.
 1. URL globbing (`{a,b}` and `[1-9]`), `--next`, `-J`, `-C` resume, `-K` config files,
    `--netrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
    encoders, `http_proxy` and `NO_PROXY` variables (Vx has no safe way to read the

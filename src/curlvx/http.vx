@@ -165,6 +165,8 @@ struct RequestInfo {
   probe : bool,
   // The boundary of a multipart form (`-F`), or empty.
   form_boundary : Vec<u8>,
+  // The request goes over HTTP/2: no `Expect: 100-continue` and no chunks.
+  h2 : bool,
 }
 
 fn add_line(out : &mut Vec<u8>, name : *const i8, value : &Vec<u8>) -> void {
@@ -315,7 +317,7 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
        && !has_custom(&info.headers, "Content-Type") {
       push_lit(&mut out, "Content-Type: application/x-www-form-urlencoded\r\n");
     }
-    if !info.http10 && !has_custom(&info.headers, "Expect")
+    if !info.http10 && !info.h2 && !has_custom(&info.headers, "Expect")
        && (info.body_length > EXPECT_100_THRESHOLD || info.add_chunked_header) {
       push_lit(&mut out, "Expect: 100-continue\r\n");
     }

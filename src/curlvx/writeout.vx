@@ -94,7 +94,11 @@ fn variable(name : &Vec<u8>, info : &TransferInfo, ctx : &WriteOutContext, out :
       if info.http_version == 11 {
         push_lit(out, "1.1");
       } else {
-        push_lit(out, "0");
+        if info.http_version == 20 {
+          push_lit(out, "2");
+        } else {
+          push_lit(out, "0");
+        }
       }
     }
     return true;

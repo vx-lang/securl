@@ -47,6 +47,8 @@ extern "C" {
   fn SSL_get0_param(ssl : *mut i8) -> *mut i8;
   fn X509_VERIFY_PARAM_set1_ip_asc(param : *mut i8, ip : *const i8) -> i32;
   fn SSL_set_alpn_protos(ssl : *mut i8, protos : *const u8, len : u32) -> i32;
+  // The protocol that ALPN chose: `data` gets a pointer to its bytes, and `len` their number.
+  fn SSL_get0_alpn_selected(ssl : *const i8, data : *mut u64, len : *mut u32) -> void;
   fn SSL_connect(ssl : *mut i8) -> i32;
   fn SSL_read(ssl : *mut i8, buffer : *mut u8, len : i32) -> i32;
   fn SSL_write(ssl : *mut i8, buffer : *const u8, len : i32) -> i32;
@@ -225,6 +227,22 @@ fn write_all_by(tcp : &mut TcpStream, bytes : &Vec<u8>, deadline : Instant)
   });
 }
 
+/// Whether ALPN chose `h2` on the connection `ssl`.
+fn alpn_is_h2(ssl : *mut i8) -> bool {
+  let mut data = Vec<u64>::new();
+  data.push(0u64);
+  let mut len = Vec<u32>::new();
+  len.push(0u32);
+  unsafe { SSL_get0_alpn_selected(ssl as *const i8, data.as_mut_ptr(), len.as_mut_ptr()); }
+  if len.get(0) != 2u32 || data.get(0) == 0u64 {
+    return false;
+  }
+  // OpenSSL keeps the two bytes as long as the connection lives.
+  let first = unsafe { *(data.get(0) as *const u8) };
+  let second = unsafe { *add(data.get(0) as *const u8, 1usize) };
+  return first == 104u8 && second == 50u8;
+}
+
 /// The error of a wait that the time limit ended.
 fn timed_out() -> TlsError {
   return tls_error(CURLE_OPERATION_TIMEDOUT, lit("Operation timed out"));
@@ -365,6 +383,8 @@ struct NetStream {
   ssl : *mut i8,
   // Each wait gives up at this time. `Instant::never()` means no time limit.
   deadline : Instant,
+  // ALPN chose HTTP/2 in the TLS handshake.
+  alpn_h2 : bool,
 
   invariant true,
 }
@@ -395,7 +415,8 @@ impl NetStream {
     return NetStream {
       tcp : tcp,
       ssl : unsafe { 0 as *mut i8 },
-      deadline : Instant::never()
+      deadline : Instant::never(),
+      alpn_h2 : false
     };
   }
 
@@ -407,7 +428,7 @@ impl NetStream {
   /// Start TLS on this plain connection, for the server `host`, with the settings of `config`.
   /// It checks the certificate of the server against `host`, unless `config` says `-k`. A
   /// tunnel through a proxy starts TLS after the proxy said yes to CONNECT.
-  pub fn start_tls(self : &mut NetStream, config : &TlsConfig, host : &Vec<u8>)
+  pub fn start_tls(self : &mut NetStream, config : &TlsConfig, host : &Vec<u8>, offer_h2 : bool)
   -> Result<i32, TlsError> {
     assert(!self.is_tls(), "start_tls on a stream that uses TLS already");
     if config.verify && config.has_ca_error {
@@ -450,14 +471,22 @@ impl NetStream {
       }
     }
     // Offer HTTP/1.1 with ALPN, as curl does when it does not use HTTP/2.
+    // With `offer_h2`, offer HTTP/2 first, as curl does for HTTPS.
     let mut alpn = Vec<u8>::new();
+    if offer_h2 {
+      alpn.push(2u8);
+      push_bytes(&mut alpn, &lit("h2"));
+    }
     alpn.push(8u8);
     push_bytes(&mut alpn, &lit("http/1.1"));
-    let _alpn = unsafe { SSL_set_alpn_protos(ssl, alpn.as_mut_ptr() as *const u8, 9u32) };
+    let _alpn = unsafe {
+      SSL_set_alpn_protos(ssl, alpn.as_mut_ptr() as *const u8, alpn.len() as u32)
+    };
 
     loop {
       let r = unsafe { SSL_connect(ssl) };
       if r == 1 {
+        self.alpn_h2 = alpn_is_h2(ssl);
         return Result<i32, TlsError>::Ok(0);
       }
       let e = unsafe { SSL_get_error(ssl, r) };
@@ -489,6 +518,11 @@ impl NetStream {
       }
       return Result<i32, TlsError>::Err(tls_error(CURLE_SSL_CONNECT_ERROR, m));
     }
+  }
+
+  /// Whether ALPN chose HTTP/2 in the TLS handshake.
+  pub fn is_h2(self : &NetStream) -> bool {
+    return self.alpn_h2;
   }
 
   /// Whether the stream uses TLS.

@@ -16,6 +16,7 @@ import curlvx::bytes;
 import curlvx::conn;
 import curlvx::cookie;
 import curlvx::failure;
+import curlvx::h2;
 import curlvx::http;
 import curlvx::options;
 import curlvx::output;
@@ -462,7 +463,7 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
   if probe {
     body_length = 0i64;
   }
-  let req_info = RequestInfo {
+  let mut req_info = RequestInfo {
     method : method,
     kind : req_kind,
     body_length : body_length,
@@ -487,7 +488,8 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
     add_chunked_header : sends_body_now && chunked_upload
       && !has_custom(headers, "Transfer-Encoding"),
     probe : probe,
-    form_boundary : form_text(req_kind, form_boundary)
+    form_boundary : form_text(req_kind, form_boundary),
+    h2 : false
   };
 
   let mut address = Vec<u8>::new();
@@ -506,23 +508,39 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
   let mut c = connected(connect_phase(network, tls, cfg, u, &proxy, &address, secure,
     connect_deadline, info), &connect_started)?;
   c.set_deadline(deadline);
+  // HTTP/2 when TLS chose it with ALPN, or with `--http2-prior-knowledge` on plain TCP.
+  let use_h2 = c.is_h2() || (cfg.h2_prior_knowledge && !secure && !via_proxy);
+  let mut h2 = new_h2();
+  if use_h2 {
+    req_info.h2 = true;
+    req_info.chunked = false;
+    req_info.add_chunked_header = false;
+  }
   let request = build_request(u, &req_info);
   if cfg.verbose {
     verbose_lines("> ", &request);
   }
   info.size_request = info.size_request + (request.len() as i64);
-  let _sent = c.send(&request)?;
-  if sends_body_now {
-    if chunked_upload {
-      let _sent_body = c.send(&chunk_encode(body))?;
-    } else {
-      let _sent_body = c.send(body)?;
+  if use_h2 {
+    let _start = h2_start(&mut h2, &mut c)?;
+    let _sent = h2_send_request(&mut h2, &mut c, &request, &u.scheme, body, sends_body_now)?;
+    if sends_body_now {
+      info.size_request = info.size_request + (body.len() as i64);
     }
-    info.size_request = info.size_request + (body.len() as i64);
+  } else {
+    let _sent = c.send(&request)?;
+    if sends_body_now {
+      if chunked_upload {
+        let _sent_body = c.send(&chunk_encode(body))?;
+      } else {
+        let _sent_body = c.send(body)?;
+      }
+      info.size_request = info.size_request + (body.len() as i64);
+    }
   }
 
   // Skip each informational response, such as `100 Continue`. With `-i`, curl shows it.
-  let mut head = read_head(&mut c, cfg.raw, &mut info.size_header_total)?;
+  let mut head = next_head(&mut c, &mut h2, use_h2, cfg.raw, &mut info.size_header_total)?;
   let mut set_cookies = take_cookies(jar, &head, &cookie_host, &cookie_path, secure_context, 0);
   while head.error_code == 0 && head.status >= 100 && head.status < 200 && head.status != 101 {
     info.size_header = info.size_header + (head.raw.len() as i64);
@@ -535,7 +553,7 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
     if sinks.has_headers {
       let _w = sinks.headers.write(&head.raw)?;
     }
-    head = read_head(&mut c, cfg.raw, &mut info.size_header_total)?;
+    head = next_head(&mut c, &mut h2, use_h2, cfg.raw, &mut info.size_header_total)?;
     set_cookies = take_cookies(jar, &head, &cookie_host, &cookie_path, secure_context,
       set_cookies);
   }
@@ -625,9 +643,11 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
   if !has_no_body(head.status, req_kind) && !skip_body {
     if again {
       let mut discard = null_output();
-      let _b = read_body(&mut c, &head, cfg.raw, &mut discard, info, &mut trailers)?;
+      let _b = body_of(&mut c, &mut h2, use_h2, &head, cfg.raw, &mut discard, info,
+        &mut trailers)?;
     } else {
-      let _b = read_body(&mut c, &head, cfg.raw, &mut sinks.body, info, &mut trailers)?;
+      let _b = body_of(&mut c, &mut h2, use_h2, &head, cfg.raw, &mut sinks.body, info,
+        &mut trailers)?;
     }
   }
   if trailers.len() > 0 {
@@ -778,7 +798,8 @@ address : &Vec<u8>, secure : bool, deadline : Instant, info : &mut TransferInfo)
     if proxy.used {
       open_tunnel(&mut c, cfg, u, proxy, info)?;
     }
-    let _tls = c.start_tls(tls, &u.host)?;
+    // curl offers HTTP/2 over TLS unless `--http1.1` or `--http1.0` says no.
+    let _tls = c.start_tls(tls, &u.host, !cfg.no_h2 && !cfg.http10)?;
     if cfg.verbose {
       verbose_info(&lit("TLS handshake done"));
     }
@@ -1112,6 +1133,33 @@ form_boundary : &Vec<u8>, jar : &mut CookieJar, sinks : &mut Sinks, info : &mut 
     current = next_text;
     path_as_is = true;
     info.num_redirects = redirects;
+  }
+}
+
+/// The next response head, over HTTP/2 or HTTP/1.
+fn next_head(c : &mut Conn, h2 : &mut H2, use_h2 : bool, raw : bool, total : &mut i64)
+-> Result<ResponseHead, Failure> {
+  if use_h2 {
+    return h2_read_head(h2, c);
+  }
+  return read_head(c, raw, total);
+}
+
+/// Copy the body of the response to `out`, over HTTP/2 or HTTP/1. The trailers go to
+/// `trailers`.
+fn body_of(c : &mut Conn, h2 : &mut H2, use_h2 : bool, head : &ResponseHead, raw : bool,
+out : &mut Output, info : &mut TransferInfo, trailers : &mut Vec<u8>) -> Result<i32, Failure> {
+  if !use_h2 {
+    return read_body(c, head, raw, out, info, trailers);
+  }
+  loop {
+    let part = h2_next_data(h2, c)?;
+    if part.len() == 0 {
+      append(trailers, &h2.trailers);
+      return Result<i32, Failure>::Ok(0);
+    }
+    info.size_download = info.size_download + (part.len() as i64);
+    let _w = out.write(&part)?;
   }
 }
 

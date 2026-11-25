@@ -27,6 +27,17 @@ fn write_all_fd(fd : i32, bytes : &Vec<u8>) -> bool {
   return true;
 }
 
+extern "C" {
+  fn signal(signum : i32, handler : u64) -> u64;
+}
+
+/// Ignore SIGPIPE, as curl does, so that a write to a closed socket or pipe gives an error and
+/// does not end the program.
+pub fn ignore_sigpipe() -> void {
+  // SIGPIPE is 13 and SIG_IGN is 1 on Linux and on macOS.
+  let _old = unsafe { signal(13, 1u64) };
+}
+
 /// Write all bytes of `bytes` to standard output. Gives false when the output is closed.
 pub fn write_stdout(bytes : &Vec<u8>) -> bool {
   return write_all_fd(1, bytes);

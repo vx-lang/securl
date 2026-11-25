@@ -87,6 +87,11 @@ deadline : Instant) -> Result<Conn, Failure> {
 }
 
 impl Conn {
+  /// Whether TLS chose HTTP/2 for the connection.
+  pub fn is_h2(self : &Conn) -> bool {
+    return self.stream.is_h2();
+  }
+
   /// Make each wait of the connection from now on give up at `at`.
   pub fn set_deadline(self : &mut Conn, at : Instant) -> void {
     self.stream.set_deadline(at);
@@ -107,10 +112,12 @@ impl Conn {
     }
   }
 
-  /// Start TLS for the server `host`. A response must not be half read.
-  pub fn start_tls(self : &mut Conn, config : &TlsConfig, host : &Vec<u8>) -> Result<i32, Failure> {
+  /// Start TLS for the server `host`, and offer HTTP/2 with ALPN when `offer_h2`. A response
+  /// must not be half read.
+  pub fn start_tls(self : &mut Conn, config : &TlsConfig, host : &Vec<u8>, offer_h2 : bool)
+  -> Result<i32, Failure> {
     assert(self.start == self.end, "start_tls with bytes in the read buffer");
-    match self.stream.start_tls(config, host) {
+    match self.stream.start_tls(config, host, offer_h2) {
       Result<i32, TlsError>::Ok(_v) => {
         return Result<i32, Failure>::Ok(0);
       },

@@ -31,6 +31,7 @@ import curlvx::writeout;
 import disk;
 
 fn main(root : Root) -> i32 {
+  ignore_sigpipe();
   let args = args();
   match parse_args(&args) {
     Result<Config, Failure>::Ok(cfg) => {
@@ -67,7 +68,7 @@ fn print_version() -> void {
   append(&mut m, &curl_vx_version());
   push_lit(&mut m, " ");
   append(&mut m, &tls_library_version());
-  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: IPv6 Largefile SSL\n");
+  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: HTTP2 IPv6 Largefile SSL\n");
   let _ok = write_stdout(&m);
 }
 
@@ -121,6 +122,9 @@ fn print_help() -> void {
   push_lit(&mut m, "     --resolve <host:port:addr> Resolve the host+port to this address\n");
   push_lit(&mut m, "     --connect-to <HOST1:PORT1:HOST2:PORT2> Connect to host\n");
   push_lit(&mut m, " -0, --http1.0              Use HTTP 1.0\n");
+  push_lit(&mut m, "     --http1.1              Use HTTP/1.1\n");
+  push_lit(&mut m, "     --http2                Use HTTP/2 (the default over TLS)\n");
+  push_lit(&mut m, "     --http2-prior-knowledge Use HTTP/2 without HTTP/1.1 Upgrade\n");
   push_lit(&mut m, " -h, --help                 Get help for commands\n");
   push_lit(&mut m, " -V, --version              Show version number and quit\n");
   let _ok = write_stdout(&m);

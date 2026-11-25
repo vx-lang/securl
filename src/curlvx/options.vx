@@ -110,6 +110,10 @@ struct Config {
   cookie_jar : Vec<u8>,
   // `-j`: do not read session cookies from the files.
   junk_session_cookies : bool,
+  // `--http1.1` or `--http1.0`: no HTTP/2, which curl uses by default over TLS.
+  no_h2 : bool,
+  // `--http2-prior-knowledge`: HTTP/2 over plain TCP with no upgrade.
+  h2_prior_knowledge : bool,
 }
 
 /// A `Config` with curl's defaults.
@@ -179,7 +183,9 @@ pub fn default_config() -> Config {
     cookie_files : Vec<Vec<u8>>::new(),
     has_cookie_jar : false,
     cookie_jar : Vec<u8>::new(),
-    junk_session_cookies : false
+    junk_session_cookies : false,
+    no_h2 : false,
+    h2_prior_knowledge : false
   };
 }
 
@@ -251,6 +257,8 @@ const OPT_FORM_STRING : i32 = 65;
 const OPT_FORM_ESCAPE : i32 = 66;
 const OPT_COOKIE_JAR : i32 = 67;
 const OPT_JUNK_SESSION_COOKIES : i32 = 68;
+const OPT_HTTP2 : i32 = 69;
+const OPT_HTTP2_PRIOR_KNOWLEDGE : i32 = 70;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -324,6 +332,8 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "form-escape") { return OPT_FORM_ESCAPE; }
   if eq_lit(name, "cookie-jar") { return OPT_COOKIE_JAR; }
   if eq_lit(name, "junk-session-cookies") { return OPT_JUNK_SESSION_COOKIES; }
+  if eq_lit(name, "http2") { return OPT_HTTP2; }
+  if eq_lit(name, "http2-prior-knowledge") { return OPT_HTTP2_PRIOR_KNOWLEDGE; }
   if eq_lit(name, "cacert") { return OPT_CACERT; }
   if eq_lit(name, "capath") { return OPT_CAPATH; }
   return OPT_UNKNOWN;
@@ -621,10 +631,26 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
   }
   if id == OPT_HTTP10 {
     cfg.http10 = enable;
+    cfg.no_h2 = enable;
+    cfg.h2_prior_knowledge = false;
     return done();
   }
   if id == OPT_HTTP11 {
     cfg.http10 = false;
+    cfg.no_h2 = true;
+    cfg.h2_prior_knowledge = false;
+    return done();
+  }
+  if id == OPT_HTTP2 {
+    cfg.http10 = false;
+    cfg.no_h2 = false;
+    cfg.h2_prior_knowledge = false;
+    return done();
+  }
+  if id == OPT_HTTP2_PRIOR_KNOWLEDGE {
+    cfg.http10 = false;
+    cfg.no_h2 = false;
+    cfg.h2_prior_knowledge = true;
     return done();
   }
   if id == OPT_FAIL {
