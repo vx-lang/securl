@@ -168,6 +168,18 @@ The Vx project tracks these.
   instead. Binding the result first (`let t = url_text(&u); info.url_effective = t;`) also
   works.
 
+## License
+
+curl-vx uses curl's license (SPDX `curl`), an MIT-style license, as curl does. See `LICENSE`.
+It keeps curl's copyright notice, because curl-vx takes its help text, its messages and its
+behavior from curl.
+
+A curl-vx binary also holds code under other licenses:
+
+- OpenSSL, under the Apache License 2.0 (`third_party/openssl/LICENSE.txt`). By default the
+  Makefile links it statically, so a copy of the binary must come with that license.
+- The Vx runtime `libvx_std_core`, under the Apache License 2.0 with LLVM Exceptions.
+
 ## Layout
 
 ```
@@ -184,6 +196,7 @@ src/curlvx/          the protocol code; no trusted code
   output.vx            standard output or a file that main opened
   writeout.vx          -w
 third_party/openssl  OpenSSL 3.5.9 (LTS), a shallow git submodule
+LICENSE              curl's license, with the copyright of curl-vx and of curl
 tests/unit/          unit tests of the parsers
 tests/tls/           HTTPS tests against local servers, with test certificates
 tests/run-curl-tests.sh   runs curl's runtests.pl against build/curl-vx
