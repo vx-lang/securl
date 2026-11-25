@@ -1,17 +1,19 @@
-// A TCP connection with a read buffer, for reading a response line by line and then its body.
+// A connection with a read buffer, for reading a response line by line and then its body. The
+// connection is plain TCP, or TLS after `start_tls`.
 import core::option;
 import core::result;
 import std::net;
 import std::string;
 import std::vec;
 import sys::text;
+import sys::tls;
 import curlvx::bytes;
 import curlvx::failure;
 
 const READ_BUFFER_SIZE : i32 = 16384;
 
 struct Conn {
-  stream : TcpStream,
+  stream : NetStream,
   buffer : Vec<u8>,
   // The next byte of `buffer` to give.
   start : i32,
@@ -21,16 +23,9 @@ struct Conn {
   closed : bool,
 }
 
-/// The failure of a receive that did not work.
-fn recv_failure(e : NetError) -> Failure {
-  match e {
-    NetError::Reset() => {
-      return fail_lit(RECV_ERROR, "Recv failure: Connection reset by peer");
-    },
-    _ => {
-      return fail_lit(RECV_ERROR, "Recv failure");
-    }
-  }
+/// The failure of curl for a TLS or socket error.
+fn failure_of(e : TlsError) -> Failure {
+  return fail_with(e.code, e.message);
 }
 
 /// Connect to `address`, written as `host:port`. `host` and `port` are for the messages.
@@ -56,7 +51,7 @@ pub fn open_conn(network : &Network, address : &Vec<u8>, host : &Vec<u8>, port :
         i = i + 1;
       }
       return Result<Conn, Failure>::Ok(Conn {
-        stream : stream,
+        stream : NetStream::plain(stream),
         buffer : buffer,
         start : 0,
         end : 0,
@@ -90,12 +85,24 @@ impl Conn {
       return Result<i32, Failure>::Ok(0);
     }
     match self.stream.write_all(bytes) {
-      Result<u64, NetError>::Ok(_n) => {
+      Result<u64, TlsError>::Ok(_n) => {
         return Result<i32, Failure>::Ok(0);
       },
-      Result<u64, NetError>::Err(_e) => {
-        return Result<i32, Failure>::Err(fail_lit(SEND_ERROR,
-          "Send failure: Connection reset by peer"));
+      Result<u64, TlsError>::Err(e) => {
+        return Result<i32, Failure>::Err(failure_of(e));
+      }
+    }
+  }
+
+  /// Start TLS for the server `host`. A response must not be half read.
+  pub fn start_tls(self : &mut Conn, config : &TlsConfig, host : &Vec<u8>) -> Result<i32, Failure> {
+    assert(self.start == self.end, "start_tls with bytes in the read buffer");
+    match self.stream.start_tls(config, host) {
+      Result<i32, TlsError>::Ok(_v) => {
+        return Result<i32, Failure>::Ok(0);
+      },
+      Result<i32, TlsError>::Err(e) => {
+        return Result<i32, Failure>::Err(failure_of(e));
       }
     }
   }
@@ -106,7 +113,7 @@ impl Conn {
       return Result<bool, Failure>::Ok(false);
     }
     match self.stream.read(&mut self.buffer) {
-      Result<u64, NetError>::Ok(n) => {
+      Result<u64, TlsError>::Ok(n) => {
         if n == 0u64 {
           self.closed = true;
           return Result<bool, Failure>::Ok(false);
@@ -115,8 +122,8 @@ impl Conn {
         self.end = n as i32;
         return Result<bool, Failure>::Ok(true);
       },
-      Result<u64, NetError>::Err(e) => {
-        return Result<bool, Failure>::Err(recv_failure(e));
+      Result<u64, TlsError>::Err(e) => {
+        return Result<bool, Failure>::Err(failure_of(e));
       }
     }
   }

@@ -7,6 +7,7 @@ import core::result;
 import std::net;
 import std::vec;
 import sys::text;
+import sys::tls;
 import curlvx::bytes;
 import curlvx::conn;
 import curlvx::failure;
@@ -373,9 +374,10 @@ struct Hop {
 
 /// Send one request for `u` and read its response. The body of the response goes to
 /// `sinks`, unless curl follows the redirect that the response gives.
-fn one_hop(network : &Network, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
+fn one_hop(network : &Network, tls : &TlsConfig, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
 req_kind : i32, body : &Vec<u8>, creds : &Credentials, same_host : bool, has_referer : bool,
 referer : &Vec<u8>, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop, Failure> {
+  let secure = eq_lit(&u.scheme, "https");
   let mut method = lit("GET");
   if cfg.has_method {
     method = clone_bytes(&cfg.method);
@@ -425,7 +427,7 @@ referer : &Vec<u8>, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop,
     range : clone_bytes(&cfg.range),
     has_cookie : cfg.has_cookie,
     cookie : clone_bytes(&cfg.cookie),
-    via_proxy : proxy.used,
+    via_proxy : proxy.used && !secure,
     has_proxy_credentials : proxy.has_credentials,
     proxy_user : clone_bytes(&proxy.user),
     proxy_password : clone_bytes(&proxy.password),
@@ -454,6 +456,15 @@ referer : &Vec<u8>, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop,
     push_lit(&mut m, " port ");
     push_u64(&mut m, u.port as u64);
     verbose_info(&m);
+  }
+  if secure {
+    if proxy.used {
+      open_tunnel(&mut c, cfg, u, &proxy, info)?;
+    }
+    let _tls = c.start_tls(tls, &u.host)?;
+    if cfg.verbose {
+      verbose_info(&lit("TLS handshake done"));
+    }
   }
   let request = build_request(u, &req_info);
   if cfg.verbose {
@@ -716,6 +727,31 @@ fn has_port_in(text : &Vec<u8>) -> bool {
   return find_byte(&host_port, 58u8, close + 1) >= 0;
 }
 
+/// Ask the HTTP proxy for a tunnel to the host of `u` with CONNECT, for HTTPS through a proxy.
+fn open_tunnel(c : &mut Conn, cfg : &Config, u : &Url, proxy : &Proxy, info : &mut TransferInfo)
+-> Result<i32, Failure> {
+  let request = build_connect_request(u, proxy.has_credentials, &proxy.user, &proxy.password,
+    cfg.has_user_agent, &cfg.user_agent);
+  if cfg.verbose {
+    verbose_lines("> ", &request);
+  }
+  let _sent = c.send(&request)?;
+  let head = read_head(c, false, &mut info.size_header_total)?;
+  if cfg.verbose {
+    verbose_lines("< ", &head.raw);
+  }
+  if head.error_code != 0 {
+    return Result<i32, Failure>::Err(fail_with(head.error_code, clone_bytes(&head.error)));
+  }
+  if head.status / 100 != 2 {
+    let mut m = lit("CONNECT tunnel failed, response ");
+    push_u64(&mut m, head.status as u64);
+    return Result<i32, Failure>::Err(fail_with(RECV_ERROR, m));
+  }
+  // A 2xx reply to CONNECT has no body.
+  return Result<i32, Failure>::Ok(0);
+}
+
 /// The credentials of `-u user:password`, or else of the URL.
 fn credentials_of(cfg : &Config, u : &Url) -> Credentials {
   if cfg.has_user {
@@ -742,7 +778,7 @@ fn credentials_of(cfg : &Config, u : &Url) -> Credentials {
 
 /// Run the transfer of `url_text`. `body` is the request body for a POST or a PUT. `kind` is
 /// `REQ_GET`, `REQ_POST`, `REQ_PUT` or `REQ_HEAD`.
-pub fn run_transfer(network : &Network, cfg : &Config, headers : &Vec<Vec<u8>>,
+pub fn run_transfer(network : &Network, tls : &TlsConfig, cfg : &Config, headers : &Vec<Vec<u8>>,
 url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, sinks : &mut Sinks, info : &mut TransferInfo)
 -> Result<i32, Failure> {
   let first = parse_url(url_text, cfg.path_as_is)?;
@@ -760,7 +796,7 @@ url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, sinks : &mut Sinks, info : &mu
   loop {
     let u = parse_url(&current, path_as_is)?;
     info.url_effective = url_text(&u);
-    if !eq_lit(&u.scheme, "http") {
+    if !eq_lit(&u.scheme, "http") && !eq_lit(&u.scheme, "https") {
       let mut m = lit("Protocol \"");
       append(&mut m, &u.scheme);
       push_lit(&mut m, "\" not supported");
@@ -770,7 +806,7 @@ url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, sinks : &mut Sinks, info : &mu
     if redirects > 0 && !cfg.has_user && u.has_user {
       creds = credentials_of(cfg, &u);
     }
-    let hop = one_hop(network, cfg, headers, &u, req_kind, body, &creds, same_host, has_referer,
+    let hop = one_hop(network, tls, cfg, headers, &u, req_kind, body, &creds, same_host, has_referer,
       &referer, sinks, info)?;
     if !hop.follow {
       return Result<i32, Failure>::Ok(0);

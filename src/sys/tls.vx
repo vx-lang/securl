@@ -1,0 +1,501 @@
+// TLS through OpenSSL, and one stream type for plain TCP and TLS connections.
+//
+// TRUSTED CODE. Each OpenSSL call is an `extern` function. The rest of curl-vx sees only safe
+// functions: `TlsConfig::new`, `NetStream::plain`, `start_tls`, `read` and `write_all`.
+//
+// Rights. `TlsConfig::new` reads the certificates of the certificate authorities from files,
+// so it takes a `&Files`. `main` makes the `TlsConfig` and lends it to the transfer, which then
+// needs no file right. A TLS connection starts from a `TcpStream`, which needs the network
+// right.
+//
+// The sockets of `std::net` do not block: a read that has to wait parks the task. OpenSSL works
+// on the file descriptor of the socket, so it gives "want read" or "want write" when the socket
+// is not ready. Then this file waits with `poll` and tries again.
+import core::option;
+import core::ptr;
+import core::result;
+import std::fs;
+import std::net;
+import std::vec;
+import sys::text;
+
+extern "C" {
+  fn TLS_client_method() -> *mut i8;
+  fn SSL_CTX_new(method : *mut i8) -> *mut i8;
+  fn SSL_CTX_free(ctx : *mut i8) -> void;
+  fn SSL_CTX_set_options(ctx : *mut i8, options : u64) -> u64;
+  fn SSL_CTX_ctrl(ctx : *mut i8, cmd : i32, larg : i64, parg : *mut i8) -> i64;
+  fn SSL_CTX_set_verify(ctx : *mut i8, mode : i32, callback : *mut i8) -> void;
+  fn SSL_CTX_load_verify_file(ctx : *mut i8, file : *const i8) -> i32;
+  fn SSL_CTX_load_verify_dir(ctx : *mut i8, dir : *const i8) -> i32;
+  fn SSL_CTX_set_default_verify_paths(ctx : *mut i8) -> i32;
+  fn SSL_new(ctx : *mut i8) -> *mut i8;
+  fn SSL_free(ssl : *mut i8) -> void;
+  fn SSL_set_fd(ssl : *mut i8, fd : i32) -> i32;
+  fn SSL_ctrl(ssl : *mut i8, cmd : i32, larg : i64, parg : *const i8) -> i64;
+  fn SSL_set1_host(ssl : *mut i8, host : *const i8) -> i32;
+  fn SSL_get0_param(ssl : *mut i8) -> *mut i8;
+  fn X509_VERIFY_PARAM_set1_ip_asc(param : *mut i8, ip : *const i8) -> i32;
+  fn SSL_set_alpn_protos(ssl : *mut i8, protos : *const u8, len : u32) -> i32;
+  fn SSL_connect(ssl : *mut i8) -> i32;
+  fn SSL_read(ssl : *mut i8, buffer : *mut u8, len : i32) -> i32;
+  fn SSL_write(ssl : *mut i8, buffer : *const u8, len : i32) -> i32;
+  fn SSL_shutdown(ssl : *mut i8) -> i32;
+  fn SSL_get_error(ssl : *mut i8, ret : i32) -> i32;
+  fn SSL_get_verify_result(ssl : *mut i8) -> i64;
+  fn X509_verify_cert_error_string(code : i64) -> *const i8;
+  fn ERR_get_error() -> u64;
+  fn ERR_clear_error() -> void;
+  fn ERR_error_string_n(code : u64, buffer : *mut i8, len : u64) -> void;
+  // `fds` points at one `struct pollfd`: an `int` file descriptor, then the `short` events and
+  // the `short` events that happened. Two `i32` values hold it on a little-endian machine.
+  fn poll(fds : *mut i32, count : u64, timeout_ms : i32) -> i32;
+  fn OpenSSL_version(kind : i32) -> *const i8;
+}
+
+/// The TLS library and its version, such as `OpenSSL/3.5.9`, for `curl-vx --version`.
+pub fn tls_library_version() -> Vec<u8> {
+  // OpenSSL_version(0) gives text such as "OpenSSL 3.5.9 30 Sep 2025".
+  let text = bytes_of_c_string(unsafe { OpenSSL_version(0) });
+  let mut out = Vec<u8>::new();
+  let mut spaces = 0;
+  for b in text.iter() {
+    if *b == 32u8 {
+      spaces = spaces + 1;
+      if spaces == 1 {
+        out.push(47u8);
+      }
+    } else {
+      if spaces < 2 {
+        out.push(*b);
+      }
+    }
+  }
+  return out;
+}
+
+// Values from the OpenSSL headers.
+const SSL_OP_IGNORE_UNEXPECTED_EOF : u64 = 128u64;
+const SSL_CTRL_SET_MIN_PROTO_VERSION : i32 = 123;
+const SSL_CTRL_SET_TLSEXT_HOSTNAME : i32 = 55;
+const TLSEXT_NAMETYPE_HOST_NAME : i64 = 0i64;
+const TLS1_2_VERSION : i64 = 771i64;
+const SSL_VERIFY_NONE : i32 = 0;
+const SSL_VERIFY_PEER : i32 = 1;
+const SSL_ERROR_WANT_READ : i32 = 2;
+const SSL_ERROR_WANT_WRITE : i32 = 3;
+const SSL_ERROR_SYSCALL : i32 = 5;
+const SSL_ERROR_ZERO_RETURN : i32 = 6;
+const POLLIN : i32 = 1;
+const POLLOUT : i32 = 4;
+
+// The exit codes of curl for TLS errors.
+const CURLE_SEND_ERROR : i32 = 55;
+const CURLE_RECV_ERROR : i32 = 56;
+const CURLE_SSL_CONNECT_ERROR : i32 = 35;
+const CURLE_PEER_FAILED_VERIFICATION : i32 = 60;
+const CURLE_SSL_CACERT_BADFILE : i32 = 77;
+
+/// Why a TLS step did not work: curl's exit code for it, and its message.
+struct TlsError {
+  code : i32,
+  message : Vec<u8>,
+}
+
+fn tls_error(code : i32, message : Vec<u8>) -> TlsError {
+  return TlsError {
+    code : code,
+    message : message
+  };
+}
+
+/// A NUL-terminated copy of `bytes`, for OpenSSL. None when `bytes` holds a NUL byte.
+fn c_string(bytes : &Vec<u8>) -> Option<Vec<i8>> {
+  let mut out = Vec<i8>::new();
+  for b in bytes.iter() {
+    if *b == 0u8 {
+      return Option<Vec<i8>>::None();
+    }
+    out.push(*b as i8);
+  }
+  out.push(0i8);
+  return Option<Vec<i8>>::Some(out);
+}
+
+/// The bytes of a C string that OpenSSL owns.
+fn bytes_of_c_string(p : *const i8) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  if is_null(p) {
+    return out;
+  }
+  let mut i : i64 = 0i64;
+  loop {
+    let b = unsafe { p[i] } as u8;
+    if b == 0u8 {
+      return out;
+    }
+    out.push(b);
+    i = i + 1i64;
+  }
+}
+
+/// The text of the oldest error in the error queue of OpenSSL, and an empty queue.
+fn openssl_error_text() -> Vec<u8> {
+  let code = unsafe { ERR_get_error() };
+  unsafe { ERR_clear_error(); }
+  if code == 0u64 {
+    return Vec<u8>::new();
+  }
+  let mut buffer = unsafe { Vec<i8>::zeroed(256) };
+  unsafe { ERR_error_string_n(code, buffer.as_mut_ptr(), 256u64); }
+  return bytes_of_c_string(buffer.as_mut_ptr() as *const i8);
+}
+
+/// Wait until `fd` is ready for a read (`POLLIN`) or a write (`POLLOUT`).
+fn wait_for(fd : i32, events : i32) -> bool {
+  let mut pollfd = Vec<i32>::new();
+  pollfd.push(fd);
+  pollfd.push(events);
+  let n = unsafe { poll(pollfd.as_mut_ptr(), 1u64, -1) };
+  return n > 0;
+}
+
+/// The settings of TLS that all connections of a run share: the certificate authorities that
+/// curl-vx trusts, and whether it checks the certificate of the server at all.
+struct TlsConfig {
+  ctx : *mut i8,
+  verify : bool,
+  // The certificate authorities could not be loaded. A TLS connection that checks the server
+  // fails with this error.
+  has_ca_error : bool,
+  ca_error : Vec<u8>,
+
+  invariant true,
+}
+
+/// The files that hold the certificate authorities of common systems: Debian and Ubuntu,
+/// Fedora and RHEL, openSUSE, Alpine and macOS.
+fn known_ca_bundles() -> Vec<Vec<u8>> {
+  let mut out = Vec<Vec<u8>>::new();
+  out.push(lit("/etc/ssl/certs/ca-certificates.crt"));
+  out.push(lit("/etc/pki/tls/certs/ca-bundle.crt"));
+  out.push(lit("/etc/ssl/ca-bundle.pem"));
+  out.push(lit("/etc/ssl/cert.pem"));
+  out.push(lit("/usr/local/etc/openssl/cert.pem"));
+  return out;
+}
+
+impl TlsConfig {
+  /// The TLS settings for a run. `insecure` (`-k`) turns the check of the server off.
+  /// `ca_file` (`--cacert`) and `ca_dir` (`--capath`) name the certificate authorities to
+  /// trust. When both are empty, it uses the file of the system. Reading them needs the right
+  /// to open files.
+  pub fn new(_files : &Files, insecure : bool, ca_file : &Vec<u8>, ca_dir : &Vec<u8>)
+  -> Result<TlsConfig, TlsError> {
+    let ctx = unsafe { SSL_CTX_new(TLS_client_method()) };
+    if is_null(ctx as *const i8) {
+      return Result<TlsConfig, TlsError>::Err(tls_error(CURLE_SSL_CONNECT_ERROR,
+        lit("SSL: could not create a context")));
+    }
+    // Some servers close the connection without the TLS close message. curl reads that as the
+    // end of the body, as browsers do.
+    let _options = unsafe { SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF) };
+    let _min = unsafe {
+      SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, 0 as *mut i8)
+    };
+    let mut config = TlsConfig {
+      ctx : ctx,
+      verify : !insecure,
+      has_ca_error : false,
+      ca_error : Vec<u8>::new()
+    };
+    if insecure {
+      unsafe { SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, 0 as *mut i8); }
+      return Result<TlsConfig, TlsError>::Ok(config);
+    }
+    unsafe { SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, 0 as *mut i8); }
+    if ca_file.len() > 0 || ca_dir.len() > 0 {
+      if ca_file.len() > 0 && !load_ca_file(ctx, ca_file) {
+        config.has_ca_error = true;
+        config.ca_error = lit("error setting certificate file: ");
+        push_bytes(&mut config.ca_error, ca_file);
+      }
+      if ca_dir.len() > 0 && !load_ca_dir(ctx, ca_dir) {
+        config.has_ca_error = true;
+        config.ca_error = lit("error setting certificate path: ");
+        push_bytes(&mut config.ca_error, ca_dir);
+      }
+      return Result<TlsConfig, TlsError>::Ok(config);
+    }
+    // The paths that OpenSSL knows, and its variables SSL_CERT_FILE and SSL_CERT_DIR.
+    let _paths = unsafe { SSL_CTX_set_default_verify_paths(ctx) };
+    let mut loaded = false;
+    for bundle in known_ca_bundles().iter() {
+      if !loaded && load_ca_file(ctx, bundle) {
+        loaded = true;
+      }
+    }
+    unsafe { ERR_clear_error(); }
+    return Result<TlsConfig, TlsError>::Ok(config);
+  }
+}
+
+fn push_bytes(dst : &mut Vec<u8>, src : &Vec<u8>) -> void {
+  for b in src.iter() {
+    dst.push(*b);
+  }
+}
+
+fn load_ca_file(ctx : *mut i8, file : &Vec<u8>) -> bool {
+  match c_string(file) {
+    Option<Vec<i8>>::Some(c) => {
+      return unsafe { SSL_CTX_load_verify_file(ctx, c.as_mut_ptr() as *const i8) } == 1;
+    },
+    Option<Vec<i8>>::None() => {
+      return false;
+    }
+  }
+}
+
+fn load_ca_dir(ctx : *mut i8, dir : &Vec<u8>) -> bool {
+  match c_string(dir) {
+    Option<Vec<i8>>::Some(c) => {
+      return unsafe { SSL_CTX_load_verify_dir(ctx, c.as_mut_ptr() as *const i8) } == 1;
+    },
+    Option<Vec<i8>>::None() => {
+      return false;
+    }
+  }
+}
+
+impl Drop for TlsConfig {
+  fn drop(self : &mut TlsConfig) -> void {
+    unsafe { SSL_CTX_free(self.ctx); }
+  }
+}
+
+/// A connection to a server: plain TCP, or TLS over TCP. With TLS, OpenSSL reads and writes the
+/// socket of `tcp`. The `TcpStream` closes the socket when the stream drops.
+struct NetStream {
+  tcp : TcpStream,
+  // The OpenSSL connection, or null for plain TCP.
+  ssl : *mut i8,
+
+  invariant true,
+}
+
+/// Whether `host` is an IPv4 or IPv6 address, which TLS checks against the certificate as an
+/// address, and which gets no server name (SNI).
+fn is_ip_address(host : &Vec<u8>) -> bool {
+  let mut dots = 0;
+  let mut only_digits_and_dots = true;
+  for b in host.iter() {
+    if *b == 58u8 {
+      return true;
+    }
+    if *b == 46u8 {
+      dots = dots + 1;
+    } else {
+      if *b < 48u8 || *b > 57u8 {
+        only_digits_and_dots = false;
+      }
+    }
+  }
+  return only_digits_and_dots && dots == 3;
+}
+
+impl NetStream {
+  /// A plain TCP connection.
+  pub fn plain(tcp : TcpStream) -> NetStream {
+    return NetStream {
+      tcp : tcp,
+      ssl : unsafe { 0 as *mut i8 }
+    };
+  }
+
+  /// Start TLS on this plain connection, for the server `host`, with the settings of `config`.
+  /// It checks the certificate of the server against `host`, unless `config` says `-k`. A
+  /// tunnel through a proxy starts TLS after the proxy said yes to CONNECT.
+  pub fn start_tls(self : &mut NetStream, config : &TlsConfig, host : &Vec<u8>)
+  -> Result<i32, TlsError> {
+    assert(!self.is_tls(), "start_tls on a stream that uses TLS already");
+    if config.verify && config.has_ca_error {
+      return Result<i32, TlsError>::Err(tls_error(CURLE_SSL_CACERT_BADFILE,
+        clone_of(&config.ca_error)));
+    }
+    let mut name = Vec<i8>::new();
+    match c_string(host) {
+      Option<Vec<i8>>::Some(c) => {
+        name = c;
+      },
+      Option<Vec<i8>>::None() => {
+        return Result<i32, TlsError>::Err(tls_error(CURLE_SSL_CONNECT_ERROR,
+          lit("SSL: bad host name")));
+      }
+    }
+    let ssl = unsafe { SSL_new(config.ctx) };
+    if is_null(ssl as *const i8) {
+      return Result<i32, TlsError>::Err(tls_error(CURLE_SSL_CONNECT_ERROR,
+        lit("SSL: could not create a connection")));
+    }
+    // From here, the drop of the stream frees `ssl`.
+    self.ssl = ssl;
+    let fd = unsafe { vx_tcp_stream_fd(self.tcp.ptr) };
+    let _set = unsafe { SSL_set_fd(ssl, fd) };
+    let ip = is_ip_address(host);
+    if !ip {
+      let _sni = unsafe {
+        SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_HOST_NAME,
+          name.as_mut_ptr() as *const i8)
+      };
+    }
+    if config.verify {
+      if ip {
+        let _set_ip = unsafe {
+          X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), name.as_mut_ptr() as *const i8)
+        };
+      } else {
+        let _set_host = unsafe { SSL_set1_host(ssl, name.as_mut_ptr() as *const i8) };
+      }
+    }
+    // Offer HTTP/1.1 with ALPN, as curl does when it does not use HTTP/2.
+    let mut alpn = Vec<u8>::new();
+    alpn.push(8u8);
+    push_bytes(&mut alpn, &lit("http/1.1"));
+    let _alpn = unsafe { SSL_set_alpn_protos(ssl, alpn.as_mut_ptr() as *const u8, 9u32) };
+
+    loop {
+      let r = unsafe { SSL_connect(ssl) };
+      if r == 1 {
+        return Result<i32, TlsError>::Ok(0);
+      }
+      let e = unsafe { SSL_get_error(ssl, r) };
+      if e == SSL_ERROR_WANT_READ {
+        let _ready = wait_for(fd, POLLIN);
+        continue;
+      }
+      if e == SSL_ERROR_WANT_WRITE {
+        let _ready = wait_for(fd, POLLOUT);
+        continue;
+      }
+      let verify_result = unsafe { SSL_get_verify_result(ssl) };
+      if config.verify && verify_result != 0i64 {
+        unsafe { ERR_clear_error(); }
+        let mut m = lit("SSL certificate problem: ");
+        push_bytes(&mut m, &bytes_of_c_string(unsafe { X509_verify_cert_error_string(verify_result) }));
+        return Result<i32, TlsError>::Err(tls_error(CURLE_PEER_FAILED_VERIFICATION, m));
+      }
+      let mut m = lit("TLS connect error: ");
+      let detail = openssl_error_text();
+      if detail.len() > 0 {
+        push_bytes(&mut m, &detail);
+      } else {
+        push_bytes(&mut m, &lit("the connection closed during the handshake"));
+      }
+      return Result<i32, TlsError>::Err(tls_error(CURLE_SSL_CONNECT_ERROR, m));
+    }
+  }
+
+  /// Whether the stream uses TLS.
+  pub fn is_tls(self : &NetStream) -> bool {
+    return !is_null(self.ssl as *const i8);
+  }
+
+  /// Read up to `buffer.len()` bytes into `buffer` and give how many arrived. 0 means that the
+  /// server closed the connection.
+  pub fn read(self : &mut NetStream, buffer : &mut Vec<u8>) -> Result<u64, TlsError> {
+    if !self.is_tls() {
+      match self.tcp.read(buffer) {
+        Result<u64, NetError>::Ok(n) => {
+          return Result<u64, TlsError>::Ok(n);
+        },
+        Result<u64, NetError>::Err(_e) => {
+          return Result<u64, TlsError>::Err(tls_error(CURLE_RECV_ERROR,
+            lit("Recv failure: Connection reset by peer")));
+        }
+      }
+    }
+    let fd = unsafe { vx_tcp_stream_fd(self.tcp.ptr) };
+    loop {
+      let r = unsafe { SSL_read(self.ssl, buffer.as_mut_ptr(), buffer.len()) };
+      if r > 0 {
+        return Result<u64, TlsError>::Ok(r as u64);
+      }
+      let e = unsafe { SSL_get_error(self.ssl, r) };
+      if e == SSL_ERROR_WANT_READ {
+        let _ready = wait_for(fd, POLLIN);
+        continue;
+      }
+      if e == SSL_ERROR_WANT_WRITE {
+        let _ready = wait_for(fd, POLLOUT);
+        continue;
+      }
+      if e == SSL_ERROR_ZERO_RETURN {
+        return Result<u64, TlsError>::Ok(0u64);
+      }
+      let detail = openssl_error_text();
+      if e == SSL_ERROR_SYSCALL && detail.len() == 0 {
+        // The peer closed the socket with no TLS close message.
+        return Result<u64, TlsError>::Ok(0u64);
+      }
+      let mut m = lit("OpenSSL SSL_read: ");
+      push_bytes(&mut m, &detail);
+      return Result<u64, TlsError>::Err(tls_error(CURLE_RECV_ERROR, m));
+    }
+  }
+
+  /// Write all of `bytes`.
+  pub fn write_all(self : &mut NetStream, bytes : &Vec<u8>) -> Result<u64, TlsError> {
+    if !self.is_tls() {
+      match self.tcp.write_all(bytes) {
+        Result<u64, NetError>::Ok(n) => {
+          return Result<u64, TlsError>::Ok(n);
+        },
+        Result<u64, NetError>::Err(_e) => {
+          return Result<u64, TlsError>::Err(tls_error(CURLE_SEND_ERROR,
+            lit("Send failure: Connection reset by peer")));
+        }
+      }
+    }
+    let fd = unsafe { vx_tcp_stream_fd(self.tcp.ptr) };
+    let base = bytes.as_mut_ptr() as *const u8;
+    let mut done : i32 = 0;
+    while done < bytes.len() {
+      let r = unsafe { SSL_write(self.ssl, add(base, done as usize), bytes.len() - done) };
+      if r > 0 {
+        done = done + r;
+        continue;
+      }
+      let e = unsafe { SSL_get_error(self.ssl, r) };
+      if e == SSL_ERROR_WANT_READ {
+        let _ready = wait_for(fd, POLLIN);
+        continue;
+      }
+      if e == SSL_ERROR_WANT_WRITE {
+        let _ready = wait_for(fd, POLLOUT);
+        continue;
+      }
+      let mut m = lit("OpenSSL SSL_write: ");
+      push_bytes(&mut m, &openssl_error_text());
+      return Result<u64, TlsError>::Err(tls_error(CURLE_SEND_ERROR, m));
+    }
+    return Result<u64, TlsError>::Ok(bytes.len() as u64);
+  }
+}
+
+fn clone_of(src : &Vec<u8>) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  push_bytes(&mut out, src);
+  return out;
+}
+
+impl Drop for NetStream {
+  /// Send the TLS close message and free the OpenSSL connection. The `TcpStream` closes the
+  /// socket after this.
+  fn drop(self : &mut NetStream) -> void {
+    if self.is_tls() {
+      let _closed = unsafe { SSL_shutdown(self.ssl) };
+      unsafe { SSL_free(self.ssl); }
+    }
+  }
+}

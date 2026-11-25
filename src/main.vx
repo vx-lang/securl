@@ -14,6 +14,7 @@ import std::vec;
 import sys::console;
 import sys::env;
 import sys::text;
+import sys::tls;
 import curlvx::body;
 import curlvx::encode;
 import curlvx::bytes;
@@ -61,12 +62,52 @@ fn print_version() -> void {
   append(&mut m, &curl_vx_version());
   push_lit(&mut m, " (x86_64-pc-linux-gnu) libcurl-vx/");
   append(&mut m, &curl_vx_version());
-  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http\nFeatures: IPv6 Largefile\n");
+  push_lit(&mut m, " ");
+  append(&mut m, &tls_library_version());
+  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: IPv6 Largefile SSL\n");
   let _ok = write_stdout(&m);
 }
 
 fn print_help() -> void {
   let mut m = Vec<u8>::new();
+  push_lit(&mut m, "Usage: curl [options...] <url>\n");
+  push_lit(&mut m, "curl-vx: the curl tool for HTTP/1.1 and HTTPS, written in Vx. Options:\n");
+  push_lit(&mut m, " -d, --data <data>          HTTP POST data (--data-ascii, --data-raw, --data-binary)\n");
+  push_lit(&mut m, "     --data-urlencode <data> HTTP POST data, URL-encoded\n");
+  push_lit(&mut m, "     --json <data>          HTTP POST JSON\n");
+  push_lit(&mut m, " -f, --fail                 Fail fast with no output on HTTP errors\n");
+  push_lit(&mut m, "     --fail-with-body       Fail on HTTP errors but save the body\n");
+  push_lit(&mut m, " -G, --get                  Put the post data in the URL and use GET\n");
+  push_lit(&mut m, " -H, --header <header>      Pass a custom header to the server\n");
+  push_lit(&mut m, " -I, --head                 Show document info only\n");
+  push_lit(&mut m, " -i, --include              Include response headers in the output\n");
+  push_lit(&mut m, " -k, --insecure             Allow insecure server connections\n");
+  push_lit(&mut m, "     --cacert <file>        CA certificate to verify peer against\n");
+  push_lit(&mut m, "     --capath <dir>         CA directory to verify peer against\n");
+  push_lit(&mut m, " -L, --location             Follow redirects\n");
+  push_lit(&mut m, "     --max-redirs <num>     Maximum number of redirects allowed\n");
+  push_lit(&mut m, " -o, --output <file>        Write to file instead of stdout\n");
+  push_lit(&mut m, " -O, --remote-name          Write output to a file named as the remote file\n");
+  push_lit(&mut m, "     --output-dir <dir>     Directory to save files in\n");
+  push_lit(&mut m, " -D, --dump-header <file>   Write the received headers to <file>\n");
+  push_lit(&mut m, " -s, --silent               Silent mode\n");
+  push_lit(&mut m, " -S, --show-error           Show error even when -s is used\n");
+  push_lit(&mut m, " -T, --upload-file <file>   Transfer local FILE to destination\n");
+  push_lit(&mut m, " -u, --user <user:password> Server user and password\n");
+  push_lit(&mut m, " -A, --user-agent <name>    Send User-Agent <name> to server\n");
+  push_lit(&mut m, " -e, --referer <URL>        Referrer URL\n");
+  push_lit(&mut m, " -b, --cookie <data>        Send cookies from string\n");
+  push_lit(&mut m, " -r, --range <range>        Retrieve only the bytes within RANGE\n");
+  push_lit(&mut m, " -v, --verbose              Make the operation more talkative\n");
+  push_lit(&mut m, " -w, --write-out <format>   Use output FORMAT after completion\n");
+  push_lit(&mut m, " -X, --request <method>     Specify request method to use\n");
+  push_lit(&mut m, " -x, --proxy <proxy>        Use this HTTP proxy\n");
+  push_lit(&mut m, " -U, --proxy-user <u:p>     Proxy user and password\n");
+  push_lit(&mut m, "     --noproxy <hosts>      List of hosts which do not use a proxy\n");
+  push_lit(&mut m, "     --resolve <host:port:addr> Resolve the host+port to this address\n");
+  push_lit(&mut m, "     --connect-to <HOST1:PORT1:HOST2:PORT2> Connect to host\n");
+  push_lit(&mut m, " -0, --http1.0              Use HTTP 1.0\n");
+  push_lit(&mut m, " -h, --help                 Get help for commands\n");
   push_lit(&mut m, " -V, --version              Show version number and quit\n");
   let _ok = write_stdout(&m);
 }
@@ -235,6 +276,25 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
     }
   }
 
+  // The TLS settings read the certificate authorities from files, so `main` makes them with its
+  // file right. The transfers get them without that right.
+  match TlsConfig::new(files, cfg.insecure, &cfg.cacert, &cfg.capath) {
+    Result<TlsConfig, TlsError>::Ok(t) => {
+      return run_all(network, files, &t, cfg, &headers, &request_body, &upload_body, kind,
+        other_kind);
+    },
+    Result<TlsConfig, TlsError>::Err(e) => {
+      let f = fail_with(e.code, e.message);
+      report(cfg, &f);
+      return f.code;
+    }
+  }
+}
+
+/// Run the transfer of each URL, and give the exit code of the last one that failed.
+fn run_all(network : &Network, files : &Files, tls : &TlsConfig, cfg : &Config,
+headers : &Vec<Vec<u8>>, request_body : &Vec<u8>, upload_body : &Vec<u8>, kind : i32,
+other_kind : i32) -> i32 {
   let mut exit_code = 0;
   let mut i = 0;
   while i < cfg.urls.len() {
@@ -245,7 +305,7 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
       } else {
         url_text.push(63u8);
       }
-      append(&mut url_text, &request_body);
+      append(&mut url_text, request_body);
     }
     let mut this_kind = other_kind;
     if i == 0 {
@@ -260,11 +320,11 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
     let mut message = Vec<u8>::new();
     let mut result = Result<i32, Failure>::Ok(0);
     if this_kind == REQ_PUT {
-      result = transfer_one(network, files, cfg, &headers, &url_text, &upload_body, this_kind, i,
-        &mut info);
+      result = transfer_one(network, files, tls, cfg, headers, &url_text, upload_body, this_kind,
+        i, &mut info);
     } else {
-      result = transfer_one(network, files, cfg, &headers, &url_text, &request_body, this_kind, i,
-        &mut info);
+      result = transfer_one(network, files, tls, cfg, headers, &url_text, request_body, this_kind,
+        i, &mut info);
     }
     match result {
       Result<i32, Failure>::Ok(_v) => {},
@@ -321,7 +381,8 @@ fn write_pieces(files : &Files, pieces : &Vec<WriteOutPiece>) -> void {
   }
 }
 
-fn transfer_one(network : &Network, files : &Files, cfg : &Config, headers : &Vec<Vec<u8>>,
+fn transfer_one(network : &Network, files : &Files, tls : &TlsConfig, cfg : &Config,
+headers : &Vec<Vec<u8>>,
 url_text : &Vec<u8>, request_body : &Vec<u8>, kind : i32, index : i32, info : &mut TransferInfo)
 -> Result<i32, Failure> {
   let body_output = open_output(files, cfg, index, url_text)?;
@@ -331,5 +392,5 @@ url_text : &Vec<u8>, request_body : &Vec<u8>, kind : i32, index : i32, info : &m
     headers : header_output,
     has_headers : cfg.has_dump_header
   };
-  return run_transfer(network, cfg, headers, url_text, request_body, kind, &mut sinks, info);
+  return run_transfer(network, tls, cfg, headers, url_text, request_body, kind, &mut sinks, info);
 }

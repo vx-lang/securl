@@ -4,6 +4,7 @@
 #   make audit      list each use of trusted code (unsafe, extern) in the program
 #   make unit       run the unit tests in tests/unit
 #   make test       run curl's own test suite against build/curl-vx (see README.md)
+#   make test-supported   only the curl tests that use options curl-vx has
 #
 # curl-vx needs a vxc built from Vx main. Put the settings of your machine in config.mk, which
 # git ignores. For example:
@@ -45,10 +46,10 @@ LIBS = -L $(VX_LIBDIR) -lvx_std_core -Wl,-rpath,$(VX_LIBDIR)
 
 all: build/curl-vx
 
-build/curl-vx: $(SRCS)
+build/curl-vx: $(SRCS) $(TLS_DEPS)
 	@mkdir -p build
 	PATH="$(LLVM_BIN):$$PATH" $(VXC) $(PKGS) -c src/main.vx -o build/curl-vx.o
-	cc build/curl-vx.o $(LIBS) -o $@
+	cc build/curl-vx.o $(TLS_LIBS) $(LIBS) -o $@
 
 audit:
 	PATH="$(LLVM_BIN):$$PATH" $(VXC) $(PKGS) --audit src/main.vx
@@ -58,6 +59,10 @@ unit:
 
 test: build/curl-vx
 	./tests/run-curl-tests.sh $(CURL_SRC) $(TESTS)
+
+# The HTTP tests that use only options that curl-vx has (tests/scan-supported-tests.py).
+test-supported: build/curl-vx
+	./tests/run-curl-tests.sh $(CURL_SRC) $$(cat tests/supported-tests.txt)
 
 # OpenSSL builds once, out of its source tree, with only what a TLS client needs.
 $(OPENSSL_STAMP):
@@ -78,4 +83,4 @@ clean:
 distclean:
 	rm -rf build
 
-.PHONY: all audit unit test clean distclean openssl
+.PHONY: all audit unit test test-supported clean distclean openssl

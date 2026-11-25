@@ -83,6 +83,10 @@ struct Config {
   noproxy : Vec<u8>,
   has_output_dir : bool,
   output_dir : Vec<u8>,
+  // `-k`: do not check the certificate of the server.
+  insecure : bool,
+  cacert : Vec<u8>,
+  capath : Vec<u8>,
 }
 
 /// A `Config` with curl's defaults.
@@ -141,7 +145,10 @@ pub fn default_config() -> Config {
     proxy_user : Vec<u8>::new(),
     noproxy : Vec<u8>::new(),
     has_output_dir : false,
-    output_dir : Vec<u8>::new()
+    output_dir : Vec<u8>::new(),
+    insecure : false,
+    cacert : Vec<u8>::new(),
+    capath : Vec<u8>::new()
   };
 }
 
@@ -202,6 +209,9 @@ const OPT_NO_PROGRESS_METER : i32 = 52;
 const OPT_NO_BUFFER : i32 = 53;
 const OPT_RAW : i32 = 54;
 const OPT_COMPRESSED : i32 = 55;
+// Options with a value that came after the booleans.
+const OPT_CACERT : i32 = 60;
+const OPT_CAPATH : i32 = 61;
 
 /// The option of a long name such as `header`, without the leading `--`.
 fn long_option(name : &Vec<u8>) -> i32 {
@@ -261,6 +271,8 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "buffer") { return OPT_NO_BUFFER; }
   if eq_lit(name, "raw") { return OPT_RAW; }
   if eq_lit(name, "compressed") { return OPT_COMPRESSED; }
+  if eq_lit(name, "cacert") { return OPT_CACERT; }
+  if eq_lit(name, "capath") { return OPT_CAPATH; }
   return OPT_UNKNOWN;
 }
 
@@ -303,7 +315,7 @@ fn short_option(letter : u8) -> i32 {
 
 /// Whether the option takes a value.
 fn takes_value(id : i32) -> bool {
-  return id >= OPT_USER_AGENT && id <= OPT_OUTPUT_DIR;
+  return (id >= OPT_USER_AGENT && id <= OPT_OUTPUT_DIR) || id == OPT_CACERT || id == OPT_CAPATH;
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -517,6 +529,18 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     cfg.output_dir = clone_bytes(value);
     return done();
   }
+  if id == OPT_INSECURE {
+    cfg.insecure = enable;
+    return done();
+  }
+  if id == OPT_CACERT {
+    cfg.cacert = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_CAPATH {
+    cfg.capath = clone_bytes(value);
+    return done();
+  }
   if id == OPT_HTTP10 {
     cfg.http10 = enable;
     return done();
@@ -597,7 +621,7 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     }
     return done();
   }
-  // OPT_INSECURE matters only for HTTPS, which curl-vx does not have yet. OPT_DISABLE,
+  // OPT_DISABLE,
   // OPT_GLOBOFF, OPT_TRACE_TIME, OPT_PROGRESS_BAR, OPT_NO_PROGRESS_METER and OPT_NO_BUFFER
   // change nothing that curl-vx does.
   return Result<i32, Failure>::Ok(0);
