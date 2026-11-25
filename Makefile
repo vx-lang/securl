@@ -5,6 +5,7 @@
 #   make unit       run the unit tests in tests/unit
 #   make test       run curl's own test suite against build/curl-vx (see README.md)
 #   make test-supported   only the curl tests that use options curl-vx has
+#   make test-tls   the HTTPS tests against local servers (needs python3)
 #
 # curl-vx needs a vxc built from Vx main. Put the settings of your machine in config.mk, which
 # git ignores. For example:
@@ -60,6 +61,10 @@ unit:
 test: build/curl-vx
 	./tests/run-curl-tests.sh $(CURL_SRC) $(TESTS)
 
+# The TLS tests, against local servers with the test certificates in tests/tls/certs.
+test-tls: build/curl-vx
+	./tests/tls/run.sh
+
 # The HTTP tests that use only options that curl-vx has (tests/scan-supported-tests.py).
 test-supported: build/curl-vx
 	./tests/run-curl-tests.sh $(CURL_SRC) $$(cat tests/supported-tests.txt)
@@ -83,4 +88,4 @@ clean:
 distclean:
 	rm -rf build
 
-.PHONY: all audit unit test test-supported clean distclean openssl
+.PHONY: all audit unit test test-supported test-tls clean distclean openssl
