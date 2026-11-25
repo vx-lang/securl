@@ -20,6 +20,21 @@ VX_LIBDIR ?= $(HOME)/.vx/current/lib
 # vxc runs the LLVM tools, such as mlir-translate, from PATH.
 LLVM_BIN  ?= /usr/lib/llvm-22/bin
 CURL_SRC  ?= $(HOME)/curl-src
+JOBS      ?= 4
+
+# TLS comes from OpenSSL. By default the Makefile builds the OpenSSL of the submodule
+# third_party/openssl as static libraries. Set SYSTEM_OPENSSL = 1 in config.mk to link the
+# OpenSSL of the system instead.
+OPENSSL_SRC   = third_party/openssl
+OPENSSL_BUILD = build/openssl
+OPENSSL_STAMP = $(OPENSSL_BUILD)/.built
+ifeq ($(SYSTEM_OPENSSL),1)
+  TLS_DEPS =
+  TLS_LIBS = -lssl -lcrypto
+else
+  TLS_DEPS = $(OPENSSL_STAMP)
+  TLS_LIBS = $(OPENSSL_BUILD)/libssl.a $(OPENSSL_BUILD)/libcrypto.a -ldl -lpthread
+endif
 
 # `curlvx` may not hold trusted code: the compiler refuses any `unsafe`, `extern`, `mlir!`,
 # `extern impl` or `unsafe impl` in it. All trusted code lives in the small `sys` package.
@@ -44,7 +59,23 @@ unit:
 test: build/curl-vx
 	./tests/run-curl-tests.sh $(CURL_SRC) $(TESTS)
 
+# OpenSSL builds once, out of its source tree, with only what a TLS client needs.
+$(OPENSSL_STAMP):
+	@test -f $(OPENSSL_SRC)/Configure || \
+	  { echo "OpenSSL is missing. Run: git submodule update --init --depth 1"; exit 1; }
+	@mkdir -p $(OPENSSL_BUILD)
+	cd $(OPENSSL_BUILD) && perl $(CURDIR)/$(OPENSSL_SRC)/Configure \
+	  no-shared no-tests no-docs no-apps no-module no-dso no-engine > configure.log
+	$(MAKE) -C $(OPENSSL_BUILD) -j$(JOBS) build_libs > $(OPENSSL_BUILD)/build.log
+	@touch $@
+
+openssl: $(TLS_DEPS)
+
+# `clean` keeps the OpenSSL build, which takes minutes. `distclean` removes it too.
 clean:
+	rm -rf build/curl-vx build/curl-vx.o build/unit
+
+distclean:
 	rm -rf build
 
-.PHONY: all audit unit test clean
+.PHONY: all audit unit test clean distclean openssl
