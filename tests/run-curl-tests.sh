@@ -15,6 +15,18 @@ shift
 if [ $# -eq 0 ]; then
   set -- HTTP
 fi
+# The servers that tools/build-test-tools.sh builds into the virtualenv: nghttpx for the HTTP/2
+# tests and stunnel for the HTTPS tests. runtests.pl finds stunnel on PATH, and nghttpx in
+# $NGHTTPX.
+venv=$root/build/h2-venv
+if [ -x "$venv/bin/stunnel" ]; then
+  PATH="$venv/bin:$PATH"
+  export PATH
+fi
+if [ -x "$venv/bin/nghttpx" ] && [ -z "${NGHTTPX:-}" ]; then
+  NGHTTPX=$venv/bin/nghttpx
+  export NGHTTPX
+fi
 cd "$curl_src/build/tests"
 exec perl -I"$curl_src/tests" "$curl_src/tests/runtests.pl" -a -j8 \
   -c "$root/build/curl-vx" "$@"

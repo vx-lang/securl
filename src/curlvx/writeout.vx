@@ -37,6 +37,163 @@ fn push_three_digits(out : &mut Vec<u8>, code : i32) -> void {
 }
 
 /// The value of the `-w` variable `name`, or false when curl-vx does not know it.
+/// The length of the valid UTF-8 sequence at `i`, or 0 (curl's `utf8len`).
+fn utf8_length(s : &Vec<u8>, i : i32) -> i32 {
+  let b = s.get(i);
+  let mut n = 0;
+  let mut lo = 128u8;
+  let mut hi = 191u8;
+  if b >= 194u8 && b <= 223u8 {
+    n = 2;
+  }
+  if b >= 224u8 && b <= 239u8 {
+    n = 3;
+    if b == 224u8 {
+      lo = 160u8;
+    }
+    if b == 237u8 {
+      hi = 159u8;
+    }
+  }
+  if b >= 240u8 && b <= 244u8 {
+    n = 4;
+    if b == 240u8 {
+      lo = 144u8;
+    }
+    if b == 244u8 {
+      hi = 143u8;
+    }
+  }
+  if n == 0 || s.len() - i < n || s.get(i + 1) < lo || s.get(i + 1) > hi {
+    return 0;
+  }
+  let mut k = 2;
+  while k < n {
+    if s.get(i + k) < 128u8 || s.get(i + k) > 191u8 {
+      return 0;
+    }
+    k = k + 1;
+  }
+  return n;
+}
+
+/// `s` as a JSON string, in quotes, as curl writes it (`jsonWriteString`). With `lower`, the
+/// letters are in lower case.
+fn json_string(s : &Vec<u8>, lower : bool, out : &mut Vec<u8>) -> void {
+  let hex = lit("0123456789abcdef");
+  out.push(34u8);
+  let mut i = 0;
+  while i < s.len() {
+    let b = s.get(i);
+    let mut done = true;
+    if b == 92u8 {
+      push_lit(out, "\\\\");
+    } else {
+      if b == 34u8 {
+        push_lit(out, "\\\"");
+      } else {
+        if b == 8u8 {
+          push_lit(out, "\\b");
+        } else {
+          if b == 12u8 {
+            push_lit(out, "\\f");
+          } else {
+            if b == 10u8 {
+              push_lit(out, "\\n");
+            } else {
+              if b == 13u8 {
+                push_lit(out, "\\r");
+              } else {
+                if b == 9u8 {
+                  push_lit(out, "\\t");
+                } else {
+                  done = false;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if done {
+      i = i + 1;
+      continue;
+    }
+    if b >= 128u8 {
+      let n = utf8_length(s, i);
+      if n > 0 {
+        append_range(out, s, i, i + n);
+        i = i + n;
+        continue;
+      }
+    }
+    if b < 32u8 || b >= 128u8 {
+      push_lit(out, "\\u00");
+      out.push(hex.get((b / 16u8) as i32));
+      out.push(hex.get((b % 16u8) as i32));
+    } else {
+      if lower {
+        out.push(ascii_lower(b));
+      } else {
+        out.push(b);
+      }
+    }
+    i = i + 1;
+  }
+  out.push(34u8);
+}
+
+/// `%{header_json}`: the headers of the last response as a JSON object, each name in lower case
+/// with the list of its values, in the order of their first appearance.
+fn header_json(headers : &Vec<Vec<u8>>, out : &mut Vec<u8>) -> void {
+  out.push(123u8);
+  let mut first = true;
+  let mut i = 0;
+  while i < headers.len() {
+    let line = headers.get_ref(i);
+    let colon = find_byte(line, 58u8, 0);
+    if colon > 0 {
+      let name = range_of(line, 0, colon);
+      // Only the first header of a name writes the entry, with the values of all.
+      let mut seen = false;
+      let mut k = 0;
+      while k < i {
+        let other = headers.get_ref(k);
+        let oc = find_byte(other, 58u8, 0);
+        if oc > 0 && eq_nocase(&range_of(other, 0, oc), &name) {
+          seen = true;
+        }
+        k = k + 1;
+      }
+      if !seen {
+        if !first {
+          push_lit(out, ",\n");
+        }
+        first = false;
+        json_string(&name, true, out);
+        push_lit(out, ":[");
+        let mut values = 0;
+        let mut j = i;
+        while j < headers.len() {
+          let other = headers.get_ref(j);
+          let oc = find_byte(other, 58u8, 0);
+          if oc > 0 && eq_nocase(&range_of(other, 0, oc), &name) {
+            if values > 0 {
+              out.push(44u8);
+            }
+            json_string(&trim_blanks(&rest_from(other, oc + 1)), false, out);
+            values = values + 1;
+          }
+          j = j + 1;
+        }
+        out.push(93u8);
+      }
+    }
+    i = i + 1;
+  }
+  push_lit(out, "\n}");
+}
+
 fn variable(name : &Vec<u8>, info : &TransferInfo, ctx : &WriteOutContext, out : &mut Vec<u8>)
 -> bool {
   if eq_lit(name, "http_code") || eq_lit(name, "response_code") {
@@ -81,6 +238,10 @@ fn variable(name : &Vec<u8>, info : &TransferInfo, ctx : &WriteOutContext, out :
   }
   if eq_lit(name, "referer") {
     append(out, &info.referer);
+    return true;
+  }
+  if eq_lit(name, "header_json") {
+    header_json(&info.headers, out);
     return true;
   }
   if eq_lit(name, "method") {

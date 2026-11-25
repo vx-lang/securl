@@ -1070,6 +1070,7 @@ form_boundary : &Vec<u8>, jar : &mut CookieJar, sinks : &mut Sinks, info : &mut 
   // A server that asks for new credentials again and again does not keep curl-vx forever.
   let mut auth_rounds = 0;
   let first_port = first.port;
+  let first_scheme = clone_bytes(&first.scheme);
   let first_host = first.host;
   // The URL of the current request, as text. Each turn of the loop parses it again, so that no
   // value of one turn outlives the turn.
@@ -1088,7 +1089,10 @@ form_boundary : &Vec<u8>, jar : &mut CookieJar, sinks : &mut Sinks, info : &mut 
       push_lit(&mut m, "\" not supported");
       return Result<i32, Failure>::Err(fail_with(UNSUPPORTED_PROTOCOL, m));
     }
-    let same_host = eq_nocase(&u.host, &first_host) && u.port == first_port;
+    // Credentials go after a redirect only to the same host, port and scheme, as in libcurl's
+    // Curl_auth_allowed_to_host.
+    let same_host = eq_nocase(&u.host, &first_host) && u.port == first_port
+      && eq_nocase(&u.scheme, &first_scheme);
     if redirects > 0 && !cfg.has_user && u.has_user {
       creds = credentials_of(cfg, &u);
     }

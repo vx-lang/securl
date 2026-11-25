@@ -53,15 +53,15 @@ Vx main d3ed6cf0b.
 
 | Test set | Passed |
 |---|---|
-| All tests with the keyword `HTTP` that runtests.pl runs for curl-vx | 511 of 855 (60%) |
-| The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 452 of 522 (87%) |
+| All tests with the keyword `HTTP` that runtests.pl runs for curl-vx | 522 of 874 (60%) |
+| The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 452 of 523 (86%) |
 | TLS and time-limit tests against local servers (`tests/tls`) | 18 of 18 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 23 of 23 |
 | Unit tests (`tests/unit`) | 6 of 6 |
 
-runtests.pl skips 14 HTTPS tests here, because they need `stunnel`. The C build of the test
-suite has OpenSSL, so that runtests.pl runs 61 more tests, most of them Digest tests (see "Run
-curl's test suite"). Before Digest, curl-vx passed 409 of those 855.
+The C build of the test suite has OpenSSL, so that runtests.pl runs 61 more tests, most of them
+Digest tests (see "Run curl's test suite"). Before Digest, curl-vx passed 409 of those 855.
+`stunnel` and `nghttpx` let runtests.pl run its HTTPS and HTTP/2 tests too.
 
 `vxc --audit` (`make audit`) lists the trusted code of the program:
 
@@ -130,9 +130,10 @@ is in `src/curlvx/`, with no trusted code; only the ALPN choice comes from OpenS
   into HTTP/2 fields, so authentication, cookies and `-H` work the same on both versions. The
   response head looks like curl's: `HTTP/2 200 ` and the header names in lower case.
 
-curl's own HTTP/2 tests need `nghttpx`, so `tests/h2` tests against a server built on the `h2`
-package of python-hyper instead, an independent implementation. curl-vx also fetches real
-sites over HTTP/2, such as Cloudflare's 1.3 MB home page.
+curl's own HTTP/2 tests run through `nghttpx` (see "Run curl's test suite"). `tests/h2` tests
+more of the protocol against a server built on the `h2` package of python-hyper, an independent
+implementation. curl-vx also fetches real sites over HTTP/2, such as Cloudflare's 1.3 MB home
+page.
 
 ## Authentication
 
@@ -174,12 +175,19 @@ cmake -B build -DCURL_ENABLE_SSL=ON -DCURL_USE_OPENSSL=ON -DOPENSSL_USE_STATIC_L
   -DUSE_NGHTTP2=OFF -DCURL_USE_LIBSSH2=OFF -DCURL_DISABLE_LDAP=ON -DBUILD_TESTING=ON
 cmake --build build -j8 && cmake --build build --target testdeps -j8
 cd ~/curl-vx
+tools/build-test-tools.sh                  # optional: nghttpx and stunnel, see below
 make test CURL_SRC=~/curl-src              # every HTTP test
 make test-supported CURL_SRC=~/curl-src    # the tests in tests/supported-tests.txt
 ```
 
+runtests.pl runs its HTTP/2 tests through `nghttpx` and its HTTPS tests through `stunnel`.
+pip cannot install either, so `tools/build-test-tools.sh` builds them from source (with
+`libev` and `c-ares` for `nghttpx`) into the virtualenv `build/h2-venv`, against the OpenSSL of
+the submodule. It checks each download against a SHA-256, and puts nothing into the system.
+`tests/run-curl-tests.sh` finds them there.
+
 `curl-vx --version` says `Protocols: http https`, so runtests.pl skips the tests of other
-protocols and of features such as cookie files or compression.
+protocols and of features such as compression.
 `tests/scan-supported-tests.py` lists the tests that use only options curl-vx has, and the
 missing options that block the most tests.
 
@@ -191,7 +199,8 @@ missing options that block the most tests.
 `--form-escape` `-D` `-e` (with `;auto`) `-f` `--fail-with-body` `-G` `-H` (with the `name:` and
 `name;` forms) `-I` `-i` `-k` `--cacert` `--capath` `-L` `--location-trusted` `--max-redirs`
 `-o` `-O` `--remote-name-all` `--output-dir` `-r` `-s` `-S` `-T` `-u` `--digest` `--basic`
-`--anyauth` `-v` `-w` (most variables, `%header{}`, `%output{}`, `%{stderr}`) `-X` `-x` `-U`
+`--anyauth` `-v` `-w` (most variables, `%header{}`, `%{header_json}`, `%output{}`, `%{stderr}`)
+`-X` `-x` `-U`
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
 `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
 `--connect-timeout` `-h` `-V`, and the options that
