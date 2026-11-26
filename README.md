@@ -11,17 +11,20 @@ The goal is to show what Vx's type system buys a network tool:
   chunked decoding, redirects and proxies. The package `cli` holds the tool around it, and
   `disk` its files. They are compiled with `--no-trusted-code`, so any `unsafe`, `extern`,
   `mlir!`, `extern impl` or `unsafe impl` in them is a compile error. All trusted code is in
-  `sys`. `src/main.vx`, the one file outside a package, only hands `Root` to `cli`.
-- **Capabilities.** Only `main` gets the rights of the program (`fn main(root : Root)`), and it
-  hands them to `cli::tool_main`. That gives the network right (`&Network`) to the transfer and
+  `sys`. `src/main.vx`, the one file outside a package, only hands `Root` and the command
+  line to `cli`.
+- **Capabilities.** Only `main` gets the rights of the program (`fn main(root : Root, args :
+  Vec<String>)`), and it hands them to `cli::tool_main`. That gives the network right (`&Network`) to the transfer and
   keeps the file right (`&Files`) for itself. It also loads the certificate authorities for TLS,
   because that reads files, and lends the result to the transfer. With the environment right
   (`&Environment`) it reads the proxy variables, such as `https_proxy`, and gives the transfer
-  their values, not the right. The parsers get no right, so
-  a bug in a parser cannot open a file or a socket: the compiler checks that the protocol code
-  has no other way to the disk or the network. It can still use standard input, output and
-  error, through `sys::console`, with no right. A right for them in `Root` would close that
-  gap, but that is a change in Vx's `std`.
+  their values, not the right. The rights to write to standard output and error go into a
+  `securl::output::Console`, which the transfer gets for the response body and for `-v`, and
+  only the code that reads `-d @-` or `-T -` gets the right to read standard input. The
+  parsers get no right, so a bug in a parser cannot open a file or a socket, or even write to
+  the terminal: the compiler checks that the protocol code has no other way to the disk, the
+  network or the terminal. The form parser of `-F` gives its warnings back as text, and the
+  tool prints them.
 
 ## Get it
 
@@ -88,12 +91,12 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 11,558 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 922 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 11,576 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 964 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 13 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
-| `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,499 | 52 `extern` functions, 103 `unsafe` blocks |
+| `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,451 | 52 `extern` functions, 100 `unsafe` blocks |
 
-Of the trusted code in `src/sys/`, 132 of the 155 items are the OpenSSL bindings: TLS (with the
+Of the trusted code in `src/sys/`, 132 of the 152 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
 `hash.vx`.
 Two safe functions of `sys` read through a raw pointer with no check, `lit` and `push_lit`,
@@ -341,9 +344,9 @@ The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #
   to write a `Vec<u8>` to standard output, to copy the bytes of a string literal, or to read an
   environment variable. Vx main has since added `String::to_bytes` (#4122), the command line
   as a parameter of `main` (#4123), and rights to standard input and output (#4130). securl
-  uses the first two, so it reads its command line and the environment with no trusted code.
-  `src/sys/console.vx` still writes to standard output, and `src/sys/text.vx` still copies
-  string literals.
+  uses all three, so it reads its command line, the environment and standard input, and
+  writes to the terminal, with no trusted code. `src/sys/text.vx` still copies string
+  literals.
 - [#4001](https://github.com/vx-lang/Vx/issues/4001) The flat code generator declines `?` on a
   `Result` of a struct with an `Option` field, so securl compiles through the older AST path.
 - [#4002](https://github.com/vx-lang/Vx/issues/4002), [#4003](https://github.com/vx-lang/Vx/issues/4003),

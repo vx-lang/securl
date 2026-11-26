@@ -1,28 +1,8 @@
-// Standard output, standard error and standard input as byte lists.
+// The handling of SIGPIPE.
 //
-// TRUSTED CODE. `std::io` writes and reads through raw pointers, so each call needs `unsafe`.
-import core::ptr;
-import std::io;
-import std::vec;
-
-/// Write all bytes of `bytes` to standard output (`fd` 1) or standard error (`fd` 2). Gives false
-/// when it is closed.
-fn write_all_fd(fd : i32, bytes : &Vec<u8>) -> bool {
-  let len = bytes.len() as u64;
-  let base = bytes.as_mut_ptr() as *const u8;
-  let mut done : u64 = 0;
-  while done < len {
-    let at = add(base, done as usize);
-    let n = unsafe {
-      if fd == 1 { stdout_write(at, len - done) } else { stderr_write(at, len - done) }
-    };
-    if n == 0u64 {
-      return false;
-    }
-    done = done + n;
-  }
-  return true;
-}
+// TRUSTED CODE. `std` cannot ignore a signal yet, so this file calls `signal` of the C library.
+// Writes to standard output and standard error, and reads of standard input, need the rights
+// of `std::io` that `main` gets in its `Root`, and are in `securl::output` and `disk::files`.
 
 extern "C" {
   fn signal(signum : i32, handler : u64) -> u64;
@@ -33,32 +13,4 @@ extern "C" {
 pub fn ignore_sigpipe() -> void {
   // SIGPIPE is 13 and SIG_IGN is 1 on Linux and on macOS.
   let _old = unsafe { signal(13, 1u64) };
-}
-
-/// Write all bytes of `bytes` to standard output. Gives false when the output is closed.
-pub fn write_stdout(bytes : &Vec<u8>) -> bool {
-  return write_all_fd(1, bytes);
-}
-
-/// Write all bytes of `bytes` to standard error. Gives false when the output is closed.
-pub fn write_stderr(bytes : &Vec<u8>) -> bool {
-  return write_all_fd(2, bytes);
-}
-
-/// Read all of standard input, until its end.
-pub fn read_stdin() -> Vec<u8> {
-  let mut out = Vec<u8>::new();
-  let mut chunk = unsafe { Vec<u8>::zeroed(4096) };
-  loop {
-    let n = unsafe { stdin_read(chunk.as_mut_ptr(), 4096u64) };
-    if n == 0 {
-      break;
-    }
-    let mut i = 0;
-    while i < (n as i32) {
-      out.push(chunk.get(i));
-      i = i + 1;
-    }
-  }
-  return out;
 }

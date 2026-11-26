@@ -8,7 +8,6 @@
 import core::option;
 import core::result;
 import std::vec;
-import sys::console;
 import sys::text;
 import securl::bytes;
 import securl::failure;
@@ -50,7 +49,7 @@ fn is_end(b : u8, comma : bool) -> bool {
 
 /// The word at `at` (curl's `get_param_word`). A quoted word may hold `\"` and `\\`. A word
 /// ends at a `;`, or at a `,` when `comma`.
-fn param_word(s : &Vec<u8>, at : i32, comma : bool) -> Word {
+fn param_word(s : &Vec<u8>, at : i32, comma : bool, warnings : &mut Vec<u8>) -> Word {
   if at < s.len() && s.get(at) == 34u8 {
     let mut value = Vec<u8>::new();
     let mut i = at + 1;
@@ -71,7 +70,7 @@ fn param_word(s : &Vec<u8>, at : i32, comma : bool) -> Word {
           i = i + 1;
         }
         if trailing {
-          warn_lit("Trailing data after quoted form parameter");
+          warn_lit(warnings, "Trailing data after quoted form parameter");
         }
         return Word {
           value : value,
@@ -122,11 +121,11 @@ fn byte_at(s : &Vec<u8>, i : i32) -> u8 {
   return 0u8;
 }
 
-fn warn_lit(message : *const i8) -> void {
-  let mut m = lit("Warning: ");
-  push_lit(&mut m, message);
-  push_lit(&mut m, "\n");
-  let _w = write_stderr(&m);
+/// Add the warning `message` to `warnings`, which the caller writes to standard error.
+fn warn_lit(warnings : &mut Vec<u8>, message : *const i8) -> void {
+  push_lit(warnings, "Warning: ");
+  push_lit(warnings, message);
+  push_lit(warnings, "\n");
 }
 
 /// The bytes that end a content type after `type=`.
@@ -153,9 +152,9 @@ struct PartParams {
 /// Read the data word at `at` and its parameters (curl's `get_param_part`). After `type=`,
 /// a parameter that curl does not know is part of the content type, as in
 /// `type=text/html;charset=utf-8`.
-fn param_part(s : &Vec<u8>, at : i32, comma : bool) -> PartParams {
+fn param_part(s : &Vec<u8>, at : i32, comma : bool, warnings : &mut Vec<u8>) -> PartParams {
   let mut i = skip_blanks(s, at);
-  let w = param_word(s, i, comma);
+  let w = param_word(s, i, comma, warnings);
   let mut p = PartParams {
     data : word_value(&w),
     has_type : false,
@@ -205,7 +204,7 @@ fn param_part(s : &Vec<u8>, at : i32, comma : bool) -> PartParams {
         j = j + 1;
       }
       j = skip_blanks(s, j);
-      let v = param_word(s, j, comma);
+      let v = param_word(s, j, comma, warnings);
       if is_filename {
         p.has_filename = true;
         p.filename = word_value(&v);
@@ -232,12 +231,11 @@ fn param_part(s : &Vec<u8>, at : i32, comma : bool) -> PartParams {
       handled = true;
     }
     if !handled {
-      let v = param_word(s, i, comma);
+      let v = param_word(s, i, comma, warnings);
       if v.value.len() > 0 {
-        let mut m = lit("Warning: skip unknown form field: ");
-        append(&mut m, &v.value);
-        push_lit(&mut m, "\n");
-        let _w = write_stderr(&m);
+        push_lit(warnings, "Warning: skip unknown form field: ");
+        append(warnings, &v.value);
+        push_lit(warnings, "\n");
       }
       i = v.next;
     }
@@ -260,11 +258,13 @@ fn base_name(path : &Vec<u8>) -> Vec<u8> {
   return rest_from(path, slash + 1);
 }
 
-/// Read one `-F` value (`literal` for `--form-string`, which takes the value as it is).
-pub fn parse_form(input : &Vec<u8>, literal : bool) -> Result<FormPart, Failure> {
+/// Read one `-F` value (`literal` for `--form-string`, which takes the value as it is). The
+/// warnings that curl prints go to `warnings`.
+pub fn parse_form(input : &Vec<u8>, literal : bool, warnings : &mut Vec<u8>)
+-> Result<FormPart, Failure> {
   let eq = find_byte(input, 61u8, 0);
   if eq < 0 {
-    warn_lit("Illegally formatted input field");
+    warn_lit(warnings, "Illegally formatted input field");
     return Result<FormPart, Failure>::Err(bad_form());
   }
   let mut part = FormPart {
@@ -287,7 +287,7 @@ pub fn parse_form(input : &Vec<u8>, literal : bool) -> Result<FormPart, Failure>
   }
   if first == 40u8 || (!part.has_name && eq_lit(&rest_from(input, eq + 1), ")")) {
     // Nested multipart parts with `(` and `)`.
-    warn_lit("securl does not support nested multipart forms yet");
+    warn_lit(warnings, "securl does not support nested multipart forms yet");
     return Result<FormPart, Failure>::Err(bad_form());
   }
   let mut start = eq + 1;
@@ -301,13 +301,13 @@ pub fn parse_form(input : &Vec<u8>, literal : bool) -> Result<FormPart, Failure>
     part.kind = FORM_FILE_TEXT;
     start = start + 1;
   }
-  let p = param_part(input, start, comma);
+  let p = param_part(input, start, comma, warnings);
   if p.unsupported {
-    warn_lit("securl does not support headers=@file and encoder= in a form yet");
+    warn_lit(warnings, "securl does not support headers=@file and encoder= in a form yet");
     return Result<FormPart, Failure>::Err(bad_form());
   }
   if p.sep == 44u8 {
-    warn_lit("securl does not support more than one file in a form field yet");
+    warn_lit(warnings, "securl does not support more than one file in a form field yet");
     return Result<FormPart, Failure>::Err(bad_form());
   }
   part.data = p.data;
@@ -316,10 +316,9 @@ pub fn parse_form(input : &Vec<u8>, literal : bool) -> Result<FormPart, Failure>
   part.headers = p.headers;
   if part.kind == FORM_FILE_TEXT {
     if p.has_filename {
-      let mut m = lit("Warning: Field filename not allowed here: ");
-      append(&mut m, &p.filename);
-      push_lit(&mut m, "\n");
-      let _w = write_stderr(&m);
+      push_lit(warnings, "Warning: Field filename not allowed here: ");
+      append(warnings, &p.filename);
+      push_lit(warnings, "\n");
     }
   } else {
     part.has_filename = p.has_filename;

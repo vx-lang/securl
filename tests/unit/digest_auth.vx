@@ -1,7 +1,8 @@
 // Checks the Digest messages of securl::auth against the examples of RFC 2617 and RFC 7616,
 // and how it reads challenges.
+import core::result;
+import std::string;
 import std::vec;
-import sys::console;
 import sys::text;
 import securl::auth;
 import securl::bytes;
@@ -24,7 +25,12 @@ fn expect(got : &Vec<u8>, want : *const i8) -> void {
     push_lit(&mut m, "\nwant: ");
     append(&mut m, &lit(want));
     push_lit(&mut m, "\n");
-    let _w = write_stderr(&m);
+    match String::from_utf8(&m) {
+      Result<String, Utf8Error>::Ok(text) => {
+        eprintln!("{}", text);
+      },
+      Result<String, Utf8Error>::Err(_e) => {}
+    }
     panic("a Digest message is wrong");
   }
 }

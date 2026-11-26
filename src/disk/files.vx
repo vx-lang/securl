@@ -3,9 +3,9 @@
 import core::option;
 import core::result;
 import std::fs;
+import std::io;
 import std::string;
 import std::vec;
-import sys::console;
 import sys::text;
 import securl::bytes;
 import securl::failure;
@@ -44,12 +44,40 @@ pub fn file_exists(files : &Files, name : &Vec<u8>) -> bool {
   }
 }
 
-/// All bytes of the file `name`. `-` means standard input.
-pub fn read_file(files : &Files, name : &Vec<u8>) -> Result<Vec<u8>, Failure> {
+/// All bytes of the file `name`. `-` means standard input, which `stdin` gives the right to
+/// read.
+pub fn read_file(files : &Files, stdin : &mut Stdin, name : &Vec<u8>) -> Result<Vec<u8>, Failure> {
   if eq_lit(name, "-") {
-    return Result<Vec<u8>, Failure>::Ok(read_stdin());
+    return Result<Vec<u8>, Failure>::Ok(read_stdin(stdin));
   }
   return read_path(files, name);
+}
+
+/// All of standard input, until its end. A read error ends it too, as for curl.
+fn read_stdin(stdin : &mut Stdin) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  let mut chunk = Vec<u8>::with_capacity(16384);
+  while chunk.len() < 16384 {
+    chunk.push(0u8);
+  }
+  loop {
+    match stdin.read(&mut chunk) {
+      Result<u64, StdioError>::Ok(n) => {
+        if n == 0u64 {
+          break;
+        }
+        let mut i = 0;
+        while i < (n as i32) {
+          out.push(chunk.get(i));
+          i = i + 1;
+        }
+      },
+      Result<u64, StdioError>::Err(_e) => {
+        break;
+      }
+    }
+  }
+  return out;
 }
 
 /// All bytes of the file `name`, where `-` is a file too.

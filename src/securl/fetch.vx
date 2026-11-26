@@ -117,13 +117,14 @@ struct Sinks {
 /// Write the header lines `raw` to the output when `to_body` (`-i`), and to the file of `-D`.
 /// When both get them, curl writes each line to the one and then to the other, which shows
 /// when both are standard output.
-fn write_head(sinks : &mut Sinks, to_body : bool, raw : &Vec<u8>) -> Result<i32, Failure> {
+fn write_head(console : &mut Console, sinks : &mut Sinks, to_body : bool, raw : &Vec<u8>)
+-> Result<i32, Failure> {
   if !to_body || !sinks.has_headers {
     if to_body {
-      let _w = sinks.body.write(raw)?;
+      let _w = sinks.body.write(console, raw)?;
     }
     if sinks.has_headers {
-      let _w = sinks.headers.write(raw)?;
+      let _w = sinks.headers.write(console, raw)?;
     }
     return Result<i32, Failure>::Ok(0);
   }
@@ -134,15 +135,15 @@ fn write_head(sinks : &mut Sinks, to_body : bool, raw : &Vec<u8>) -> Result<i32,
       end = raw.len() - 1;
     }
     let line = range_of(raw, start, end + 1);
-    let _b = sinks.body.write(&line)?;
-    let _h = sinks.headers.write(&line)?;
+    let _b = sinks.body.write(console, &line)?;
+    let _h = sinks.headers.write(console, &line)?;
     start = end + 1;
   }
   return Result<i32, Failure>::Ok(0);
 }
 
 /// Write `bytes` to standard error with `prefix` before each line, for `-v`.
-fn verbose_lines(prefix : *const i8, bytes : &Vec<u8>) -> void {
+fn verbose_lines(console : &mut Console, prefix : *const i8, bytes : &Vec<u8>) -> void {
   let mut out = Vec<u8>::new();
   let mut start = 0;
   while start < bytes.len() {
@@ -154,7 +155,7 @@ fn verbose_lines(prefix : *const i8, bytes : &Vec<u8>) -> void {
     append_range(&mut out, bytes, start, end + 1);
     start = end + 1;
   }
-  to_stderr(&out);
+  console.to_stderr(&out);
 }
 
 /// The request as `-v` shows it. Over HTTP/2, curl ends the request line with `HTTP/2`, so
@@ -171,11 +172,11 @@ fn shown_request(request : &Vec<u8>, h2 : bool) -> Vec<u8> {
   return out;
 }
 
-fn verbose_info(text : &Vec<u8>) -> void {
+fn verbose_info(console : &mut Console, text : &Vec<u8>) -> void {
   let mut out = lit("* ");
   append(&mut out, text);
   push_lit(&mut out, "\n");
-  to_stderr(&out);
+  console.to_stderr(&out);
 }
 
 /// `host:port` with brackets around an IPv6 address.
@@ -438,7 +439,8 @@ fn read_head(c : &mut Conn, raw : bool, tr_encoding : bool, total : &mut i64)
 }
 
 /// Copy exactly `length` body bytes to `out`.
-fn read_length(c : &mut Conn, length : i64, out : &mut Output, info : &mut TransferInfo)
+fn read_length(c : &mut Conn, length : i64, out : &mut Output, console : &mut Console,
+info : &mut TransferInfo)
 -> Result<i32, Failure> {
   let mut left = length;
   while left > 0i64 {
@@ -451,13 +453,13 @@ fn read_length(c : &mut Conn, length : i64, out : &mut Output, info : &mut Trans
     }
     left = left - (part.len() as i64);
     info.size_download = info.size_download + (part.len() as i64);
-    let _w = out.write(&part)?;
+    let _w = out.write(console, &part)?;
   }
   return Result<i32, Failure>::Ok(0);
 }
 
 /// Copy the body bytes to `out` until the peer closes the connection.
-fn read_to_close(c : &mut Conn, out : &mut Output, info : &mut TransferInfo)
+fn read_to_close(c : &mut Conn, out : &mut Output, console : &mut Console, info : &mut TransferInfo)
 -> Result<i32, Failure> {
   loop {
     let part = c.read_some(1048576i64)?;
@@ -465,7 +467,7 @@ fn read_to_close(c : &mut Conn, out : &mut Output, info : &mut TransferInfo)
       return Result<i32, Failure>::Ok(0);
     }
     info.size_download = info.size_download + (part.len() as i64);
-    let _w = out.write(&part)?;
+    let _w = out.write(console, &part)?;
   }
 }
 
@@ -475,8 +477,8 @@ fn bad_chunk() -> Failure {
 
 /// Decode a chunked body and copy its data to `out`. The trailer headers go to `trailers`.
 /// With `raw` (`--raw`), the chunk lines go to `out` as they arrived.
-fn read_chunked(c : &mut Conn, out : &mut Output, info : &mut TransferInfo, trailers : &mut Vec<u8>,
-raw : bool) -> Result<i32, Failure> {
+fn read_chunked(c : &mut Conn, out : &mut Output, console : &mut Console, info : &mut TransferInfo,
+trailers : &mut Vec<u8>, raw : bool) -> Result<i32, Failure> {
   loop {
     let mut line = Vec<u8>::new();
     let n = c.read_line(&mut line, MAX_HEADER_LINE, RECV_ERROR,
@@ -486,7 +488,7 @@ raw : bool) -> Result<i32, Failure> {
         "transfer closed with outstanding read data remaining"));
     }
     if raw {
-      let _w = out.write(&line)?;
+      let _w = out.write(console, &line)?;
     }
     let mut size : i64 = 0i64;
     let mut digits = 0;
@@ -521,7 +523,7 @@ raw : bool) -> Result<i32, Failure> {
           return Result<i32, Failure>::Err(fail_with(RECV_ERROR, m));
         }
         if raw {
-          let _w = out.write(&t)?;
+          let _w = out.write(console, &t)?;
         }
         if got == 0 || eq_lit(&t, "\r\n") || eq_lit(&t, "\n") {
           return Result<i32, Failure>::Ok(0);
@@ -531,12 +533,12 @@ raw : bool) -> Result<i32, Failure> {
         }
       }
     }
-    let _copied = read_length(c, size, out, info)?;
+    let _copied = read_length(c, size, out, console, info)?;
     // The data of a chunk ends with CRLF, as curl requires. Any other byte there is an error.
     let mut end = Vec<u8>::new();
     let got = c.read_line(&mut end, 2, RECV_ERROR, "Malformed encoding found in chunked-encoding")?;
     if raw {
-      let _w = out.write(&end)?;
+      let _w = out.write(console, &end)?;
     }
     if got == 0 {
       return Result<i32, Failure>::Err(fail_lit(PARTIAL_FILE,
@@ -571,7 +573,8 @@ struct Hop {
 fn one_hop(network : &Network, tls : &TlsSettings, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
 req_kind : i32, body : &Vec<u8>, creds : &Credentials, same_host : bool, has_referer : bool,
 referer : &Vec<u8>, deadline : Instant, form_boundary : &Vec<u8>, auth : &mut AuthContext,
-session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop, Failure> {
+session : &mut Session, console : &mut Console, sinks : &mut Sinks, info : &mut TransferInfo)
+-> Result<Hop, Failure> {
   let secure = eq_lit(&u.scheme, "https");
   let mut method = lit("GET");
   if cfg.has_method {
@@ -592,7 +595,7 @@ session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<
   if has_referer {
     info.referer = clone_bytes(referer);
   }
-  let proxy = proxy_for(cfg, u)?;
+  let proxy = proxy_for(console, cfg, u)?;
   let sends_body = req_kind == REQ_POST || req_kind == REQ_PUT;
   // A `-H "Transfer-Encoding: chunked"` header, or an upload from standard input, whose
   // length curl does not know, sends the body in chunks.
@@ -685,7 +688,7 @@ session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<
   let connect_deadline = earliest(deadline,
     deadline_after(Duration::from_millis(connect_limit_ms(cfg) as u64)));
   let mut c = connected(connect_phase(network, tls, cfg, u, &proxy, &address, secure,
-    connect_deadline, info, sinks), &connect_started)?;
+    connect_deadline, info, console, sinks), &connect_started)?;
   c.set_deadline(deadline);
   if cfg.limit_rate > 0i64 {
     c.limit_rate(cfg.limit_rate);
@@ -701,7 +704,7 @@ session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<
   let request = build_request(u, &req_info);
   if cfg.verbose {
     let shown = shown_request(&request, use_h2);
-    verbose_lines("> ", &shown);
+    verbose_lines(console, "> ", &shown);
   }
   info.size_request = info.size_request + (request.len() as i64);
   // `%{size_upload}` is the body of this request. Chunks count with their framing, as in curl.
@@ -732,23 +735,23 @@ session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<
     &mut info.size_header_total)?;
   let mut set_cookies = take_cookies(&mut session.jar, &head, &cookie_host, &cookie_path,
     secure_context, 0);
-  take_hsts(cfg, &mut session.hsts, &head, u, secure);
+  take_hsts(console, cfg, &mut session.hsts, &head, u, secure);
   while head.error_code == 0 && head.status >= 100 && head.status < 200 && head.status != 101 {
     info.size_header = info.size_header + (head.raw.len() as i64);
     if cfg.verbose {
-      verbose_lines("< ", &head.raw);
+      verbose_lines(console, "< ", &head.raw);
     }
-    let _w = write_head(sinks, cfg.include, &head.raw)?;
+    let _w = write_head(console, sinks, cfg.include, &head.raw)?;
     head = next_head(&mut c, &mut h2, use_h2, cfg.raw, cfg.tr_encoding,
       &mut info.size_header_total)?;
     set_cookies = take_cookies(&mut session.jar, &head, &cookie_host, &cookie_path,
       secure_context, set_cookies);
-    take_hsts(cfg, &mut session.hsts, &head, u, secure);
+    take_hsts(console, cfg, &mut session.hsts, &head, u, secure);
   }
   if head.error_code != 0 {
     // curl writes the headers before the bad one, and stops.
     if cfg.include || cfg.head {
-      let _w = sinks.body.write(&head.raw)?;
+      let _w = sinks.body.write(console, &head.raw)?;
     }
     return Result<Hop, Failure>::Err(fail_with(head.error_code, clone_bytes(&head.error)));
   }
@@ -771,7 +774,7 @@ session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<
     info.expected_size = head.content_length;
   }
   if cfg.verbose {
-    verbose_lines("< ", &head.raw);
+    verbose_lines(console, "< ", &head.raw);
   }
 
   // The challenges of a 401, and whether to send the request again with credentials.
@@ -813,7 +816,7 @@ session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<
     return Result<Hop, Failure>::Err(http_error(head.status));
   }
 
-  let _w = write_head(sinks, cfg.include || cfg.head, &head.raw)?;
+  let _w = write_head(console, sinks, cfg.include || cfg.head, &head.raw)?;
 
   // The body of a redirect that curl follows goes nowhere.
   let mut trailers = Vec<u8>::new();
@@ -826,8 +829,8 @@ session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<
   if !has_no_body(head.status, req_kind) && !skip_body {
     if again {
       let mut discard = null_output();
-      let _b = body_of(&mut c, &mut h2, use_h2, &head, cfg.raw, &mut discard, info,
-        &mut trailers)?;
+      let _b = body_of(&mut c, &mut h2, use_h2, &head, cfg.raw, &mut discard, console,
+        info, &mut trailers)?;
     } else {
       // `--compressed` decodes the body as its Content-Encoding says.
       let mut encodings = Vec<u8>::new();
@@ -835,13 +838,13 @@ session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<
         encodings = content_encodings(&head);
       }
       let _stack = sinks.body.start_body(&head.transfer_codings, &encodings)?;
-      let _b = body_of(&mut c, &mut h2, use_h2, &head, cfg.raw, &mut sinks.body, info,
-        &mut trailers)?;
+      let _b = body_of(&mut c, &mut h2, use_h2, &head, cfg.raw, &mut sinks.body,
+        console, info, &mut trailers)?;
       info.size_delivered = info.size_delivered + sinks.body.finish_body()?;
     }
   }
   if trailers.len() > 0 {
-    let _w = write_head(sinks, cfg.include, &trailers)?;
+    let _w = write_head(console, sinks, cfg.include, &trailers)?;
   }
   if failed {
     return Result<Hop, Failure>::Err(http_error(head.status));
@@ -852,7 +855,7 @@ session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<
     push_lit(&mut m, ":");
     push_u64(&mut m, u.port as u64);
     push_lit(&mut m, " left intact");
-    verbose_info(&m);
+    verbose_info(console, &m);
   }
   return Result<Hop, Failure>::Ok(Hop {
     retry : retry,
@@ -933,8 +936,8 @@ secure : bool, count : i32) -> i32 {
 
 /// Give each `Strict-Transport-Security` header of `head` to the HSTS cache, when the response
 /// came over HTTPS. libcurl skips a header that it cannot read, and says so with `-v`.
-fn take_hsts(cfg : &Config, hsts : &mut Hsts, head : &ResponseHead, u : &Url, secure : bool)
--> void {
+fn take_hsts(console : &mut Console, cfg : &Config, hsts : &mut Hsts, head : &ResponseHead, u : &Url,
+secure : bool) -> void {
   if !hsts.enabled || !secure {
     return;
   }
@@ -942,7 +945,7 @@ fn take_hsts(cfg : &Config, hsts : &mut Hsts, head : &ResponseHead, u : &Url, se
     if starts_lit_nocase(line, "Strict-Transport-Security:") {
       let value = rest_from(line, 26);
       if !hsts_header(hsts, &u.host, &value) && cfg.verbose {
-        verbose_info(&lit("Illegal STS header skipped"));
+        verbose_info(console, &lit("Illegal STS header skipped"));
       }
     }
   }
@@ -950,7 +953,7 @@ fn take_hsts(cfg : &Config, hsts : &mut Hsts, head : &ResponseHead, u : &Url, se
 
 /// `u` over HTTPS when the HSTS cache says that its host must be reached that way, as
 /// libcurl's `hsts_upgrade`. A port that the URL gives stays.
-fn hsts_upgrade(cfg : &Config, hsts : &mut Hsts, u : Url) -> Url {
+fn hsts_upgrade(console : &mut Console, cfg : &Config, hsts : &mut Hsts, u : Url) -> Url {
   if !eq_lit(&u.scheme, "http") || !hsts_applies(hsts, &u.host) {
     return u;
   }
@@ -962,7 +965,7 @@ fn hsts_upgrade(cfg : &Config, hsts : &mut Hsts, u : Url) -> Url {
   if cfg.verbose {
     let mut m = lit("Switched from HTTP to HTTPS due to HSTS => ");
     append(&mut m, &url_text(&up));
-    verbose_info(&m);
+    verbose_info(console, &m);
   }
   return up;
 }
@@ -1029,12 +1032,12 @@ fn earliest(a : Instant, b : Instant) -> Instant {
 /// gives up at `deadline`.
 fn connect_phase(network : &Network, tls : &TlsSettings, cfg : &Config, u : &Url, proxy : &Proxy,
 address : &Vec<u8>, secure : bool, deadline : Instant, info : &mut TransferInfo,
-sinks : &mut Sinks) -> Result<Conn, Failure> {
+console : &mut Console, sinks : &mut Sinks) -> Result<Conn, Failure> {
   if cfg.verbose {
     let mut m = lit("  Trying ");
     append(&mut m, address);
     push_lit(&mut m, "...");
-    verbose_info(&m);
+    verbose_info(console, &m);
   }
   let mut c = open_conn(network, address, &u.host, u.port, deadline, &socket_options(cfg))?;
   info.num_connects = info.num_connects + 1;
@@ -1044,7 +1047,7 @@ sinks : &mut Sinks) -> Result<Conn, Failure> {
     append(&mut m, &host_text(u));
     push_lit(&mut m, " port ");
     push_u64(&mut m, u.port as u64);
-    verbose_info(&m);
+    verbose_info(console, &m);
   }
   // An HTTPS proxy speaks TLS, with ALPN for HTTP/1.1 only, as curl does without
   // `--proxy-http2`.
@@ -1052,7 +1055,7 @@ sinks : &mut Sinks) -> Result<Conn, Failure> {
     let _proxy_tls = c.start_tls(&tls.proxy, &proxy.url.host,
       host_is_address(&proxy.url.host, proxy.url.ipv6), false)?;
     if cfg.verbose {
-      verbose_info(&lit("TLS handshake with the proxy done"));
+      verbose_info(console, &lit("TLS handshake with the proxy done"));
     }
   }
   // A SOCKS proxy connects to the server. HTTPS through an HTTP proxy goes through a CONNECT
@@ -1062,14 +1065,14 @@ sinks : &mut Sinks) -> Result<Conn, Failure> {
     let _socks = socks_connect(&mut c, &request)?;
   }
   if proxy.used && !is_socks(proxy.kind) && (secure || cfg.proxytunnel) {
-    open_tunnel(&mut c, cfg, u, proxy, info, sinks)?;
+    open_tunnel(&mut c, cfg, u, proxy, info, console, sinks)?;
   }
   if secure {
     // curl offers HTTP/2 over TLS unless `--http1.1` or `--http1.0` says no.
     let _tls = c.start_tls(&tls.server, &u.host, host_is_address(&u.host, u.ipv6),
       !cfg.no_h2 && !cfg.http10)?;
     if cfg.verbose {
-      verbose_info(&lit("TLS handshake done"));
+      verbose_info(console, &lit("TLS handshake done"));
     }
   }
   return Result<Conn, Failure>::Ok(c);
@@ -1176,7 +1179,8 @@ fn no_proxy_for(list : &Vec<u8>, host : &Vec<u8>) -> bool {
 
 /// The first of the proxy variables `a` and `b` that is set, or an empty list. With `-v` it says
 /// which one, as libcurl does. `b` may be empty, for no second variable.
-fn proxy_env_value(cfg : &Config, a : *const i8, b : *const i8) -> Vec<u8> {
+fn proxy_env_value(console : &mut Console, cfg : &Config, a : *const i8, b : *const i8)
+-> Vec<u8> {
   let mut k = 0;
   while k < 2 {
     let mut name = lit(a);
@@ -1191,7 +1195,7 @@ fn proxy_env_value(cfg : &Config, a : *const i8, b : *const i8) -> Vec<u8> {
           push_lit(&mut m, " == '");
           append(&mut m, &var.value);
           push_lit(&mut m, "'");
-          verbose_info(&m);
+          verbose_info(console, &m);
         }
         return clone_bytes(&var.value);
       }
@@ -1205,7 +1209,7 @@ fn proxy_env_value(cfg : &Config, a : *const i8, b : *const i8) -> Vec<u8> {
 /// `--noproxy`, or else `no_proxy` or `NO_PROXY`, names the hosts that go direct. Then `-x`,
 /// where an empty value means no proxy. Then the variables: `https_proxy` or `HTTPS_PROXY`
 /// for HTTPS, `http_proxy` for HTTP, and last `all_proxy` or `ALL_PROXY`.
-fn proxy_for(cfg : &Config, u : &Url) -> Result<Proxy, Failure> {
+fn proxy_for(console : &mut Console, cfg : &Config, u : &Url) -> Result<Proxy, Failure> {
   let none = Proxy {
     used : false,
     kind : PROXY_HTTP,
@@ -1216,7 +1220,7 @@ fn proxy_for(cfg : &Config, u : &Url) -> Result<Proxy, Failure> {
   };
   let mut noproxy = clone_bytes(&cfg.noproxy);
   if !cfg.has_noproxy {
-    noproxy = proxy_env_value(cfg, "no_proxy", "NO_PROXY");
+    noproxy = proxy_env_value(console, cfg, "no_proxy", "NO_PROXY");
   }
   if no_proxy_for(&noproxy, &u.host) {
     return Result<Proxy, Failure>::Ok(none);
@@ -1224,12 +1228,12 @@ fn proxy_for(cfg : &Config, u : &Url) -> Result<Proxy, Failure> {
   let mut given = clone_bytes(&cfg.proxy);
   if !cfg.proxy_set {
     if eq_lit(&u.scheme, "https") {
-      given = proxy_env_value(cfg, "https_proxy", "HTTPS_PROXY");
+      given = proxy_env_value(console, cfg, "https_proxy", "HTTPS_PROXY");
     } else {
-      given = proxy_env_value(cfg, "http_proxy", "");
+      given = proxy_env_value(console, cfg, "http_proxy", "");
     }
     if given.len() == 0 {
-      given = proxy_env_value(cfg, "all_proxy", "ALL_PROXY");
+      given = proxy_env_value(console, cfg, "all_proxy", "ALL_PROXY");
     }
   }
   if given.len() == 0 {
@@ -1306,16 +1310,16 @@ fn has_port_in(text : &Vec<u8>) -> bool {
 /// and for `-p`. The head of the reply goes to the output with `-i` and to the file of `-D`, as
 /// in curl, unless `--suppress-connect-headers`.
 fn open_tunnel(c : &mut Conn, cfg : &Config, u : &Url, proxy : &Proxy, info : &mut TransferInfo,
-sinks : &mut Sinks) -> Result<i32, Failure> {
+console : &mut Console, sinks : &mut Sinks) -> Result<i32, Failure> {
   let request = build_connect_request(u, proxy.has_credentials, &proxy.user, &proxy.password,
     cfg.has_user_agent, &cfg.user_agent);
   if cfg.verbose {
-    verbose_lines("> ", &request);
+    verbose_lines(console, "> ", &request);
   }
   let _sent = c.send(&request)?;
   let head = read_head(c, false, false, &mut info.size_header_total)?;
   if cfg.verbose {
-    verbose_lines("< ", &head.raw);
+    verbose_lines(console, "< ", &head.raw);
   }
   if head.error_code != 0 {
     return Result<i32, Failure>::Err(fail_with(head.error_code, clone_bytes(&head.error)));
@@ -1323,7 +1327,7 @@ sinks : &mut Sinks) -> Result<i32, Failure> {
   info.size_header = info.size_header + (head.raw.len() as i64);
   info.http_connect = head.status;
   if !cfg.suppress_connect_headers {
-    let _w = write_head(sinks, cfg.include, &head.raw)?;
+    let _w = write_head(console, sinks, cfg.include, &head.raw)?;
   }
   if head.status == 407 {
     // libcurl reads the body of a 407 before it gives up, so that the connection could take
@@ -1333,17 +1337,17 @@ sinks : &mut Sinks) -> Result<i32, Failure> {
     let mut trailers = Vec<u8>::new();
     if head.chunked {
       if cfg.verbose {
-        verbose_info(&lit("Ignore chunked response-body"));
+        verbose_info(console, &lit("Ignore chunked response-body"));
       }
-      let _b = read_chunked(c, &mut discard, &mut scratch, &mut trailers, false)?;
+      let _b = read_chunked(c, &mut discard, console, &mut scratch, &mut trailers, false)?;
     } else if head.content_length > 0i64 && !head.has_transfer_encoding {
       if cfg.verbose {
         let mut m = lit("Ignore ");
         push_i64(&mut m, head.content_length);
         push_lit(&mut m, " bytes of response-body");
-        verbose_info(&m);
+        verbose_info(console, &m);
       }
-      let _b = read_length(c, head.content_length, &mut discard, &mut scratch)?;
+      let _b = read_length(c, head.content_length, &mut discard, console, &mut scratch)?;
     }
   }
   if head.status / 100 != 2 {
@@ -1384,14 +1388,14 @@ fn credentials_of(cfg : &Config, u : &Url) -> Credentials {
 /// included, has that time limit.
 pub fn run_transfer(network : &Network, tls : &TlsSettings, cfg : &Config, headers : &Vec<Vec<u8>>,
 url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>, session : &mut Session,
-sinks : &mut Sinks, info : &mut TransferInfo) -> Result<i32, Failure> {
+console : &mut Console, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<i32, Failure> {
   let started = Instant::now();
   let mut deadline = Instant::never();
   if cfg.max_time_ms > 0i64 {
     deadline = deadline_after(Duration::from_millis(cfg.max_time_ms as u64));
   }
   match follow_redirects(network, tls, cfg, headers, url_text, body, kind, deadline, form_boundary,
-    session, sinks, info) {
+    session, console, sinks, info) {
     Result<i32, Failure>::Ok(n) => {
       return Result<i32, Failure>::Ok(n);
     },
@@ -1422,10 +1426,10 @@ fn timeout_message(f : Failure, started : &Instant, info : &TransferInfo) -> Fai
 /// The transfer of `url_text`, and of each redirect that it follows, until `deadline`.
 fn follow_redirects(network : &Network, tls : &TlsSettings, cfg : &Config,
 headers : &Vec<Vec<u8>>, url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, deadline : Instant,
-form_boundary : &Vec<u8>, session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo)
--> Result<i32, Failure> {
+form_boundary : &Vec<u8>, session : &mut Session, console : &mut Console, sinks : &mut Sinks,
+info : &mut TransferInfo) -> Result<i32, Failure> {
   let parsed = parse_url(url_text, cfg.path_as_is)?;
-  let first = hsts_upgrade(cfg, &mut session.hsts, parsed);
+  let first = hsts_upgrade(console, cfg, &mut session.hsts, parsed);
   let mut creds = credentials_of(cfg, &first);
   let mut auth = new_auth_context(cfg.auth_type, cfg.proxy_auth_type);
   // A server that asks for new credentials again and again does not keep securl forever.
@@ -1454,7 +1458,8 @@ form_boundary : &Vec<u8>, session : &mut Session, sinks : &mut Sinks, info : &mu
       creds = credentials_of(cfg, &u);
     }
     let hop = one_hop(network, tls, cfg, headers, &u, req_kind, body, &creds, same_host, has_referer,
-      &referer, deadline, form_boundary, &mut auth, session, sinks, info)?;
+      &referer, deadline, form_boundary, &mut auth, session, console, sinks,
+      info)?;
     if hop.retry && auth_rounds < MAX_AUTH_ROUNDS {
       auth_rounds = auth_rounds + 1;
       continue;
@@ -1475,7 +1480,7 @@ form_boundary : &Vec<u8>, session : &mut Session, sinks : &mut Sinks, info : &mu
       let mut m = lit("Issue another request to this URL: '");
       append(&mut m, &next_text);
       push_lit(&mut m, "'");
-      verbose_info(&m);
+      verbose_info(console, &m);
     }
     // 301, 302 and 303 turn a POST into a GET, as browsers do. 303 turns a PUT into a GET too.
     // 307 and 308 keep the method and the body.
@@ -1490,7 +1495,7 @@ form_boundary : &Vec<u8>, session : &mut Session, sinks : &mut Sinks, info : &mu
       has_referer = true;
       referer = url_text(&u);
     }
-    u = hsts_upgrade(cfg, &mut session.hsts, next);
+    u = hsts_upgrade(console, cfg, &mut session.hsts, next);
     info.num_redirects = redirects;
   }
 }
@@ -1508,9 +1513,10 @@ total : &mut i64)
 /// Copy the body of the response to `out`, over HTTP/2 or HTTP/1. The trailers go to
 /// `trailers`.
 fn body_of(c : &mut Conn, h2 : &mut H2, use_h2 : bool, head : &ResponseHead, raw : bool,
-out : &mut Output, info : &mut TransferInfo, trailers : &mut Vec<u8>) -> Result<i32, Failure> {
+out : &mut Output, console : &mut Console, info : &mut TransferInfo, trailers : &mut Vec<u8>)
+-> Result<i32, Failure> {
   if !use_h2 {
-    return read_body(c, head, raw, out, info, trailers);
+    return read_body(c, head, raw, out, console, info, trailers);
   }
   loop {
     let part = h2_next_data(h2, c)?;
@@ -1519,19 +1525,19 @@ out : &mut Output, info : &mut TransferInfo, trailers : &mut Vec<u8>) -> Result<
       return Result<i32, Failure>::Ok(0);
     }
     info.size_download = info.size_download + (part.len() as i64);
-    let _w = out.write(&part)?;
+    let _w = out.write(console, &part)?;
   }
 }
 
 fn read_body(c : &mut Conn, head : &ResponseHead, raw : bool, out : &mut Output,
-info : &mut TransferInfo, trailers : &mut Vec<u8>) -> Result<i32, Failure> {
+console : &mut Console, info : &mut TransferInfo, trailers : &mut Vec<u8>) -> Result<i32, Failure> {
   if head.chunked {
-    return read_chunked(c, out, info, trailers, raw);
+    return read_chunked(c, out, console, info, trailers, raw);
   }
   if head.content_length >= 0i64 && !head.has_transfer_encoding {
-    return read_length(c, head.content_length, out, info);
+    return read_length(c, head.content_length, out, console, info);
   }
-  return read_to_close(c, out, info);
+  return read_to_close(c, out, console, info);
 }
 
 /// The values of the Content-Encoding headers of `head`, joined with commas.

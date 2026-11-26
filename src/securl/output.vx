@@ -1,12 +1,13 @@
 // Where the bytes of a response go: standard output, a file, or nowhere.
 //
 // This file cannot open a file, because it never gets a `&Files`. `main` opens each output
-// file and gives the open `File` to `file_output`.
+// file and gives the open `File` to `file_output`. It writes to standard output and standard
+// error only with the rights in a `Console`, which `main` makes from its `Root`.
 import core::option;
 import core::result;
 import std::fs;
+import std::io;
 import std::vec;
-import sys::console;
 import sys::text;
 import securl::bytes;
 import securl::failure;
@@ -14,6 +15,26 @@ import securl::inflate;
 
 // libcurl's limit of content encodings on one response.
 const MAX_ENCODE_STACK : i32 = 5;
+
+/// The rights to write to standard output and to standard error. Only `main` can make one,
+/// because only `main` has the rights of the program. So code that gets no `&mut Console`
+/// cannot write to the terminal.
+struct Console {
+  out : Stdout,
+  err : Stderr,
+}
+
+impl Console {
+  /// Write all of `bytes` to standard output. False when the output is closed.
+  pub fn to_stdout(self : &mut Console, bytes : &Vec<u8>) -> bool {
+    return self.out.write_all(bytes).is_ok();
+  }
+
+  /// Write `bytes` to standard error. A closed standard error is not an error for curl.
+  pub fn to_stderr(self : &mut Console, bytes : &Vec<u8>) -> void {
+    let _r = self.err.write_all(bytes);
+  }
+}
 
 struct Output {
   to_stdout : bool,
@@ -203,20 +224,22 @@ impl Output {
     return Result<Vec<u8>, Failure>::Ok(data);
   }
 
-  /// Write all of `bytes` to the output, decoded when a body is being decoded.
-  pub fn write(self : &mut Output, bytes : &Vec<u8>) -> Result<i32, Failure> {
+  /// Write all of `bytes` to the output, decoded when a body is being decoded. `console` has
+  /// the right to write to standard output.
+  pub fn write(self : &mut Output, console : &mut Console, bytes : &Vec<u8>)
+  -> Result<i32, Failure> {
     if bytes.len() == 0 {
       return Result<i32, Failure>::Ok(0);
     }
     if self.decoders.len() > 0 || self.unknown_encoding {
       let decoded = self.decoded(bytes)?;
-      return self.put(&decoded);
+      return self.put(console, &decoded);
     }
-    return self.put(bytes);
+    return self.put(console, bytes);
   }
 
   /// Write all of `bytes` to the output as they are.
-  fn put(self : &mut Output, bytes : &Vec<u8>) -> Result<i32, Failure> {
+  fn put(self : &mut Output, console : &mut Console, bytes : &Vec<u8>) -> Result<i32, Failure> {
     if bytes.len() == 0 {
       return Result<i32, Failure>::Ok(0);
     }
@@ -225,7 +248,7 @@ impl Output {
       self.delivered = self.delivered + (bytes.len() as i64);
     }
     if self.to_stdout {
-      if !write_stdout(bytes) {
+      if !console.to_stdout(bytes) {
         return Result<i32, Failure>::Err(write_error());
       }
       return Result<i32, Failure>::Ok(0);
@@ -275,14 +298,4 @@ pub fn message_lines(prefix : *const i8, text : &Vec<u8>, columns : i32) -> Vec<
     out.push(10u8);
   }
   return out;
-}
-
-/// Write `bytes` to standard error. A closed standard error is not an error for curl.
-pub fn to_stderr(bytes : &Vec<u8>) -> void {
-  let _ok = write_stderr(bytes);
-}
-
-/// Write the string literal `s` to standard error.
-pub fn lit_to_stderr(s : *const i8) -> void {
-  let _ok = write_stderr(&lit(s));
 }
