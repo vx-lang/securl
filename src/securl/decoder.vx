@@ -1,0 +1,108 @@
+// One decoder of `--compressed` or `--tr-encoding`, for any coding that securl knows: gzip and
+// deflate (`inflate.vx`) and zstd (`zstd.vx`). It gives the failures with libcurl's codes and
+// texts.
+import core::result;
+import std::vec;
+import sys::text;
+import securl::bytes;
+import securl::failure;
+import securl::inflate;
+import securl::zstd;
+
+const CODING_GZIP : i32 = 1;
+const CODING_DEFLATE : i32 = 2;
+const CODING_ZSTD : i32 = 3;
+
+/// A decoder of one coding. Only the decoder of `coding` holds data; the other one is idle.
+struct Decoder {
+  coding : i32,
+  inflate : Inflate,
+  zstd : Zstd,
+}
+
+/// The coding of the name `name` of a Content-Encoding or Transfer-Encoding, or 0 when securl
+/// does not know it.
+pub fn coding_of(name : &Vec<u8>) -> i32 {
+  if eq_lit_nocase(name, "gzip") || eq_lit_nocase(name, "x-gzip") {
+    return CODING_GZIP;
+  }
+  if eq_lit_nocase(name, "deflate") {
+    return CODING_DEFLATE;
+  }
+  if eq_lit_nocase(name, "zstd") {
+    return CODING_ZSTD;
+  }
+  return 0;
+}
+
+/// A decoder of `coding`, one that `coding_of` gave.
+pub fn new_decoder(coding : i32) -> Decoder {
+  if coding == CODING_ZSTD {
+    return Decoder {
+      coding : coding,
+      inflate : idle_inflate(),
+      zstd : new_zstd()
+    };
+  }
+  let mut wrap = WRAP_GZIP;
+  if coding == CODING_DEFLATE {
+    wrap = WRAP_ZLIB;
+  }
+  return Decoder {
+    coding : coding,
+    inflate : new_inflate(wrap),
+    zstd : idle_zstd()
+  };
+}
+
+impl Decoder {
+  /// Decode `piece`, the next part of the body, and give the bytes that came out.
+  pub fn feed(self : &mut Decoder, piece : &Vec<u8>) -> Result<Vec<u8>, Failure> {
+    if self.coding == CODING_ZSTD {
+      match self.zstd.feed(piece) {
+        Result<Vec<u8>, i32>::Ok(out) => {
+          return Result<Vec<u8>, Failure>::Ok(out);
+        },
+        Result<Vec<u8>, i32>::Err(_e) => {
+          // libcurl gives no text of its own for a zstd error, so curl shows the one of the code.
+          return Result<Vec<u8>, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
+            "Unrecognized or bad HTTP Content or Transfer-Encoding"));
+        }
+      }
+    }
+    match self.inflate.feed(piece) {
+      Result<Vec<u8>, i32>::Ok(out) => {
+        return Result<Vec<u8>, Failure>::Ok(out);
+      },
+      Result<Vec<u8>, i32>::Err(_e) => {
+        if self.inflate.error_code == WRITE_ERROR {
+          return Result<Vec<u8>, Failure>::Err(fail_with(WRITE_ERROR,
+            clone_bytes(&self.inflate.error)));
+        }
+        let mut m = lit("Error while processing content unencoding: ");
+        append(&mut m, &self.inflate.error);
+        return Result<Vec<u8>, Failure>::Err(fail_with(BAD_CONTENT_ENCODING, m));
+      }
+    }
+  }
+
+  /// The body ended. A body that ended inside its compressed data fails, as in libcurl.
+  pub fn finish(self : &Decoder) -> Result<i32, Failure> {
+    if self.coding == CODING_ZSTD {
+      if !self.zstd.complete() {
+        return Result<i32, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
+          "Zstd stream ended before completion"));
+      }
+      return Result<i32, Failure>::Ok(0);
+    }
+    if !self.inflate.complete() {
+      if self.coding == CODING_GZIP {
+        return Result<i32, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
+          "Gzip stream ended before completion"));
+      }
+      return Result<i32, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
+        "Deflate stream ended before completion"));
+    }
+    return Result<i32, Failure>::Ok(0);
+  }
+}

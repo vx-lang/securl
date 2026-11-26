@@ -63,11 +63,11 @@ Vx main 973d80f9b.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 437 of 750 (58%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 390 of 459 (84%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 168 of 168 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 438 of 752 (58%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 392 of 461 (85%) |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 176 of 176 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
-| Unit tests (`tests/unit`) | 10 of 10 |
+| Unit tests (`tests/unit`) | 11 of 11 |
 
 `CURL=/path/to/curl tests/tls/run.sh` runs the checks of `tests/tls` against another curl, and
 `tests/h2/run.sh` takes `CURL` too. curl 8.23.1-DEV, built from the same curl commit, passes all
@@ -91,7 +91,7 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 11,576 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 13,090 | none, and `--no-trusted-code` enforces this |
 | `src/cli/` (the tool) and `src/disk/` (its files) | 964 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 13 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,451 | 52 `extern` functions, 100 `unsafe` blocks |
@@ -196,9 +196,10 @@ page.
 
 ## Compression
 
-`--compressed` asks for `deflate, gzip` and decodes them as the body arrives.
-`src/securl/inflate.vx` is a DEFLATE decoder in Vx with the gzip and zlib wrappers, so this
-needs no zlib and no trusted code. It follows libcurl and zlib: the CRC-32 and Adler-32 checks,
+`--compressed` asks for `deflate, gzip, zstd` and decodes them as the body arrives.
+`src/securl/inflate.vx` is a DEFLATE decoder in Vx with the gzip and zlib wrappers, and
+`src/securl/zstd.vx` a zstd decoder (RFC 8878) in Vx, so this needs no zlib, no libzstd and no
+trusted code. It follows libcurl and zlib: the CRC-32 and Adler-32 checks,
 zlib's error texts after "Error while processing content unencoding: ", raw DEFLATE for a
 `deflate` body that has no zlib header, a chain of up to five encodings, and exit 61 for a body
 that ends inside the compressed data. `-w %{size_delivered}` gives the decoded size.
@@ -207,6 +208,23 @@ response before its content codings, with libcurl's rules: at most five, and chu
 `tests/unit/inflate.vx` feeds data from Python's zlib in one piece and one byte at a time, so
 that each block header and symbol is cut once. A curl 8.23.1-DEV built with zlib passes the
 compression checks of `tests/tls` too.
+
+The zstd decoder follows libzstd as libcurl uses it: frames one after another, with skippable
+frames between them, the XXH64 checksum, a window of at most 128 MiB, and failure for a frame
+that names a dictionary. It decodes a block (at most 128 KiB) once all of it has arrived. Like
+libcurl, it gives exit 61 with "Unrecognized or bad HTTP Content or Transfer-Encoding" for bad
+data, and "Zstd stream ended before completion" for a body that ends inside a frame.
+`tests/unit/zstd_decode.vx` (made by `tools/gen-zstd-test.py`) holds frames that libzstd made,
+with fast and slow levels, no checksum, no content size, random bytes and several frames, and
+frames that must fail; it feeds each whole, a byte at a time, and in pieces of 7 bytes. With
+Python 3.14, which has `compression.zstd`, `tests/tls` checks zstd bodies too. 5,600 frames of
+those cases with random changes gave the same result with securl as with libzstd, and none
+stopped securl.
+
+As in libcurl, `%{size_download}` counts a piece of the body only once the decoders and the
+output took it, so a piece that does not decode does not count. Test 4272 checks a cut gzip
+body and a cut zstd body, but its second transfer needs `--next`, which securl does not have
+yet, so it now fails where it passed while securl had no zstd.
 
 ## Authentication
 
@@ -322,7 +340,7 @@ time variables yet.
 
 In order of how much users need them:
 
-1. Connection reuse (and with it, HTTP/2 multiplexing), brotli and zstd for `--compressed`,
+1. Connection reuse (and with it, HTTP/2 multiplexing), brotli for `--compressed`,
    `--unix-socket`, the
    `Upgrade: h2c` of `--http2` on plain HTTP, and HTTP/2 through an HTTP proxy.
 1. URL globbing (`{a,b}` and `[1-9]`), `--next`, `-J`, `-C` resume, `-K` config files,

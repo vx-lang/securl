@@ -144,6 +144,34 @@ pub fn new_inflate(wrap : i32) -> Inflate {
   };
 }
 
+/// A decoder that holds nothing, for a coding that is not gzip or deflate.
+pub fn idle_inflate() -> Inflate {
+  return Inflate {
+    wrap : WRAP_RAW,
+    input : Vec<u8>::new(),
+    pos : 0,
+    bit : 0,
+    wstate : W_DATA,
+    state : ST_BLOCK,
+    last : false,
+    lencode : empty_huffman(),
+    distcode : empty_huffman(),
+    stored_left : 0,
+    window : Vec<u8>::new(),
+    wpos : 0,
+    total : 0i64,
+    crc : 0u64,
+    adler_a : 1u64,
+    adler_b : 0u64,
+    crc_table : Vec<u64>::new(),
+    can_fall_back : false,
+    trailer_left : 0,
+    started : false,
+    error : Vec<u8>::new(),
+    error_code : 0
+  };
+}
+
 // The tables of RFC 1951: the base and the extra bits of each length and distance symbol, and
 // the order of the lengths of the code length code.
 fn length_base(i : i32) -> i32 {

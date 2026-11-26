@@ -11,7 +11,7 @@ import std::vec;
 import sys::text;
 import securl::bytes;
 import securl::failure;
-import securl::inflate;
+import securl::decoder;
 
 // libcurl's limit of content encodings on one response.
 const MAX_ENCODE_STACK : i32 = 5;
@@ -43,7 +43,7 @@ struct Output {
   written : i64,
   // The decoders of `--compressed`, in the order that the body goes through them: the last
   // encoding of Content-Encoding first. Empty when the body is written as it came.
-  decoders : Vec<Inflate>,
+  decoders : Vec<Decoder>,
   // Content-Encoding named an encoding that securl does not know. The first byte of the body
   // fails, as in libcurl.
   unknown_encoding : bool,
@@ -58,7 +58,7 @@ pub fn stdout_output() -> Output {
     to_stdout : true,
     file : Option<File>::None(),
     written : 0i64,
-    decoders : Vec<Inflate>::new(),
+    decoders : Vec<Decoder>::new(),
     unknown_encoding : false,
     in_body : false,
     delivered : 0i64
@@ -71,7 +71,7 @@ pub fn file_output(file : File) -> Output {
     to_stdout : false,
     file : Option<File>::Some(file),
     written : 0i64,
-    decoders : Vec<Inflate>::new(),
+    decoders : Vec<Decoder>::new(),
     unknown_encoding : false,
     in_body : false,
     delivered : 0i64
@@ -84,7 +84,7 @@ pub fn null_output() -> Output {
     to_stdout : false,
     file : Option<File>::None(),
     written : 0i64,
-    decoders : Vec<Inflate>::new(),
+    decoders : Vec<Decoder>::new(),
     unknown_encoding : false,
     in_body : false,
     delivered : 0i64
@@ -145,7 +145,7 @@ impl Output {
   -> Result<i32, Failure> {
     self.in_body = true;
     self.delivered = 0i64;
-    let mut decoders = Vec<Inflate>::new();
+    let mut decoders = Vec<Decoder>::new();
     self.add_decoders(&mut decoders, &coding_names(transfer_codings));
     let names = coding_names(encodings);
     if names.len() > MAX_ENCODE_STACK {
@@ -158,20 +158,17 @@ impl Output {
   }
 
   /// Add the decoders of the codings `names` to `decoders`, the last coding first.
-  fn add_decoders(self : &mut Output, decoders : &mut Vec<Inflate>, names : &Vec<Vec<u8>>)
+  fn add_decoders(self : &mut Output, decoders : &mut Vec<Decoder>, names : &Vec<Vec<u8>>)
   -> void {
     let mut i = names.len() - 1;
     while i >= 0 {
       let name = names.get_ref(i);
-      if eq_lit_nocase(name, "gzip") || eq_lit_nocase(name, "x-gzip") {
-        decoders.push(new_inflate(WRAP_GZIP));
+      let coding = coding_of(name);
+      if coding != 0 {
+        decoders.push(new_decoder(coding));
       } else {
-        if eq_lit_nocase(name, "deflate") {
-          decoders.push(new_inflate(WRAP_ZLIB));
-        } else {
-          if !eq_lit_nocase(name, "identity") && !eq_lit_nocase(name, "none") {
-            self.unknown_encoding = true;
-          }
+        if !eq_lit_nocase(name, "identity") && !eq_lit_nocase(name, "none") {
+          self.unknown_encoding = true;
         }
       }
       i = i - 1;
@@ -184,17 +181,16 @@ impl Output {
     self.in_body = false;
     let mut result = Result<i64, Failure>::Ok(self.delivered);
     for d in self.decoders.iter() {
-      if result.is_ok() && !d.complete() {
-        if d.wrap == WRAP_GZIP {
-          result = Result<i64, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
-            "Gzip stream ended before completion"));
-        } else {
-          result = Result<i64, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
-            "Deflate stream ended before completion"));
+      if result.is_ok() {
+        match d.finish() {
+          Result<i32, Failure>::Ok(_n) => {},
+          Result<i32, Failure>::Err(f) => {
+            result = Result<i64, Failure>::Err(f);
+          }
         }
       }
     }
-    self.decoders = Vec<Inflate>::new();
+    self.decoders = Vec<Decoder>::new();
     self.unknown_encoding = false;
     return result;
   }
@@ -207,19 +203,7 @@ impl Output {
     }
     let mut data = clone_bytes(bytes);
     for d in self.decoders.iter_mut() {
-      match d.feed(&data) {
-        Result<Vec<u8>, i32>::Ok(out) => {
-          data = out;
-        },
-        Result<Vec<u8>, i32>::Err(_e) => {
-          if d.error_code == WRITE_ERROR {
-            return Result<Vec<u8>, Failure>::Err(fail_with(WRITE_ERROR, clone_bytes(&d.error)));
-          }
-          let mut m = lit("Error while processing content unencoding: ");
-          append(&mut m, &d.error);
-          return Result<Vec<u8>, Failure>::Err(fail_with(BAD_CONTENT_ENCODING, m));
-        }
-      }
+      data = d.feed(&data)?;
     }
     return Result<Vec<u8>, Failure>::Ok(data);
   }

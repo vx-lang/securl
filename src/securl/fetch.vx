@@ -452,8 +452,9 @@ info : &mut TransferInfo)
       return Result<i32, Failure>::Err(fail_with(PARTIAL_FILE, m));
     }
     left = left - (part.len() as i64);
-    info.size_download = info.size_download + (part.len() as i64);
+    // As libcurl, a piece counts once the decoders and the output took it.
     let _w = out.write(console, &part)?;
+    info.size_download = info.size_download + (part.len() as i64);
   }
   return Result<i32, Failure>::Ok(0);
 }
@@ -466,8 +467,9 @@ fn read_to_close(c : &mut Conn, out : &mut Output, console : &mut Console, info 
     if part.len() == 0 {
       return Result<i32, Failure>::Ok(0);
     }
-    info.size_download = info.size_download + (part.len() as i64);
+    // As libcurl, a piece counts once the decoders and the output took it.
     let _w = out.write(console, &part)?;
+    info.size_download = info.size_download + (part.len() as i64);
   }
 }
 
@@ -1524,8 +1526,9 @@ out : &mut Output, console : &mut Console, info : &mut TransferInfo, trailers : 
       append(trailers, &h2.trailers);
       return Result<i32, Failure>::Ok(0);
     }
-    info.size_download = info.size_download + (part.len() as i64);
+    // As libcurl, a piece counts once the decoders and the output took it.
     let _w = out.write(console, &part)?;
+    info.size_download = info.size_download + (part.len() as i64);
   }
 }
 

@@ -1,0 +1,1391 @@
+// The decoder of `Content-Encoding: zstd` (RFC 8878), as libcurl decodes it with libzstd.
+//
+// A decoder takes the body in pieces as it arrives and gives the bytes that it could decode. It
+// decodes a block only when the whole block has arrived, so it never has to go back: a block is
+// at most 128 KiB. The steps follow the educational decoder of the zstd project and RFC 8878:
+// FSE tables, Huffman-coded literals, sequences, repeat offsets and the XXH64 checksum.
+//
+// As in libzstd, a frame may not need a window of more than 128 MiB, a frame that names a
+// dictionary fails, and frames may follow each other, with skippable frames between them.
+import core::num;
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import securl::bytes;
+
+// The states of the decoder.
+const Z_MAGIC : i32 = 0;
+const Z_SKIP : i32 = 1;
+const Z_HEADER : i32 = 2;
+const Z_BLOCK_HEADER : i32 = 3;
+const Z_BLOCK : i32 = 4;
+const Z_CHECKSUM : i32 = 5;
+
+// The kinds of blocks.
+const BLOCK_RAW : i32 = 0;
+const BLOCK_RLE : i32 = 1;
+const BLOCK_COMPRESSED : i32 = 2;
+
+// The most bytes that a block holds, and the biggest window that libzstd accepts by default:
+// 2^27 bytes and one.
+const BLOCK_MAX : i32 = 131072;
+const WINDOW_LIMIT : i64 = 134217729i64;
+
+// The largest symbol of each code of the sequences, and the largest accuracy of its table.
+const LL_MAX_CODE : i32 = 35;
+const ML_MAX_CODE : i32 = 52;
+const OF_MAX_CODE : i32 = 31;
+const LL_MAX_LOG : i32 = 9;
+const ML_MAX_LOG : i32 = 9;
+const OF_MAX_LOG : i32 = 8;
+
+// The modes of the tables of the sequences.
+const MODE_PREDEFINED : i32 = 0;
+const MODE_RLE : i32 = 1;
+const MODE_FSE : i32 = 2;
+const MODE_REPEAT : i32 = 3;
+
+// The primes of XXH64.
+const P1 : u64 = 11400714785074694791u64;
+const P2 : u64 = 14029467366897019727u64;
+const P3 : u64 = 1609587929392839161u64;
+const P4 : u64 = 9650029242287828579u64;
+const P5 : u64 = 2870177450012600261u64;
+
+/// An FSE decoding table: for each state, its symbol, how many bits to read, and the base of
+/// the next state.
+struct FseTable {
+  log : i32,
+  symbols : Vec<i32>,
+  bits : Vec<i32>,
+  base : Vec<i32>,
+  ready : bool,
+}
+
+/// A Huffman decoding table for the literals: for each value of `max_bits` bits, its symbol
+/// and the length of its code.
+struct HufTable {
+  max_bits : i32,
+  symbols : Vec<u8>,
+  bits : Vec<i32>,
+  ready : bool,
+}
+
+/// A bit stream read backwards from the end of `src[start..end)`, as zstd writes its
+/// Huffman, FSE and sequence streams. `offset` counts the bits that are left; below 0, the
+/// reads give zero bits.
+struct BackBits {
+  start : i32,
+  offset : i64,
+}
+
+/// XXH64 with seed 0, fed in pieces.
+struct Xxh64 {
+  v1 : u64,
+  v2 : u64,
+  v3 : u64,
+  v4 : u64,
+  // The bytes of an unfinished 32-byte stripe.
+  buf : Vec<u8>,
+  total : u64,
+}
+
+/// A decoder of `zstd`.
+struct Zstd {
+  // The input that the decoder has not used yet, from byte `pos`.
+  input : Vec<u8>,
+  pos : i32,
+  state : i32,
+  skip_left : i64,
+  // The frame: its window, the size that its header gives (-1 when it gives none), and whether
+  // a checksum ends it.
+  window : i64,
+  content_size : i64,
+  has_checksum : bool,
+  block_max : i32,
+  // The block whose header was read.
+  block_last : bool,
+  block_type : i32,
+  block_size : i32,
+  // The output of the frame: how much, and the last part of it, for the matches.
+  frame_out : i64,
+  hist : Vec<u8>,
+  rep0 : i64,
+  rep1 : i64,
+  rep2 : i64,
+  // The tables that a block may use again in the next one.
+  huf : HufTable,
+  ll : FseTable,
+  of : FseTable,
+  ml : FseTable,
+  ll_default : FseTable,
+  of_default : FseTable,
+  ml_default : FseTable,
+  hash : Xxh64,
+  // Some input came, so the end of the body must also be the end of a frame.
+  started : bool,
+  error : Vec<u8>,
+}
+
+fn empty_fse() -> FseTable {
+  return FseTable {
+    log : 0,
+    symbols : Vec<i32>::new(),
+    bits : Vec<i32>::new(),
+    base : Vec<i32>::new(),
+    ready : false
+  };
+}
+
+fn copy_fse(t : &FseTable) -> FseTable {
+  let mut out = empty_fse();
+  out.log = t.log;
+  for s in t.symbols.iter() {
+    out.symbols.push(*s);
+  }
+  for b in t.bits.iter() {
+    out.bits.push(*b);
+  }
+  for b in t.base.iter() {
+    out.base.push(*b);
+  }
+  out.ready = t.ready;
+  return out;
+}
+
+fn empty_huf() -> HufTable {
+  return HufTable {
+    max_bits : 0,
+    symbols : Vec<u8>::new(),
+    bits : Vec<i32>::new(),
+    ready : false
+  };
+}
+
+fn new_xxh() -> Xxh64 {
+  return Xxh64 {
+    v1 : P1 + P2,
+    v2 : P2,
+    v3 : 0u64,
+    v4 : 0u64 - P1,
+    buf : Vec<u8>::new(),
+    total : 0u64
+  };
+}
+
+/// A decoder that holds nothing, for a coding that is not zstd. `new_zstd` makes one that
+/// decodes.
+pub fn idle_zstd() -> Zstd {
+  return Zstd {
+    input : Vec<u8>::new(),
+    pos : 0,
+    state : Z_MAGIC,
+    skip_left : 0i64,
+    window : 0i64,
+    content_size : -1i64,
+    has_checksum : false,
+    block_max : 0,
+    block_last : false,
+    block_type : 0,
+    block_size : 0,
+    frame_out : 0i64,
+    hist : Vec<u8>::new(),
+    rep0 : 1i64,
+    rep1 : 4i64,
+    rep2 : 8i64,
+    huf : empty_huf(),
+    ll : empty_fse(),
+    of : empty_fse(),
+    ml : empty_fse(),
+    ll_default : empty_fse(),
+    of_default : empty_fse(),
+    ml_default : empty_fse(),
+    hash : new_xxh(),
+    started : false,
+    error : Vec<u8>::new()
+  };
+}
+
+/// A decoder of `zstd`.
+pub fn new_zstd() -> Zstd {
+  let mut z = idle_zstd();
+  // The predefined distributions of RFC 8878, section 3.1.1.3.2.2.
+  let ll = [4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1,
+    1, 1, 1, -1, -1, -1, -1];
+  let ml = [1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1];
+  let of = [1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1,
+    -1, -1];
+  let mut freqs = Vec<i32>::new();
+  let mut i = 0;
+  while i < 36 {
+    freqs.push(ll[i]);
+    i = i + 1;
+  }
+  let _l = build_fse(&freqs, 6, &mut z.ll_default);
+  freqs = Vec<i32>::new();
+  i = 0;
+  while i < 53 {
+    freqs.push(ml[i]);
+    i = i + 1;
+  }
+  let _m = build_fse(&freqs, 6, &mut z.ml_default);
+  freqs = Vec<i32>::new();
+  i = 0;
+  while i < 29 {
+    freqs.push(of[i]);
+    i = i + 1;
+  }
+  let _o = build_fse(&freqs, 5, &mut z.of_default);
+  return z;
+}
+
+/// The place of the highest bit that is set in `x`, which is more than 0.
+fn high_bit(x : i64) -> i32 {
+  return 63 - ((x as u64).leading_zeros() as i32);
+}
+
+/// `n` bits (at most 32) of `src` from bit `bitpos` after byte `start`, the first one in the
+/// lowest place. Bits after byte `end` read as 0.
+fn le_bits(src : &Vec<u8>, start : i32, end : i32, bitpos : i64, n : i32) -> i64 {
+  if n == 0 {
+    return 0i64;
+  }
+  let first = start + ((bitpos >> 3i64) as i32);
+  let shift = bitpos & 7i64;
+  let mut v : u64 = 0u64;
+  let mut k = 0;
+  while k < 5 && first + k < end {
+    v = v | ((src.get(first + k) as u64) << ((8 * k) as u64));
+    k = k + 1;
+  }
+  let mask = (1u64 << (n as u64)) - 1u64;
+  return ((v >> (shift as u64)) & mask) as i64;
+}
+
+/// The 4 bytes at `at` as a little-endian number.
+fn le32(src : &Vec<u8>, at : i32) -> i64 {
+  return (src.get(at) as i64) + ((src.get(at + 1) as i64) << 8i64)
+    + ((src.get(at + 2) as i64) << 16i64) + ((src.get(at + 3) as i64) << 24i64);
+}
+
+/// A backward stream over `src[start..end)`, or None when its last byte has no end mark.
+fn back_bits(src : &Vec<u8>, start : i32, end : i32) -> Option<BackBits> {
+  if end <= start {
+    return Option<BackBits>::None();
+  }
+  let last = src.get(end - 1) as i64;
+  if last == 0i64 {
+    return Option<BackBits>::None();
+  }
+  let padding = 8 - high_bit(last);
+  return Option<BackBits>::Some(BackBits {
+    start : start,
+    offset : ((end - start) as i64) * 8i64 - (padding as i64)
+  });
+}
+
+/// Read `n` bits of a backward stream.
+fn back_read(src : &Vec<u8>, r : &mut BackBits, n : i32) -> i64 {
+  if n == 0 {
+    return 0i64;
+  }
+  r.offset = r.offset - (n as i64);
+  if r.offset >= 0i64 {
+    return le_bits(src, r.start, src.len(), r.offset, n);
+  }
+  // Fewer bits are left than asked for: the missing low bits are 0.
+  let have = (n as i64) + r.offset;
+  if have <= 0i64 {
+    return 0i64;
+  }
+  let v = le_bits(src, r.start, src.len(), 0i64, have as i32);
+  return v << (0i64 - r.offset);
+}
+
+/// Build the FSE table of the probabilities `freqs` with accuracy `log`. False for
+/// probabilities that do not fill the table.
+fn build_fse(freqs : &Vec<i32>, log : i32, t : &mut FseTable) -> bool {
+  let size = 1 << log;
+  let mut symbols = Vec<i32>::with_capacity(size);
+  let mut i = 0;
+  while i < size {
+    symbols.push(0);
+    i = i + 1;
+  }
+  let mut next = Vec<i32>::new();
+  let mut high = size;
+  let mut s = 0;
+  while s < freqs.len() {
+    let f = freqs.get(s);
+    if f == -1 {
+      high = high - 1;
+      if high < 0 {
+        return false;
+      }
+      symbols.set(high, s);
+      next.push(1);
+    } else {
+      next.push(f);
+    }
+    s = s + 1;
+  }
+  let step = (size >> 1) + (size >> 3) + 3;
+  let mask = size - 1;
+  let mut pos = 0;
+  s = 0;
+  while s < freqs.len() {
+    let f = freqs.get(s);
+    let mut k = 0;
+    while k < f {
+      symbols.set(pos, s);
+      pos = (pos + step) & mask;
+      while pos >= high {
+        pos = (pos + step) & mask;
+      }
+      k = k + 1;
+    }
+    s = s + 1;
+  }
+  if pos != 0 {
+    return false;
+  }
+  let mut bits = Vec<i32>::with_capacity(size);
+  let mut base = Vec<i32>::with_capacity(size);
+  i = 0;
+  while i < size {
+    let sym = symbols.get(i);
+    let desc = next.get(sym);
+    next.set(sym, desc + 1);
+    let nb = log - high_bit(desc as i64);
+    bits.push(nb);
+    base.push((desc << nb) - size);
+    i = i + 1;
+  }
+  t.log = log;
+  t.symbols = symbols;
+  t.bits = bits;
+  t.base = base;
+  t.ready = true;
+  return true;
+}
+
+/// The FSE table of one symbol, for the RLE mode.
+fn rle_fse(symbol : i32, t : &mut FseTable) -> void {
+  t.log = 0;
+  t.symbols = Vec<i32>::new();
+  t.symbols.push(symbol);
+  t.bits = Vec<i32>::new();
+  t.bits.push(0);
+  t.base = Vec<i32>::new();
+  t.base.push(0);
+  t.ready = true;
+}
+
+/// Read the FSE table description at `src[start..end)` into `t`, with an accuracy of at most
+/// `max_log` and at most `max_symbols` symbols. Gives its size in bytes, or -1 when it is bad.
+fn read_fse(src : &Vec<u8>, start : i32, end : i32, max_log : i32, max_symbols : i32,
+t : &mut FseTable) -> i32 {
+  if end - start < 1 {
+    return -1;
+  }
+  let log = 5 + (le_bits(src, start, end, 0i64, 4) as i32);
+  if log > max_log {
+    return -1;
+  }
+  let mut bp : i64 = 4i64;
+  let mut remaining = 1 << log;
+  let mut freqs = Vec<i32>::new();
+  while remaining > 0 && freqs.len() < 256 {
+    let bits = high_bit((remaining + 1) as i64) + 1;
+    let val = le_bits(src, start, end, bp, bits) as i32;
+    let lower_mask = (1 << (bits - 1)) - 1;
+    let threshold = (1 << bits) - 1 - (remaining + 1);
+    let mut v = val;
+    if (val & lower_mask) < threshold {
+      v = val & lower_mask;
+      bp = bp + ((bits - 1) as i64);
+    } else {
+      bp = bp + (bits as i64);
+      if val > lower_mask {
+        v = val - threshold;
+      }
+    }
+    let proba = v - 1;
+    if proba < 0 {
+      remaining = remaining + proba;
+    } else {
+      remaining = remaining - proba;
+    }
+    freqs.push(proba);
+    if proba == 0 {
+      loop {
+        let repeat = le_bits(src, start, end, bp, 2) as i32;
+        bp = bp + 2i64;
+        let mut k = 0;
+        while k < repeat && freqs.len() < 256 {
+          freqs.push(0);
+          k = k + 1;
+        }
+        if repeat != 3 {
+          break;
+        }
+      }
+    }
+  }
+  let used = ((bp + 7i64) / 8i64) as i32;
+  if remaining != 0 || freqs.len() > max_symbols || used > end - start {
+    return -1;
+  }
+  if !build_fse(&freqs, log, t) {
+    return -1;
+  }
+  return used;
+}
+
+/// Build the Huffman table of the literals from their `weights`; the weight of the last symbol
+/// is not written. False for weights that make no code.
+fn build_huf(weights : &Vec<i32>, h : &mut HufTable) -> bool {
+  if weights.len() == 0 || weights.len() > 255 {
+    return false;
+  }
+  let mut sum : i64 = 0i64;
+  for w in weights.iter() {
+    if *w > 11 {
+      return false;
+    }
+    if *w > 0 {
+      sum = sum + (1i64 << ((*w - 1) as i64));
+    }
+  }
+  if sum == 0i64 {
+    return false;
+  }
+  let max_bits = high_bit(sum) + 1;
+  if max_bits > 11 {
+    return false;
+  }
+  let left = (1i64 << (max_bits as i64)) - sum;
+  if (left & (left - 1i64)) != 0i64 {
+    return false;
+  }
+  let last_weight = high_bit(left) + 1;
+  let mut lengths = Vec<i32>::new();
+  for w in weights.iter() {
+    if *w > 0 {
+      lengths.push(max_bits + 1 - *w);
+    } else {
+      lengths.push(0);
+    }
+  }
+  lengths.push(max_bits + 1 - last_weight);
+  // Each length has a range of the table: the longest codes first.
+  let mut rank_count = Vec<i32>::new();
+  let mut i = 0;
+  while i <= max_bits + 1 {
+    rank_count.push(0);
+    i = i + 1;
+  }
+  for l in lengths.iter() {
+    rank_count.set(*l, rank_count.get(*l) + 1);
+  }
+  let size = 1 << max_bits;
+  let mut symbols = Vec<u8>::with_capacity(size);
+  let mut bits = Vec<i32>::with_capacity(size);
+  i = 0;
+  while i < size {
+    symbols.push(0u8);
+    bits.push(0);
+    i = i + 1;
+  }
+  let mut rank_idx = Vec<i32>::new();
+  i = 0;
+  while i <= max_bits {
+    rank_idx.push(0);
+    i = i + 1;
+  }
+  let mut b = max_bits;
+  while b >= 1 {
+    let from = rank_idx.get(b);
+    let to = from + rank_count.get(b) * (1 << (max_bits - b));
+    rank_idx.set(b - 1, to);
+    let mut k = from;
+    while k < to {
+      bits.set(k, b);
+      k = k + 1;
+    }
+    b = b - 1;
+  }
+  let mut s = 0;
+  while s < lengths.len() {
+    let l = lengths.get(s);
+    if l != 0 {
+      let code = rank_idx.get(l);
+      let n = 1 << (max_bits - l);
+      let mut k = 0;
+      while k < n {
+        symbols.set(code + k, s as u8);
+        k = k + 1;
+      }
+      rank_idx.set(l, code + n);
+    }
+    s = s + 1;
+  }
+  h.max_bits = max_bits;
+  h.symbols = symbols;
+  h.bits = bits;
+  h.ready = true;
+  return true;
+}
+
+/// Read the Huffman tree description at `src[start..end)` into `h`. Gives its size in bytes,
+/// or -1 when it is bad.
+fn read_huf(src : &Vec<u8>, start : i32, end : i32, h : &mut HufTable) -> i32 {
+  if start >= end {
+    return -1;
+  }
+  let header = src.get(start) as i32;
+  let mut weights = Vec<i32>::new();
+  if header >= 128 {
+    // The weights as they are, 4 bits each.
+    let n = header - 127;
+    let size = (n + 1) / 2;
+    if start + 1 + size > end {
+      return -1;
+    }
+    let mut i = 0;
+    while i < n {
+      let byte = src.get(start + 1 + i / 2) as i32;
+      if i % 2 == 0 {
+        weights.push(byte >> 4);
+      } else {
+        weights.push(byte & 15);
+      }
+      i = i + 1;
+    }
+    if !build_huf(&weights, h) {
+      return -1;
+    }
+    return 1 + size;
+  }
+  // The weights compressed with FSE, in two interleaved states.
+  let size = header;
+  if size == 0 || start + 1 + size > end {
+    return -1;
+  }
+  let stop = start + 1 + size;
+  let mut t = empty_fse();
+  let table_size = read_fse(src, start + 1, stop, 6, 12, &mut t);
+  if table_size < 0 {
+    return -1;
+  }
+  match back_bits(src, start + 1 + table_size, stop) {
+    Option<BackBits>::Some(r0) => {
+      let mut r = r0;
+      let mut s1 = back_read(src, &mut r, t.log) as i32;
+      let mut s2 = back_read(src, &mut r, t.log) as i32;
+      // As libzstd, which has room for 255 weights.
+      loop {
+        if weights.len() > 253 {
+          return -1;
+        }
+        weights.push(t.symbols.get(s1));
+        s1 = t.base.get(s1) + (back_read(src, &mut r, t.bits.get(s1)) as i32);
+        if r.offset < 0i64 {
+          weights.push(t.symbols.get(s2));
+          break;
+        }
+        if weights.len() > 253 {
+          return -1;
+        }
+        weights.push(t.symbols.get(s2));
+        s2 = t.base.get(s2) + (back_read(src, &mut r, t.bits.get(s2)) as i32);
+        if r.offset < 0i64 {
+          weights.push(t.symbols.get(s1));
+          break;
+        }
+      }
+    },
+    Option<BackBits>::None() => {
+      return -1;
+    }
+  }
+  if !build_huf(&weights, h) {
+    return -1;
+  }
+  return 1 + size;
+}
+
+/// Decode `count` literals of the Huffman stream `src[start..end)` into `out`. False when the
+/// stream is bad or does not end with its last literal.
+fn huf_stream(src : &Vec<u8>, start : i32, end : i32, h : &HufTable, count : i32,
+out : &mut Vec<u8>) -> bool {
+  match back_bits(src, start, end) {
+    Option<BackBits>::Some(r0) => {
+      let mut r = r0;
+      let mask = (1 << h.max_bits) - 1;
+      let mut state = back_read(src, &mut r, h.max_bits) as i32;
+      let mut i = 0;
+      while i < count {
+        out.push(h.symbols.get(state));
+        let nb = h.bits.get(state);
+        let rest = back_read(src, &mut r, nb) as i32;
+        state = ((state << nb) + rest) & mask;
+        i = i + 1;
+      }
+      return r.offset == 0i64 - (h.max_bits as i64);
+    },
+    Option<BackBits>::None() => {
+      return false;
+    }
+  }
+}
+
+/// The base and the extra bits of the literal length code `c` and the match length code `c`.
+fn ll_base(c : i32) -> i64 {
+  let bases = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32,
+    40, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+  return bases[c] as i64;
+}
+
+fn ll_bits(c : i32) -> i32 {
+  let bits = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8,
+    9, 10, 11, 12, 13, 14, 15, 16];
+  return bits[c];
+}
+
+fn ml_base(c : i32) -> i64 {
+  if c < 32 {
+    return (c + 3) as i64;
+  }
+  let bases = [35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027, 2051, 4099, 8195,
+    16387, 32771, 65539];
+  return bases[c - 32] as i64;
+}
+
+fn ml_bits(c : i32) -> i32 {
+  if c < 32 {
+    return 0;
+  }
+  let bits = [1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+  return bits[c - 32];
+}
+
+/// Read the table of one code of the sequences at `src[at..end)`, in `mode`. Gives its size in
+/// bytes, or -1 when it is bad.
+fn read_seq_table(src : &Vec<u8>, at : i32, end : i32, mode : i32, max_code : i32, max_log : i32,
+t : &mut FseTable, default : &FseTable) -> i32 {
+  if mode == MODE_PREDEFINED {
+    let copy = copy_fse(default);
+    t.log = copy.log;
+    t.symbols = copy.symbols;
+    t.bits = copy.bits;
+    t.base = copy.base;
+    t.ready = true;
+    return 0;
+  }
+  if mode == MODE_RLE {
+    if at >= end {
+      return -1;
+    }
+    let symbol = src.get(at) as i32;
+    if symbol > max_code {
+      return -1;
+    }
+    rle_fse(symbol, t);
+    return 1;
+  }
+  if mode == MODE_FSE {
+    return read_fse(src, at, end, max_log, max_code + 1, t);
+  }
+  // MODE_REPEAT: the table of the previous block.
+  if !t.ready {
+    return -1;
+  }
+  return 0;
+}
+
+impl Xxh64 {
+  fn stripe(self : &mut Xxh64, src : &Vec<u8>, at : i32) -> void {
+    self.v1 = xxh_round(self.v1, le64(src, at));
+    self.v2 = xxh_round(self.v2, le64(src, at + 8));
+    self.v3 = xxh_round(self.v3, le64(src, at + 16));
+    self.v4 = xxh_round(self.v4, le64(src, at + 24));
+  }
+
+  /// Add `src[from..to)` to the hash.
+  fn update(self : &mut Xxh64, src : &Vec<u8>, from : i32, to : i32) -> void {
+    self.total = self.total + ((to - from) as u64);
+    let mut i = from;
+    if self.buf.len() > 0 {
+      while self.buf.len() < 32 && i < to {
+        self.buf.push(src.get(i));
+        i = i + 1;
+      }
+      if self.buf.len() < 32 {
+        return;
+      }
+      let full = clone_bytes(&self.buf);
+      self.stripe(&full, 0);
+      self.buf = Vec<u8>::new();
+    }
+    while to - i >= 32 {
+      self.stripe(src, i);
+      i = i + 32;
+    }
+    while i < to {
+      self.buf.push(src.get(i));
+      i = i + 1;
+    }
+  }
+
+  /// The hash of all that came.
+  fn digest(self : &Xxh64) -> u64 {
+    let mut h : u64 = 0u64;
+    if self.total >= 32u64 {
+      h = self.v1.rotate_left(1u64) + self.v2.rotate_left(7u64) + self.v3.rotate_left(12u64)
+        + self.v4.rotate_left(18u64);
+      h = xxh_merge(h, self.v1);
+      h = xxh_merge(h, self.v2);
+      h = xxh_merge(h, self.v3);
+      h = xxh_merge(h, self.v4);
+    } else {
+      h = P5;
+    }
+    h = h + self.total;
+    let n = self.buf.len();
+    let mut i = 0;
+    while n - i >= 8 {
+      h = h ^ xxh_round(0u64, le64(&self.buf, i));
+      h = h.rotate_left(27u64) * P1 + P4;
+      i = i + 8;
+    }
+    if n - i >= 4 {
+      h = h ^ ((le32(&self.buf, i) as u64) * P1);
+      h = h.rotate_left(23u64) * P2 + P3;
+      i = i + 4;
+    }
+    while i < n {
+      h = h ^ ((self.buf.get(i) as u64) * P5);
+      h = h.rotate_left(11u64) * P1;
+      i = i + 1;
+    }
+    h = h ^ (h >> 33u64);
+    h = h * P2;
+    h = h ^ (h >> 29u64);
+    h = h * P3;
+    h = h ^ (h >> 32u64);
+    return h;
+  }
+}
+
+fn xxh_round(acc : u64, input : u64) -> u64 {
+  return (acc + input * P2).rotate_left(31u64) * P1;
+}
+
+fn xxh_merge(acc : u64, v : u64) -> u64 {
+  return (acc ^ xxh_round(0u64, v)) * P1 + P4;
+}
+
+fn le64(src : &Vec<u8>, at : i32) -> u64 {
+  let mut v : u64 = 0u64;
+  let mut k = 7;
+  while k >= 0 {
+    v = (v << 8u64) | (src.get(at + k) as u64);
+    k = k - 1;
+  }
+  return v;
+}
+
+impl Zstd {
+  fn fail(self : &mut Zstd, message : *const i8) -> Result<Vec<u8>, i32> {
+    self.error = lit(message);
+    return Result<Vec<u8>, i32>::Err(-2);
+  }
+
+  /// Add the byte `b` to the output of the frame.
+  fn emit(self : &mut Zstd, out : &mut Vec<u8>, b : u8) -> void {
+    out.push(b);
+    self.hist.push(b);
+  }
+
+  /// Start a frame: no output yet, and the repeat offsets and tables of RFC 8878.
+  fn start_frame(self : &mut Zstd) -> void {
+    self.frame_out = 0i64;
+    self.hist = Vec<u8>::new();
+    self.rep0 = 1i64;
+    self.rep1 = 4i64;
+    self.rep2 = 8i64;
+    self.huf.ready = false;
+    self.ll.ready = false;
+    self.of.ready = false;
+    self.ml.ready = false;
+    self.hash = new_xxh();
+  }
+
+  /// Read the frame header at `pos`. Gives its size, 0 when more input is needed, or -1 when it
+  /// is bad, with the reason in `error`.
+  fn frame_header(self : &mut Zstd) -> i32 {
+    let avail = self.input.len() - self.pos;
+    if avail < 1 {
+      return 0;
+    }
+    let desc = self.input.get(self.pos) as i32;
+    let fcs_flag = desc >> 6;
+    let single = (desc >> 5) & 1 == 1;
+    if (desc >> 3) & 1 == 1 {
+      self.error = lit("Unsupported frame parameter");
+      return -1;
+    }
+    let checksum = (desc >> 2) & 1 == 1;
+    let dict_sizes = [0, 1, 2, 4];
+    let dict_size = dict_sizes[desc & 3];
+    let mut fcs_size = 0;
+    if fcs_flag == 0 && single {
+      fcs_size = 1;
+    }
+    if fcs_flag == 1 {
+      fcs_size = 2;
+    }
+    if fcs_flag == 2 {
+      fcs_size = 4;
+    }
+    if fcs_flag == 3 {
+      fcs_size = 8;
+    }
+    let mut size = 1 + dict_size + fcs_size;
+    if !single {
+      size = size + 1;
+    }
+    if avail < size {
+      return 0;
+    }
+    let mut at = self.pos + 1;
+    let mut window : i64 = 0i64;
+    if !single {
+      let wd = self.input.get(at) as i64;
+      at = at + 1;
+      let base = 1i64 << (10i64 + (wd >> 3i64));
+      window = base + (base / 8i64) * (wd & 7i64);
+    }
+    let mut dict : i64 = 0i64;
+    let mut k = 0;
+    while k < dict_size {
+      dict = dict + ((self.input.get(at + k) as i64) << ((8 * k) as i64));
+      k = k + 1;
+    }
+    at = at + dict_size;
+    if dict != 0i64 {
+      self.error = lit("Dictionary mismatch");
+      return -1;
+    }
+    let mut fcs : i64 = -1i64;
+    if fcs_size > 0 {
+      fcs = 0i64;
+      k = 0;
+      while k < fcs_size {
+        fcs = fcs + ((self.input.get(at + k) as i64) << ((8 * k) as i64));
+        k = k + 1;
+      }
+      if fcs_size == 2 {
+        fcs = fcs + 256i64;
+      }
+    }
+    if single {
+      window = fcs;
+    }
+    if window > WINDOW_LIMIT || window < 0i64 {
+      self.error = lit("Frame requires too much memory for decoding");
+      return -1;
+    }
+    self.window = window;
+    self.content_size = fcs;
+    self.has_checksum = checksum;
+    self.block_max = BLOCK_MAX;
+    if window < (BLOCK_MAX as i64) {
+      self.block_max = window as i32;
+    }
+    return size;
+  }
+
+  /// Decode the block `block`, which is the whole content of a compressed block, into `out`.
+  /// False when it is bad, with the reason in `error`.
+  fn compressed_block(self : &mut Zstd, block : &Vec<u8>, out : &mut Vec<u8>) -> bool {
+    let end = block.len();
+    // The literals section.
+    if end < 1 {
+      return self.bad_block();
+    }
+    let b0 = block.get(0) as i32;
+    let lit_type = b0 & 3;
+    let size_format = (b0 >> 2) & 3;
+    let mut lits = Vec<u8>::new();
+    let mut p = 0;
+    if lit_type == 0 || lit_type == 1 {
+      let mut regen = 0;
+      let mut header = 1;
+      if size_format == 0 || size_format == 2 {
+        regen = b0 >> 3;
+      }
+      if size_format == 1 {
+        header = 2;
+        if end < 2 {
+          return self.bad_block();
+        }
+        regen = (b0 >> 4) + ((block.get(1) as i32) << 4);
+      }
+      if size_format == 3 {
+        header = 3;
+        if end < 3 {
+          return self.bad_block();
+        }
+        regen = (b0 >> 4) + ((block.get(1) as i32) << 4) + ((block.get(2) as i32) << 12);
+      }
+      if regen > self.block_max {
+        return self.bad_block();
+      }
+      p = header;
+      if lit_type == 0 {
+        if p + regen > end {
+          return self.bad_block();
+        }
+        append_range(&mut lits, block, p, p + regen);
+        p = p + regen;
+      } else {
+        if p + 1 > end {
+          return self.bad_block();
+        }
+        let b = block.get(p);
+        let mut i = 0;
+        while i < regen {
+          lits.push(b);
+          i = i + 1;
+        }
+        p = p + 1;
+      }
+    } else {
+      // Huffman-coded literals, with a new tree (2) or the tree of the last block (3).
+      let mut header = 3;
+      let mut streams = 4;
+      let mut regen = 0;
+      let mut csize = 0;
+      if size_format == 0 || size_format == 1 {
+        if size_format == 0 {
+          streams = 1;
+        }
+        if end < 3 {
+          return self.bad_block();
+        }
+        let v = (b0 >> 4) + ((block.get(1) as i32) << 4) + ((block.get(2) as i32) << 12);
+        regen = v & 1023;
+        csize = v >> 10;
+      }
+      if size_format == 2 {
+        header = 4;
+        if end < 4 {
+          return self.bad_block();
+        }
+        let v = (b0 >> 4) + ((block.get(1) as i32) << 4) + ((block.get(2) as i32) << 12)
+          + ((block.get(3) as i32) << 20);
+        regen = v & 16383;
+        csize = v >> 14;
+      }
+      if size_format == 3 {
+        header = 5;
+        if end < 5 {
+          return self.bad_block();
+        }
+        let v = (b0 >> 4) + ((block.get(1) as i32) << 4) + ((block.get(2) as i32) << 12)
+          + ((block.get(3) as i32) << 20);
+        regen = v & 262143;
+        csize = (v >> 18) + ((block.get(4) as i32) << 10);
+      }
+      if regen > self.block_max || header + csize > end {
+        return self.bad_block();
+      }
+      let mut q = header;
+      let stop = header + csize;
+      if lit_type == 2 {
+        let tree = read_huf(block, q, stop, &mut self.huf);
+        if tree < 0 {
+          return self.bad_block();
+        }
+        q = q + tree;
+      } else {
+        if !self.huf.ready {
+          return self.bad_block();
+        }
+      }
+      if streams == 1 {
+        if !huf_stream(block, q, stop, &self.huf, regen, &mut lits) {
+          return self.bad_block();
+        }
+      } else {
+        if stop - q < 10 || regen < 6 {
+          return self.bad_block();
+        }
+        let s1 = (block.get(q) as i32) + ((block.get(q + 1) as i32) << 8);
+        let s2 = (block.get(q + 2) as i32) + ((block.get(q + 3) as i32) << 8);
+        let s3 = (block.get(q + 4) as i32) + ((block.get(q + 5) as i32) << 8);
+        let a = q + 6;
+        let b = a + s1;
+        let c = b + s2;
+        let d = c + s3;
+        if d > stop {
+          return self.bad_block();
+        }
+        let part = (regen + 3) / 4;
+        let last_part = regen - 3 * part;
+        if last_part < 0 {
+          return self.bad_block();
+        }
+        if !huf_stream(block, a, b, &self.huf, part, &mut lits)
+           || !huf_stream(block, b, c, &self.huf, part, &mut lits)
+           || !huf_stream(block, c, d, &self.huf, part, &mut lits)
+           || !huf_stream(block, d, stop, &self.huf, last_part, &mut lits) {
+          return self.bad_block();
+        }
+      }
+      p = stop;
+    }
+
+    // The sequences section.
+    if p >= end {
+      return self.bad_block();
+    }
+    let n0 = block.get(p) as i32;
+    let mut nb_seq = 0;
+    if n0 < 128 {
+      nb_seq = n0;
+      p = p + 1;
+    } else {
+      if n0 < 255 {
+        if p + 2 > end {
+          return self.bad_block();
+        }
+        nb_seq = ((n0 - 128) << 8) + (block.get(p + 1) as i32);
+        p = p + 2;
+      } else {
+        if p + 3 > end {
+          return self.bad_block();
+        }
+        nb_seq = (block.get(p + 1) as i32) + ((block.get(p + 2) as i32) << 8) + 32512;
+        p = p + 3;
+      }
+    }
+    let mut lit_pos = 0;
+    let mut block_out = 0;
+    if nb_seq > 0 {
+      if p >= end {
+        return self.bad_block();
+      }
+      let modes = block.get(p) as i32;
+      p = p + 1;
+      if modes & 3 != 0 {
+        return self.bad_block();
+      }
+      let ll_size = read_seq_table(block, p, end, modes >> 6, LL_MAX_CODE, LL_MAX_LOG, &mut self.ll,
+        &self.ll_default);
+      if ll_size < 0 {
+        return self.bad_block();
+      }
+      p = p + ll_size;
+      let of_size = read_seq_table(block, p, end, (modes >> 4) & 3, OF_MAX_CODE, OF_MAX_LOG,
+        &mut self.of, &self.of_default);
+      if of_size < 0 {
+        return self.bad_block();
+      }
+      p = p + of_size;
+      let ml_size = read_seq_table(block, p, end, (modes >> 2) & 3, ML_MAX_CODE, ML_MAX_LOG,
+        &mut self.ml, &self.ml_default);
+      if ml_size < 0 {
+        return self.bad_block();
+      }
+      p = p + ml_size;
+      match back_bits(block, p, end) {
+        Option<BackBits>::Some(r0) => {
+          let mut r = r0;
+          let mut ll_state = back_read(block, &mut r, self.ll.log) as i32;
+          let mut of_state = back_read(block, &mut r, self.of.log) as i32;
+          let mut ml_state = back_read(block, &mut r, self.ml.log) as i32;
+          let mut i = 0;
+          while i < nb_seq {
+            let of_code = self.of.symbols.get(of_state);
+            let ll_code = self.ll.symbols.get(ll_state);
+            let ml_code = self.ml.symbols.get(ml_state);
+            if ll_code > LL_MAX_CODE || ml_code > ML_MAX_CODE || of_code > OF_MAX_CODE {
+              return self.bad_block();
+            }
+            let offset_value = (1i64 << (of_code as i64)) + back_read(block, &mut r, of_code);
+            let match_len = ml_base(ml_code) + back_read(block, &mut r, ml_bits(ml_code));
+            let lit_len = ll_base(ll_code) + back_read(block, &mut r, ll_bits(ll_code));
+            if i != nb_seq - 1 {
+              ll_state = self.ll.base.get(ll_state)
+                + (back_read(block, &mut r, self.ll.bits.get(ll_state)) as i32);
+              ml_state = self.ml.base.get(ml_state)
+                + (back_read(block, &mut r, self.ml.bits.get(ml_state)) as i32);
+              of_state = self.of.base.get(of_state)
+                + (back_read(block, &mut r, self.of.bits.get(of_state)) as i32);
+            }
+            // The literals of the sequence.
+            if (lit_pos as i64) + lit_len > (lits.len() as i64) {
+              return self.bad_block();
+            }
+            block_out = block_out + (lit_len as i32) + (match_len as i32);
+            if match_len > (BLOCK_MAX as i64) || block_out > self.block_max {
+              return self.bad_block();
+            }
+            let lit_end = lit_pos + (lit_len as i32);
+            while lit_pos < lit_end {
+              self.emit(out, lits.get(lit_pos));
+              lit_pos = lit_pos + 1;
+            }
+            self.frame_out = self.frame_out + lit_len;
+            // The offset, maybe one of the three last ones.
+            let offset = self.offset_of(offset_value, lit_len);
+            if offset <= 0i64 || offset > self.frame_out || offset > self.window
+               || offset > (self.hist.len() as i64) {
+              return self.bad_block();
+            }
+            let back = offset as i32;
+            let mut k = 0;
+            let n = match_len as i32;
+            while k < n {
+              let b = self.hist.get(self.hist.len() - back);
+              self.emit(out, b);
+              k = k + 1;
+            }
+            self.frame_out = self.frame_out + match_len;
+            i = i + 1;
+          }
+          if r.offset != 0i64 {
+            return self.bad_block();
+          }
+        },
+        Option<BackBits>::None() => {
+          return self.bad_block();
+        }
+      }
+    } else {
+      if p != end {
+        return self.bad_block();
+      }
+    }
+    // The literals after the last sequence.
+    let rest = lits.len() - lit_pos;
+    block_out = block_out + rest;
+    if block_out > self.block_max {
+      return self.bad_block();
+    }
+    while lit_pos < lits.len() {
+      self.emit(out, lits.get(lit_pos));
+      lit_pos = lit_pos + 1;
+    }
+    self.frame_out = self.frame_out + (rest as i64);
+    return true;
+  }
+
+  /// The offset of a sequence whose offset value is `value` (RFC 8878, 3.1.1.5): a new offset,
+  /// or one of the three last ones. It updates the three.
+  fn offset_of(self : &mut Zstd, value : i64, lit_len : i64) -> i64 {
+    if value > 3i64 {
+      let offset = value - 3i64;
+      self.rep2 = self.rep1;
+      self.rep1 = self.rep0;
+      self.rep0 = offset;
+      return offset;
+    }
+    let mut idx = value - 1i64;
+    if lit_len == 0i64 {
+      idx = idx + 1i64;
+    }
+    if idx == 0i64 {
+      return self.rep0;
+    }
+    let mut offset = self.rep0 - 1i64;
+    if idx == 1i64 {
+      offset = self.rep1;
+    }
+    if idx == 2i64 {
+      offset = self.rep2;
+    }
+    if idx > 1i64 {
+      self.rep2 = self.rep1;
+    }
+    self.rep1 = self.rep0;
+    self.rep0 = offset;
+    return offset;
+  }
+
+  fn bad_block(self : &mut Zstd) -> bool {
+    self.error = lit("Data corruption detected");
+    return false;
+  }
+
+  /// Keep only the part of the output that a match can still reach.
+  fn trim_history(self : &mut Zstd) -> void {
+    let mut keep = self.window;
+    if keep < (BLOCK_MAX as i64) {
+      keep = BLOCK_MAX as i64;
+    }
+    if (self.hist.len() as i64) > keep * 2i64 + (BLOCK_MAX as i64) {
+      self.hist = rest_from(&self.hist, self.hist.len() - (keep as i32));
+    }
+  }
+
+  /// Decode `piece`, the next part of the body. Gives the bytes that it could decode, or
+  /// Err(-2) with the reason in `error`.
+  pub fn feed(self : &mut Zstd, piece : &Vec<u8>) -> Result<Vec<u8>, i32> {
+    let mut out = Vec<u8>::new();
+    if piece.len() == 0 {
+      return Result<Vec<u8>, i32>::Ok(out);
+    }
+    self.started = true;
+    if self.pos > 0 {
+      self.input = rest_from(&self.input, self.pos);
+      self.pos = 0;
+    }
+    append(&mut self.input, piece);
+    loop {
+      let avail = self.input.len() - self.pos;
+      if self.state == Z_MAGIC {
+        if avail < 4 {
+          return Result<Vec<u8>, i32>::Ok(out);
+        }
+        let magic = le32(&self.input, self.pos);
+        if magic == 4247762216i64 {
+          self.pos = self.pos + 4;
+          self.state = Z_HEADER;
+          continue;
+        }
+        if (magic >> 4i64) == 25481893i64 {
+          // A skippable frame: its size, then that many bytes.
+          if avail < 8 {
+            return Result<Vec<u8>, i32>::Ok(out);
+          }
+          self.skip_left = le32(&self.input, self.pos + 4);
+          self.pos = self.pos + 8;
+          self.state = Z_SKIP;
+          continue;
+        }
+        return self.fail("Unknown frame descriptor");
+      }
+      if self.state == Z_SKIP {
+        let mut n = avail as i64;
+        if n > self.skip_left {
+          n = self.skip_left;
+        }
+        self.pos = self.pos + (n as i32);
+        self.skip_left = self.skip_left - n;
+        if self.skip_left > 0i64 {
+          return Result<Vec<u8>, i32>::Ok(out);
+        }
+        self.state = Z_MAGIC;
+        continue;
+      }
+      if self.state == Z_HEADER {
+        let size = self.frame_header();
+        if size < 0 {
+          return Result<Vec<u8>, i32>::Err(-2);
+        }
+        if size == 0 {
+          return Result<Vec<u8>, i32>::Ok(out);
+        }
+        self.pos = self.pos + size;
+        self.start_frame();
+        self.state = Z_BLOCK_HEADER;
+        continue;
+      }
+      if self.state == Z_BLOCK_HEADER {
+        if avail < 3 {
+          return Result<Vec<u8>, i32>::Ok(out);
+        }
+        let h = (self.input.get(self.pos) as i32) + ((self.input.get(self.pos + 1) as i32) << 8)
+          + ((self.input.get(self.pos + 2) as i32) << 16);
+        self.block_last = h & 1 == 1;
+        self.block_type = (h >> 1) & 3;
+        self.block_size = h >> 3;
+        if self.block_type == 3 {
+          return self.fail("Data corruption detected");
+        }
+        if self.block_size > self.block_max {
+          return self.fail("Data corruption detected");
+        }
+        self.pos = self.pos + 3;
+        self.state = Z_BLOCK;
+        continue;
+      }
+      if self.state == Z_BLOCK {
+        let mut need = self.block_size;
+        if self.block_type == BLOCK_RLE {
+          need = 1;
+        }
+        if avail < need {
+          return Result<Vec<u8>, i32>::Ok(out);
+        }
+        let before = out.len();
+        if self.block_type == BLOCK_RAW {
+          let mut i = 0;
+          while i < need {
+            let b = self.input.get(self.pos + i);
+            self.emit(&mut out, b);
+            i = i + 1;
+          }
+          self.frame_out = self.frame_out + (need as i64);
+        }
+        if self.block_type == BLOCK_RLE {
+          let b = self.input.get(self.pos);
+          let mut i = 0;
+          while i < self.block_size {
+            self.emit(&mut out, b);
+            i = i + 1;
+          }
+          self.frame_out = self.frame_out + (self.block_size as i64);
+        }
+        if self.block_type == BLOCK_COMPRESSED {
+          let block = range_of(&self.input, self.pos, self.pos + need);
+          if !self.compressed_block(&block, &mut out) {
+            return Result<Vec<u8>, i32>::Err(-2);
+          }
+        }
+        self.pos = self.pos + need;
+        if self.content_size >= 0i64 && self.frame_out > self.content_size {
+          return self.fail("Data corruption detected");
+        }
+        if self.has_checksum {
+          self.hash.update(&out, before, out.len());
+        }
+        self.trim_history();
+        if !self.block_last {
+          self.state = Z_BLOCK_HEADER;
+          continue;
+        }
+        if self.content_size >= 0i64 && self.frame_out != self.content_size {
+          return self.fail("Data corruption detected");
+        }
+        if self.has_checksum {
+          self.state = Z_CHECKSUM;
+        } else {
+          self.state = Z_MAGIC;
+        }
+        continue;
+      }
+      // Z_CHECKSUM: the low 32 bits of the XXH64 of the frame.
+      if avail < 4 {
+        return Result<Vec<u8>, i32>::Ok(out);
+      }
+      let want = le32(&self.input, self.pos) as u64;
+      self.pos = self.pos + 4;
+      if (self.hash.digest() & 4294967295u64) != want {
+        return self.fail("Restored data doesn't match checksum");
+      }
+      self.state = Z_MAGIC;
+    }
+  }
+
+  /// Whether the body may end here: before any input, or right after a frame.
+  pub fn complete(self : &Zstd) -> bool {
+    return !self.started || (self.state == Z_MAGIC && self.pos == self.input.len());
+  }
+}

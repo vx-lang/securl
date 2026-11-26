@@ -382,6 +382,30 @@ stderr_has "  with curl's message" "Unrecognized content encoding type"
 check "six encodings" 61 "" -sS --compressed -o /dev/null "http://127.0.0.1:$http/six"
 stderr_has "  with curl's message" "Reject response exceeding limit of 5 content encodings"
 
+# zstd, when the servers can make it and the curl under test has it. The body is the same.
+if python3 -I -c 'import compression.zstd' 2> /dev/null && "$curl" -V | grep -q '^Features:.* zstd'; then
+  check "--compressed decodes zstd" 0 "203890" -s --compressed -w '%{size_delivered}' \
+    -o "$work/zst" "http://127.0.0.1:$http/zstd"
+  if cmp -s "$work/zst" "$work/gz"; then
+    echo "ok     to the last byte"
+  else
+    echo "FAIL   the zstd body differs"
+    fail=1
+  fi
+  check "  in two frames with a skippable frame between" 0 "203890" -s --compressed \
+    -w '%{size_delivered}' -o "$work/zst" "http://127.0.0.1:$http/zstd-frames"
+  check "  and zstd, gzip" 0 "203890" -s --compressed -w '%{size_delivered}' -o "$work/zst" \
+    "http://127.0.0.1:$http/zstd-gzip"
+  check "a zstd body cut short" 61 "" -sS --compressed -o /dev/null \
+    "http://127.0.0.1:$http/zstd-cut"
+  stderr_has "  with curl's message" "Zstd stream ended before completion"
+  check "a zstd body with a bad checksum" 61 "" -sS --compressed -o /dev/null \
+    "http://127.0.0.1:$http/zstd-bad-sum"
+  stderr_has "  with curl's message" "Unrecognized or bad HTTP Content or Transfer-Encoding"
+else
+  echo "skip zstd: python3 has no compression.zstd, or $curl has no zstd"
+fi
+
 # --tr-encoding: gzip as a transfer coding. Without it, curl refuses one that it did not ask for.
 check "--tr-encoding decodes Transfer-Encoding: gzip" 0 "203890" -s --tr-encoding \
   -w '%{size_delivered}' -o "$work/te" "http://127.0.0.1:$http/te-gzip"

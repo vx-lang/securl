@@ -24,7 +24,8 @@ On both HTTP servers, `/stall` sends 10 of the 100 bytes of its body and then wa
 time limits of reads, and `/huge-chunk` sends a chunk size too large for 64 bits. The paths of
 `ENDLESS` send a status line, a header, a chunk-size line or a trailer that never ends, and
 `/chunk-junk` a chunk with no CRLF after its data. The paths of `ENCODED` send a body with a
-Content-Encoding for `--compressed`. `/sts?VALUE` sends a Strict-Transport-Security header with
+Content-Encoding for `--compressed`; with Python 3.14 or later, which has `compression.zstd`,
+they include zstd bodies. `/sts?VALUE` sends a Strict-Transport-Security header with
 the decoded VALUE, for `--hsts`.
 
 It runs until it is killed.
@@ -70,6 +71,23 @@ ENCODED = {
     "/compress": ("compress", b"not decodable", False),
     "/six": ("gzip, gzip, gzip, gzip, gzip, gzip", _GZ, False),
 }
+try:
+    from compression import zstd
+except ImportError:
+    zstd = None
+if zstd:
+    _ZST = zstd.compress(TEXT, options={zstd.CompressionParameter.compression_level: 19,
+                                        zstd.CompressionParameter.checksum_flag: 1})
+    # A skippable frame between two frames.
+    _SKIP = struct.pack("<II", 0x184D2A53, 5) + b"12345"
+    ENCODED.update({
+        "/zstd": ("zstd", _ZST, True),
+        "/zstd-cut": ("zstd", _ZST[:len(_ZST) // 2], False),
+        "/zstd-bad-sum": ("zstd", _ZST[:-1] + bytes([_ZST[-1] ^ 1]), False),
+        "/zstd-frames": ("zstd", zstd.compress(TEXT[:1000]) + _SKIP + zstd.compress(TEXT[1000:]),
+                         False),
+        "/zstd-gzip": ("zstd, gzip", gzip_bytes(_ZST), True),
+    })
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
