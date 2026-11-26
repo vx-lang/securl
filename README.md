@@ -19,7 +19,7 @@ The goal is to show what Vx's type system buys a network tool:
 ## Get it
 
 ```sh
-git clone --recurse-submodules --shallow-submodules https://github.com/<you>/curl-vx
+git clone --recurse-submodules --shallow-submodules https://github.com/vx-lang/securl
 # or, in a clone without the submodule:
 git submodule update --init --depth 1
 ```
@@ -67,7 +67,7 @@ Digest tests (see "Run curl's test suite"). Before Digest, curl-vx passed 409 of
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/curlvx/` (the package with all protocol code) | 8,022 | none, and `--no-trusted-code` enforces this |
+| `src/curlvx/` (the package with all protocol code) | 8,187 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx`, `src/disk.vx` | 618 | none |
 | `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 872 | 39 `extern` functions, 55 `unsafe` blocks |
 
@@ -170,11 +170,11 @@ make openssl-dev       # prints the -DOPENSSL_ROOT_DIR for cmake
 git clone --depth 1 https://github.com/curl/curl ~/curl-src
 cd ~/curl-src
 cmake -B build -DCURL_ENABLE_SSL=ON -DCURL_USE_OPENSSL=ON -DOPENSSL_USE_STATIC_LIBS=ON \
-  -DOPENSSL_ROOT_DIR=$HOME/curl-vx/build/openssl-dev/usr/local \
+  -DOPENSSL_ROOT_DIR=$HOME/securl/build/openssl-dev/usr/local \
   -DCURL_USE_LIBPSL=OFF -DUSE_LIBIDN2=OFF -DCURL_ZLIB=OFF -DCURL_BROTLI=OFF -DCURL_ZSTD=OFF \
   -DUSE_NGHTTP2=OFF -DCURL_USE_LIBSSH2=OFF -DCURL_DISABLE_LDAP=ON -DBUILD_TESTING=ON
 cmake --build build -j8 && cmake --build build --target testdeps -j8
-cd ~/curl-vx
+cd ~/securl
 tools/build-test-tools.sh                  # optional: nghttpx and stunnel, see below
 make test CURL_SRC=~/curl-src              # every HTTP test
 make test-supported CURL_SRC=~/curl-src    # the tests in tests/supported-tests.txt
