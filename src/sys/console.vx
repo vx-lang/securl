@@ -1,28 +1,25 @@
 // Standard output, standard error and standard input as byte lists.
 //
-// TRUSTED CODE. `std::io::stdout_write` goes through the line buffer of Rust's `stdout`, and
-// nothing flushes that buffer when a Vx program ends. So the bytes after the last newline are
-// lost, for example a body that does not end in a newline. These functions call the `write`
-// of the C library on file descriptors 1 and 2 instead, so no byte waits in a buffer.
+// TRUSTED CODE. `std::io` writes and reads through raw pointers, so each call needs `unsafe`.
 import core::ptr;
 import std::io;
 import std::vec;
 
-extern "C" {
-  fn write(fd : i32, buffer : *const u8, count : u64) -> i64;
-}
-
-/// Write all bytes of `bytes` to the file descriptor `fd`. Gives false when it is closed.
+/// Write all bytes of `bytes` to standard output (`fd` 1) or standard error (`fd` 2). Gives false
+/// when it is closed.
 fn write_all_fd(fd : i32, bytes : &Vec<u8>) -> bool {
   let len = bytes.len() as u64;
   let base = bytes.as_mut_ptr() as *const u8;
   let mut done : u64 = 0;
   while done < len {
-    let n = unsafe { write(fd, add(base, done as usize), len - done) };
-    if n <= 0i64 {
+    let at = add(base, done as usize);
+    let n = unsafe {
+      if fd == 1 { stdout_write(at, len - done) } else { stderr_write(at, len - done) }
+    };
+    if n == 0u64 {
       return false;
     }
-    done = done + (n as u64);
+    done = done + n;
   }
   return true;
 }

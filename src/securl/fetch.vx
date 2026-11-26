@@ -1112,17 +1112,13 @@ form_boundary : &Vec<u8>, jar : &mut CookieJar, sinks : &mut Sinks, info : &mut 
   let mut auth_rounds = 0;
   let first_port = first.port;
   let first_scheme = clone_bytes(&first.scheme);
-  let first_host = first.host;
-  // The URL of the current request, as text. Each turn of the loop parses it again, so that no
-  // value of one turn outlives the turn.
-  let mut current = clone_bytes(url_text);
-  let mut path_as_is = cfg.path_as_is;
+  let first_host = clone_bytes(&first.host);
+  let mut u = first;
   let mut req_kind = kind;
   let mut has_referer = cfg.has_referer;
   let mut referer = clone_bytes(&cfg.referer);
   let mut redirects = 0;
   loop {
-    let u = parse_url(&current, path_as_is)?;
     info.url_effective = url_text(&u);
     if !eq_lit(&u.scheme, "http") && !eq_lit(&u.scheme, "https") {
       let mut m = lit("Protocol \"");
@@ -1174,9 +1170,7 @@ form_boundary : &Vec<u8>, jar : &mut CookieJar, sinks : &mut Sinks, info : &mut 
       has_referer = true;
       referer = url_text(&u);
     }
-    // The URL of a redirect is already normalized.
-    current = next_text;
-    path_as_is = true;
+    u = next;
     info.num_redirects = redirects;
   }
 }

@@ -54,7 +54,7 @@ make test-h2    # HTTP/2 tests against a local server (makes a virtualenv with h
 
 Measured with curl's own test suite: curl's `runtests.pl` and its test servers, pointed at
 `build/securl` with `-c`. The tests come from curl commit 2f5c657, and the compiler is vxc from
-Vx main d3ed6cf0b.
+Vx main 860f9f31a.
 
 | Test set | Passed |
 |---|---|
@@ -78,12 +78,12 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 8,599 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 8,593 | none, and `--no-trusted-code` enforces this |
 | `src/cli/` (the tool) and `src/disk/` (its files) | 619 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` to `cli`) | 11 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
-| `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 908 | 38 `extern` functions, 55 `unsafe` blocks |
+| `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 905 | 37 `extern` functions, 54 `unsafe` blocks |
 
-Of the trusted code in `src/sys/`, 80 of the 93 items are the OpenSSL bindings: TLS (with the
+Of the trusted code in `src/sys/`, 80 of the 91 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
 `hash.vx`.
 Two safe functions of `sys` read through a raw pointer with no check, `lit` and `push_lit`,
@@ -93,7 +93,7 @@ literal stays the only pointer that the other packages can have, `tools/check-no
 refuses `as_mut_ptr`, `as_ptr`, pointer casts and `core::ptr` outside `src/sys`. Each build,
 `make audit` and the GitHub workflow in `.github/workflows/checks.yml` run it.
 
-`core` and `std` have trusted code too: the audit counts 965 `unsafe` blocks and 77 `extern`
+`core` and `std` have trusted code too: the audit counts 978 `unsafe` blocks and 83 `extern`
 functions in the modules that the program uses. That is the trusted base of the language, as
 Rust's `std` is for a Rust program. OpenSSL itself is C.
 
@@ -243,17 +243,12 @@ In order of how much users need them:
 
 ## Vx issues found while writing securl
 
-The Vx project tracks these.
+The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #4026) and #3999
+(with #4028), and securl no longer works around them.
 
-- [#4000](https://github.com/vx-lang/Vx/issues/4000) `std::io::stdout_write` writes through
-  Rust's line buffer, and nothing flushes it when a Vx program ends. The bytes after the last
-  newline are lost. `src/sys/console.vx` calls `write(2)` directly instead.
-- [#3998](https://github.com/vx-lang/Vx/issues/3998) Compile time grows about 2x with each link
-  of an `else if` chain: 24 links take 6.8 s, and 50 links did not finish. `options.vx` uses
-  flat `if .. { return }` blocks instead.
-- [#3999](https://github.com/vx-lang/Vx/issues/3999) `--audit` and `--no-trusted-code` blame the
-  `unsafe` block of a trait's default method (`core::fmt::Write::write_c_str`) on the file that
-  writes the `impl`.
+- [#3998](https://github.com/vx-lang/Vx/issues/3998) Compile time grew about 2x with each link
+  of an `else if` chain. `options.vx` uses flat `if .. { return }` blocks. Vx #4024 fixed it,
+  and the flat blocks stay because they read as well.
 - [#4005](https://github.com/vx-lang/Vx/issues/4005) No safe way to make a `String` from bytes,
   to write a `Vec<u8>` to standard output, to copy the bytes of a string literal, or to read an
   environment variable. Vx PR #3975 adds `root.args`. `src/sys/` wraps each of these.
@@ -263,11 +258,6 @@ The Vx project tracks these.
   [#4004](https://github.com/vx-lang/Vx/issues/4004): a reference cannot be pointed at another
   field, `assert(false, ..)` fails at compile time on a path that never runs, and there is no
   `ref mut` pattern or `Option::as_mut`.
-- [#4010](https://github.com/vx-lang/Vx/issues/4010) In a loop, `info.url_effective =
-  url_text(&u);` makes the checker think that `info` borrows `u`, so a later `u = next;` gets
-  E4009. The result of `url_text` holds no reference. `fetch.vx` carries the URL as text
-  instead. Binding the result first (`let t = url_text(&u); info.url_effective = t;`) also
-  works.
 - [#4092](https://github.com/vx-lang/Vx/issues/4092) `--no-trusted-code` takes the body of each
   closure for an `unsafe` block (E5003), while `--audit` lists nothing for it. So the package
   `securl` cannot pass a closure to `std::sync::wait::within`, and `src/sys/tls.vx` holds those
