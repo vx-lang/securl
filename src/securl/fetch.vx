@@ -251,14 +251,21 @@ fn connect_address(cfg : &Config, u : &Url) -> Result<Vec<u8>, Failure> {
 // a header line too.
 const MAX_HEADER_LINE : i32 = 102400;
 const MAX_HEADERS_SIZE : i64 = 307200i64;
+// The longest trailer line, with its CRLF, as libcurl's DYN_H1_TRAILER of 4096 bytes allows.
+const MAX_TRAILER_LINE : i32 = 4095;
+
 const MAX_HEADER_COUNT : i32 = 5000;
 
 /// Read one response head: the status line and the headers, up to the empty line. `total`
 /// counts the header bytes of all responses of the transfer, which libcurl also limits.
+///
+/// A status line or header line longer than 100 KiB fails with the text of CURLE_TOO_LARGE, as
+/// in curl, where libcurl gives that error with no message of its own.
 fn read_head(c : &mut Conn, raw : bool, total : &mut i64) -> Result<ResponseHead, Failure> {
   let mut head = empty_head();
   let mut line = Vec<u8>::new();
-  let n = c.read_line(&mut line, MAX_HEADER_LINE, TOO_LARGE, "Too large response headers")?;
+  let n = c.read_line(&mut line, MAX_HEADER_LINE, TOO_LARGE,
+    "A value or data field grew larger than allowed")?;
   if n == 0 {
     return Result<ResponseHead, Failure>::Err(fail_lit(GOT_NOTHING, "Empty reply from server"));
   }
@@ -274,7 +281,8 @@ fn read_head(c : &mut Conn, raw : bool, total : &mut i64) -> Result<ResponseHead
   let mut index = 1;
   loop {
     let mut h = Vec<u8>::new();
-    let got = c.read_line(&mut h, MAX_HEADER_LINE, TOO_LARGE, "Too large response headers")?;
+    let got = c.read_line(&mut h, MAX_HEADER_LINE, TOO_LARGE,
+      "A value or data field grew larger than allowed")?;
     if got == 0 {
       // The peer closed the connection inside the headers.
       return Result<ResponseHead, Failure>::Ok(head);
@@ -282,8 +290,9 @@ fn read_head(c : &mut Conn, raw : bool, total : &mut i64) -> Result<ResponseHead
     index = index + 1;
     size = size + (h.len() as i64);
     *total = *total + (h.len() as i64);
-    if h.len() > MAX_HEADER_LINE || index > MAX_HEADER_COUNT {
-      return Result<ResponseHead, Failure>::Err(fail_lit(TOO_LARGE, "Too large response headers"));
+    if index > MAX_HEADER_COUNT {
+      return Result<ResponseHead, Failure>::Err(fail_lit(TOO_LARGE,
+        "Too many response headers, 5000 is max"));
     }
     if size > MAX_HEADERS_SIZE || *total > MAX_HEADERS_SIZE * 20i64 {
       let mut m = lit("Too large response headers: ");
@@ -377,10 +386,14 @@ raw : bool) -> Result<i32, Failure> {
       let mut trailer_size : i64 = 0i64;
       loop {
         let mut t = Vec<u8>::new();
-        let got = c.read_line(&mut t, MAX_HEADER_LINE, TOO_LARGE, "Too large response headers")?;
+        let got = c.read_line(&mut t, MAX_TRAILER_LINE, TOO_LARGE,
+          "Out of memory in chunked-encoding")?;
         trailer_size = trailer_size + (got as i64);
         if trailer_size > MAX_HEADERS_SIZE {
-          return Result<i32, Failure>::Err(fail_lit(TOO_LARGE, "Too large response headers"));
+          let mut m = lit("Too large response headers: ");
+          push_i64(&mut m, trailer_size);
+          push_lit(&mut m, " > 307200");
+          return Result<i32, Failure>::Err(fail_with(RECV_ERROR, m));
         }
         if raw {
           let _w = out.write(&t)?;

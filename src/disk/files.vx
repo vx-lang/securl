@@ -14,6 +14,36 @@ fn path_string(name : &Vec<u8>) -> Option<String> {
   return to_string(name);
 }
 
+/// Whether a file or a folder has the path `name`, as curl's `stat` check of `--cacert` asks. A
+/// file that the program may not read exists too.
+pub fn file_exists(files : &Files, name : &Vec<u8>) -> bool {
+  match path_string(name) {
+    Option<String>::Some(path) => {
+      match File::open(files, &path, OpenMode::Read()) {
+        Result<File, FileError>::Ok(_f) => {
+          return true;
+        },
+        Result<File, FileError>::Err(e) => {
+          match e {
+            FileError::NotFound() => {
+              return false;
+            },
+            FileError::BadPath() => {
+              return false;
+            },
+            _ => {
+              return true;
+            }
+          }
+        }
+      }
+    },
+    Option<String>::None() => {
+      return false;
+    }
+  }
+}
+
 /// All bytes of the file `name`. `-` means standard input.
 pub fn read_file(files : &Files, name : &Vec<u8>) -> Result<Vec<u8>, Failure> {
   if eq_lit(name, "-") {

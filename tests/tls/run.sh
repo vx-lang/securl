@@ -98,13 +98,18 @@ check "host name not in the certificate" 60 "" \
 check "a name that looks like an address" 60 "" \
   -sS --cacert "$certs/ca.pem" --resolve "999.1.1.1:$https:127.0.0.1" \
   "https://999.1.1.1:$https/"
+# -g, or curl reads the brackets as a glob.
 check "a bad IPv6 address" 3 "" \
-  -sS --cacert "$certs/ca.pem" "https://[1:2:3]:$https/"
+  -sS -g --cacert "$certs/ca.pem" "https://[1:2:3]:$https/"
 stderr_has "  with curl's message" "URL rejected: Bad IPv6 address"
 check "an IPv6 zone is not part of the name" 3 "" \
-  -sS --cacert "$certs/ca.pem" "https://[::1%25lo%zz]:$https/"
-check "missing --cacert file" 77 "" \
+  -sS -g --cacert "$certs/ca.pem" "https://[::1%25lo%zz]:$https/"
+# curl checks that the file exists while it reads the command line.
+check "missing --cacert file" 2 "" \
   -sS --cacert "$work/no-such-file.pem" "https://localhost:$https/"
+stderr_has "  with curl's message" "provided to --cacert does not exist"
+check "a --cacert file that holds no certificate" 77 "" \
+  -sS --cacert "$here/run.sh" "https://localhost:$https/"
 check "1 MiB in chunks" 0 "200 1048576" \
   -sS --cacert "$certs/ca.pem" -o "$work/big" -w '%{http_code} %{size_download}' \
   "https://localhost:$https/big"
@@ -123,12 +128,21 @@ fi
 check "a chunk size of 2^63" 56 "" \
   -sS "http://127.0.0.1:$http/huge-chunk"
 stderr_has "  with curl's message" "invalid chunk size: '8000000000000000'"
-# A peer that never ends a line must not make securl read on: each line has a limit.
+# A peer that never ends a line must not make securl read on: each line has a limit, 100 KiB
+# for a status or header line and 4 KiB for a trailer, as in libcurl.
 check "a status line with no end" 100 "" -sS "http://127.0.0.1:$http/endless-status"
-stderr_has "  with curl's message" "Too large response headers"
+stderr_has "  with curl's message" "A value or data field grew larger than allowed"
 check "a header line with no end" 100 "" -sS "http://127.0.0.1:$http/endless-header"
-check "a chunk-size line with no end" 56 "" -sS "http://127.0.0.1:$http/endless-chunk-line"
+stderr_has "  with curl's message" "A value or data field grew larger than allowed"
+# curl reads the extension of a chunk-size line with no limit, so it waits until -m. securl
+# stops at 100 KiB.
+if [ -z "${CURL:-}" ]; then
+  check "a chunk-size line with no end" 56 "" -sS "http://127.0.0.1:$http/endless-chunk-line"
+else
+  echo "skip a chunk-size line with no end: curl waits for -m there, and securl does not"
+fi
 check "a trailer with no end" 100 "" -sS "http://127.0.0.1:$http/endless-trailer"
+stderr_has "  with curl's message" "Out of memory in chunked-encoding"
 check "chunk data with no CRLF after it" 56 "hello" -sS "http://127.0.0.1:$http/chunk-junk"
 stderr_has "  with curl's message" "Malformed encoding found in chunked-encoding"
 # A body that ends when the connection closes is whole only when TLS ends it with its close
@@ -203,7 +217,9 @@ sockopts "--keepalive-time, --keepalive-cnt and --no-tcp-nodelay" \
   "SO_KEEPALIVE=1 TCP_KEEPIDLE=17 TCP_KEEPINTVL=17 TCP_KEEPCNT=3" \
   -s --keepalive-time 17 --keepalive-cnt 3 --no-tcp-nodelay "http://127.0.0.1:$http/"
 sockopts "--no-keepalive" "TCP_NODELAY=1" -s --no-keepalive "http://127.0.0.1:$http/"
+# --resolve, because curl also tries ::1 for localhost, which sets the options on a second
+# socket.
 sockopts "the same options over TLS" \
   "TCP_NODELAY=1 SO_KEEPALIVE=1 TCP_KEEPIDLE=60 TCP_KEEPINTVL=60 TCP_KEEPCNT=9" \
-  -s --cacert "$certs/ca.pem" "https://localhost:$https/"
+  -s --cacert "$certs/ca.pem" --resolve "localhost:$https:127.0.0.1" "https://localhost:$https/"
 exit $fail

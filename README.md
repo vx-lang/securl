@@ -62,9 +62,14 @@ Vx main 860f9f31a.
 |---|---|
 | The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 376 of 720 (52%) |
 | The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 353 of 429 (82%) |
-| TLS, proxy, socket-option and limit tests against local servers (`tests/tls`) | 55 of 55 |
+| TLS, proxy, socket-option and limit tests against local servers (`tests/tls`) | 59 of 59 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 7 of 7 |
+
+`CURL=/path/to/curl tests/tls/run.sh` runs the checks of `tests/tls` against another curl. curl
+8.23.1-DEV, built from the same curl commit, passes all of them but one, which it skips: curl
+reads the extension of a chunk-size line with no limit and waits for `-m`, while securl stops
+after 100 KiB.
 
 Some HTTP tests have the keyword `libtest` or `unittest`. For those, runtests.pl runs a C
 program of the curl build, linked with curl's own libcurl, so they never run securl.

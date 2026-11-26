@@ -66,6 +66,16 @@ pub fn tool_main(root : Root) -> i32 {
     Result<Config, Failure>::Ok(parsed) => {
       let mut cfg = parsed;
       cfg.proxy_env = proxy_env(&root.env);
+      // As curl does while it reads the command line: a `--cacert` file must exist.
+      if cfg.cacert.len() > 0 && !file_exists(&root.files, &cfg.cacert) {
+        let mut m = lit("curl: The file '");
+        append(&mut m, &cfg.cacert);
+        push_lit(&mut m, "' provided to --cacert does not exist\n");
+        push_lit(&mut m, "curl: option --cacert: is badly used here\n");
+        push_lit(&mut m, "curl: try 'curl --help' for more information\n");
+        to_stderr(&m);
+        return FAILED_INIT;
+      }
       return run(&root.network, &root.files, &cfg);
     },
     Result<Config, Failure>::Err(f) => {
