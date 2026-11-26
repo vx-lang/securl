@@ -11,6 +11,7 @@ import std::time;
 import std::vec;
 import sys::text;
 import sys::tls;
+import curlvx::address;
 import curlvx::auth;
 import curlvx::bytes;
 import curlvx::conn;
@@ -814,7 +815,8 @@ address : &Vec<u8>, secure : bool, deadline : Instant, info : &mut TransferInfo)
       open_tunnel(&mut c, cfg, u, proxy, info)?;
     }
     // curl offers HTTP/2 over TLS unless `--http1.1` or `--http1.0` says no.
-    let _tls = c.start_tls(tls, &u.host, !cfg.no_h2 && !cfg.http10)?;
+    let _tls = c.start_tls(tls, &u.host, host_is_address(&u.host, u.ipv6),
+      !cfg.no_h2 && !cfg.http10)?;
     if cfg.verbose {
       verbose_info(&lit("TLS handshake done"));
     }

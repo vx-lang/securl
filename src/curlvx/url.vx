@@ -4,6 +4,7 @@ import core::option;
 import core::result;
 import std::vec;
 import sys::text;
+import curlvx::address;
 import curlvx::bytes;
 import curlvx::failure;
 
@@ -16,8 +17,11 @@ struct Url {
   has_password : bool,
   password : Vec<u8>,
   host : Vec<u8>,
-  // The host is an IPv6 address. `host` holds it without the brackets.
+  // The host is an IPv6 address. `host` holds it without the brackets, in its short form.
   ipv6 : bool,
+  // The zone of an IPv6 address, as in `[fe80::1%25eth0]`, or empty. curl-vx keeps it for
+  // the URL that `-w` writes, but does not connect through the zone yet.
+  zone : Vec<u8>,
   port : i32,
   path : Vec<u8>,
 }
@@ -32,6 +36,7 @@ pub fn clone_url(u : &Url) -> Url {
     password : clone_bytes(&u.password),
     host : clone_bytes(&u.host),
     ipv6 : u.ipv6,
+    zone : clone_bytes(&u.zone),
     port : u.port,
     path : clone_bytes(&u.path)
   };
@@ -223,6 +228,7 @@ pub fn parse_url(text : &Vec<u8>, path_as_is : bool) -> Result<Url, Failure> {
 
   let mut host = Vec<u8>::new();
   let mut ipv6 = false;
+  let mut zone = Vec<u8>::new();
   let mut port_text = Vec<u8>::new();
   let mut has_port = false;
   if host_port.len() > 0 && host_port.get(0) == 91u8 {
@@ -231,7 +237,16 @@ pub fn parse_url(text : &Vec<u8>, path_as_is : bool) -> Result<Url, Failure> {
       return Result<Url, Failure>::Err(fail_lit(URL_MALFORMAT,
         "URL rejected: Bad IPv6 address"));
     }
-    host = range_of(&host_port, 1, close);
+    match bracket_host(&percent_decode(&range_of(&host_port, 1, close))) {
+      Option<BracketHost>::Some(h) => {
+        host = clone_bytes(&h.address);
+        zone = clone_bytes(&h.zone);
+      },
+      Option<BracketHost>::None() => {
+        return Result<Url, Failure>::Err(fail_lit(URL_MALFORMAT,
+          "URL rejected: Bad IPv6 address"));
+      }
+    }
     ipv6 = true;
     if close + 1 < host_port.len() {
       if host_port.get(close + 1) != 58u8 {
@@ -290,9 +305,63 @@ pub fn parse_url(text : &Vec<u8>, path_as_is : bool) -> Result<Url, Failure> {
     password : password,
     host : host,
     ipv6 : ipv6,
+    zone : zone,
     port : port,
     path : path
   });
+}
+
+/// The host between the brackets of a URL.
+struct BracketHost {
+  // The IPv6 address in its short form.
+  address : Vec<u8>,
+  // The zone after the `%`, or empty.
+  zone : Vec<u8>,
+}
+
+/// Whether `b` can be in a zone: curl allows letters, digits, `-`, `.`, `_`, `~` and the
+/// bytes from 128 up, as in a host name.
+fn is_zone_byte(b : u8) -> bool {
+  return is_digit(b) || (b >= 65u8 && b <= 90u8) || (b >= 97u8 && b <= 122u8) || b == 45u8
+    || b == 46u8 || b == 95u8 || b == 126u8 || b >= 128u8;
+}
+
+/// The host between the brackets of a URL, after percent decoding, as curl's `ipv6_parse`
+/// reads it: an IPv6 address, maybe with `%` and a zone of 1 to 15 bytes, as in
+/// `fe80::1%eth0`. The address comes back in its short form, as curl writes it, so
+/// `[0:0::1]` becomes `[::1]`.
+fn bracket_host(inside : &Vec<u8>) -> Option<BracketHost> {
+  let mut len = 0;
+  while len < inside.len() && (hex_value(inside.get(len)) >= 0 || inside.get(len) == 58u8
+    || inside.get(len) == 46u8) {
+    len = len + 1;
+  }
+  let mut zone = Vec<u8>::new();
+  if len < inside.len() {
+    if inside.get(len) != 37u8 {
+      return Option<BracketHost>::None();
+    }
+    zone = rest_from(inside, len + 1);
+    if zone.len() == 0 || zone.len() > 15 {
+      return Option<BracketHost>::None();
+    }
+    for b in zone.iter() {
+      if !is_zone_byte(*b) {
+        return Option<BracketHost>::None();
+      }
+    }
+  }
+  match parse_ipv6(&range_of(inside, 0, len)) {
+    Option<Vec<u8>>::Some(a) => {
+      return Option<BracketHost>::Some(BracketHost {
+        address : ipv6_text(&a),
+        zone : zone
+      });
+    },
+    Option<Vec<u8>>::None() => {
+      return Option<BracketHost>::None();
+    }
+  }
 }
 
 /// The URL that a redirect to `location` leads to from `base`. `location` can be a whole URL,
@@ -389,7 +458,16 @@ pub fn url_text(u : &Url) -> Vec<u8> {
     }
     push_lit(&mut out, "@");
   }
-  append(&mut out, &host_text(u));
+  if u.ipv6 && u.zone.len() > 0 {
+    // curl writes the zone back into the URL, encoded as `%25`. The `Host` header has none.
+    push_lit(&mut out, "[");
+    append(&mut out, &u.host);
+    push_lit(&mut out, "%25");
+    append(&mut out, &u.zone);
+    push_lit(&mut out, "]");
+  } else {
+    append(&mut out, &host_text(u));
+  }
   if u.port != default_port(&u.scheme) {
     push_lit(&mut out, ":");
     push_u64(&mut out, u.port as u64);

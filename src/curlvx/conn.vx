@@ -114,10 +114,10 @@ impl Conn {
 
   /// Start TLS for the server `host`, and offer HTTP/2 with ALPN when `offer_h2`. A response
   /// must not be half read.
-  pub fn start_tls(self : &mut Conn, config : &TlsConfig, host : &Vec<u8>, offer_h2 : bool)
-  -> Result<i32, Failure> {
+  pub fn start_tls(self : &mut Conn, config : &TlsConfig, host : &Vec<u8>, host_is_ip : bool,
+  offer_h2 : bool) -> Result<i32, Failure> {
     assert(self.start == self.end, "start_tls with bytes in the read buffer");
-    match self.stream.start_tls(config, host, offer_h2) {
+    match self.stream.start_tls(config, host, host_is_ip, offer_h2) {
       Result<i32, TlsError>::Ok(_v) => {
         return Result<i32, Failure>::Ok(0);
       },

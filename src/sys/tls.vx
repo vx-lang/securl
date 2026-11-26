@@ -389,24 +389,50 @@ struct NetStream {
   invariant true,
 }
 
-/// Whether `host` is an IPv4 or IPv6 address, which TLS checks against the certificate as an
-/// address, and which gets no server name (SNI).
-fn is_ip_address(host : &Vec<u8>) -> bool {
-  let mut dots = 0;
-  let mut only_digits_and_dots = true;
-  for b in host.iter() {
-    if *b == 58u8 {
-      return true;
-    }
-    if *b == 46u8 {
-      dots = dots + 1;
-    } else {
-      if *b < 48u8 || *b > 57u8 {
-        only_digits_and_dots = false;
-      }
-    }
+/// Proof that the handshake checks whom the certificate of the server was issued to: OpenSSL
+/// took the name of the server for that check, or its address when the host is an IP address.
+/// Only `check_identity` makes one, and the handshake needs one, so a way to the handshake
+/// that skips the check does not compile. With `-k`, `checked` is false.
+struct PeerIdentity {
+  checked : bool,
+}
+
+/// Tell OpenSSL to check the certificate of the server against `host`. `name` is `host` as a
+/// C string. Each call gives 1 when OpenSSL took the value. When one fails, the handshake would
+/// still check the chain of the certificate but not the name in it, so that any certificate
+/// from a trusted CA would pass. The transfer fails instead, with curl's exit code 60.
+fn check_identity(ssl : *mut i8, config : &TlsConfig, host : &Vec<u8>, name : &mut Vec<i8>,
+host_is_ip : bool) -> Result<PeerIdentity, TlsError> {
+  if !config.verify {
+    return Result<PeerIdentity, TlsError>::Ok(PeerIdentity { checked : false });
   }
-  return only_digits_and_dots && dots == 3;
+  let mut taken = 0;
+  if host_is_ip {
+    taken = unsafe {
+      X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), name.as_mut_ptr() as *const i8)
+    };
+  } else {
+    taken = unsafe { SSL_set1_host(ssl, name.as_mut_ptr() as *const i8) };
+  }
+  if taken != 1 {
+    unsafe { ERR_clear_error(); }
+    let mut m = lit("SSL: cannot check the certificate of the server against '");
+    push_bytes(&mut m, host);
+    push_bytes(&mut m, &lit("'"));
+    return Result<PeerIdentity, TlsError>::Err(tls_error(CURLE_PEER_FAILED_VERIFICATION, m));
+  }
+  return Result<PeerIdentity, TlsError>::Ok(PeerIdentity { checked : true });
+}
+
+/// A TLS error with curl's exit code 35, `what` and the reason from OpenSSL's error queue.
+fn setup_error(what : *const i8) -> TlsError {
+  let mut m = lit(what);
+  let detail = openssl_error_text();
+  if detail.len() > 0 {
+    push_bytes(&mut m, &lit(": "));
+    push_bytes(&mut m, &detail);
+  }
+  return tls_error(CURLE_SSL_CONNECT_ERROR, m);
 }
 
 impl NetStream {
@@ -428,8 +454,8 @@ impl NetStream {
   /// Start TLS on this plain connection, for the server `host`, with the settings of `config`.
   /// It checks the certificate of the server against `host`, unless `config` says `-k`. A
   /// tunnel through a proxy starts TLS after the proxy said yes to CONNECT.
-  pub fn start_tls(self : &mut NetStream, config : &TlsConfig, host : &Vec<u8>, offer_h2 : bool)
-  -> Result<i32, TlsError> {
+  pub fn start_tls(self : &mut NetStream, config : &TlsConfig, host : &Vec<u8>, host_is_ip : bool,
+  offer_h2 : bool) -> Result<i32, TlsError> {
     assert(!self.is_tls(), "start_tls on a stream that uses TLS already");
     if config.verify && config.has_ca_error {
       return Result<i32, TlsError>::Err(tls_error(CURLE_SSL_CACERT_BADFILE,
@@ -453,23 +479,20 @@ impl NetStream {
     // From here, the drop of the stream frees `ssl`.
     self.ssl = ssl;
     let fd = unsafe { vx_tcp_stream_fd(self.tcp.ptr) };
-    let _set = unsafe { SSL_set_fd(ssl, fd) };
-    let ip = is_ip_address(host);
-    if !ip {
-      let _sni = unsafe {
+    if unsafe { SSL_set_fd(ssl, fd) } != 1 {
+      return Result<i32, TlsError>::Err(setup_error("SSL: SSL_set_fd failed"));
+    }
+    // A name gets SNI, so that the server can pick its certificate. An address gets none.
+    if !host_is_ip {
+      let sni = unsafe {
         SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_HOST_NAME,
           name.as_mut_ptr() as *const i8)
       };
-    }
-    if config.verify {
-      if ip {
-        let _set_ip = unsafe {
-          X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), name.as_mut_ptr() as *const i8)
-        };
-      } else {
-        let _set_host = unsafe { SSL_set1_host(ssl, name.as_mut_ptr() as *const i8) };
+      if sni != 1i64 {
+        return Result<i32, TlsError>::Err(setup_error("Failed set SNI"));
       }
     }
+    let identity = check_identity(ssl, config, host, &mut name, host_is_ip)?;
     // Offer HTTP/1.1 with ALPN, as curl does when it does not use HTTP/2.
     // With `offer_h2`, offer HTTP/2 first, as curl does for HTTPS.
     let mut alpn = Vec<u8>::new();
@@ -479,10 +502,17 @@ impl NetStream {
     }
     alpn.push(8u8);
     push_bytes(&mut alpn, &lit("http/1.1"));
-    let _alpn = unsafe {
-      SSL_set_alpn_protos(ssl, alpn.as_mut_ptr() as *const u8, alpn.len() as u32)
-    };
+    // SSL_set_alpn_protos gives 0 when it took the list.
+    if unsafe { SSL_set_alpn_protos(ssl, alpn.as_mut_ptr() as *const u8, alpn.len() as u32) } != 0 {
+      return Result<i32, TlsError>::Err(setup_error("Error setting ALPN"));
+    }
+    return self.handshake(fd, &identity);
+  }
 
+  /// Run the TLS handshake of `start_tls`. `identity` says that OpenSSL checks the certificate
+  /// against the host, unless `-k` turned the check off.
+  fn handshake(self : &mut NetStream, fd : i32, identity : &PeerIdentity) -> Result<i32, TlsError> {
+    let ssl = self.ssl;
     loop {
       let r = unsafe { SSL_connect(ssl) };
       if r == 1 {
@@ -503,7 +533,7 @@ impl NetStream {
         continue;
       }
       let verify_result = unsafe { SSL_get_verify_result(ssl) };
-      if config.verify && verify_result != 0i64 {
+      if identity.checked && verify_result != 0i64 {
         unsafe { ERR_clear_error(); }
         let mut m = lit("SSL certificate problem: ");
         push_bytes(&mut m, &bytes_of_c_string(unsafe { X509_verify_cert_error_string(verify_result) }));

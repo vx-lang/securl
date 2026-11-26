@@ -1,0 +1,228 @@
+// IP addresses as text. They read IPv4 and IPv6 addresses as the C library's `inet_pton`
+// does, and write an IPv6 address in its short form as `inet_ntop` does. The URL parser checks
+// the host in brackets with them, and TLS asks them whether a host is an address, which it
+// checks against the addresses in the certificate, or a name.
+import core::option;
+import std::vec;
+import curlvx::bytes;
+
+/// The 4 bytes of the IPv4 address `text`, or None. As `inet_pton`, it takes only four decimal
+/// numbers from 0 to 255 split by dots, with no leading zero: `127.0.0.1`, but not `127.1`,
+/// `127.0.0.01` or `999.1.1.1`.
+pub fn parse_ipv4(text : &Vec<u8>) -> Option<Vec<u8>> {
+  let mut out = Vec<u8>::new();
+  let mut value = 0;
+  let mut digits = 0;
+  for b in text.iter() {
+    if is_digit(*b) {
+      if digits > 0 && value == 0 {
+        return Option<Vec<u8>>::None();
+      }
+      value = value * 10 + ((*b - 48u8) as i32);
+      digits = digits + 1;
+      if value > 255 {
+        return Option<Vec<u8>>::None();
+      }
+    } else {
+      if *b != 46u8 || digits == 0 || out.len() == 3 {
+        return Option<Vec<u8>>::None();
+      }
+      out.push(value as u8);
+      value = 0;
+      digits = 0;
+    }
+  }
+  if digits == 0 || out.len() != 3 {
+    return Option<Vec<u8>>::None();
+  }
+  out.push(value as u8);
+  return Option<Vec<u8>>::Some(out);
+}
+
+/// The 16 bytes of the IPv6 address `text`, or None. As `inet_pton`, it takes eight groups of
+/// one to four hex digits split by colons. One `::` stands for one or more groups of zeros,
+/// and an IPv4 address can take the place of the last two groups, as in `::ffff:10.0.0.1`.
+pub fn parse_ipv6(text : &Vec<u8>) -> Option<Vec<u8>> {
+  let n = text.len();
+  // The bytes of the groups so far, two for each group.
+  let mut out = Vec<u8>::new();
+  // Where the `::` is, as an offset into `out`, or -1.
+  let mut gap = -1;
+  let mut i = 0;
+  if n > 0 && text.get(0) == 58u8 {
+    // An address can start with `::`, but not with one colon.
+    if n < 2 || text.get(1) != 58u8 {
+      return Option<Vec<u8>>::None();
+    }
+    gap = 0;
+    i = 2;
+  }
+  let mut group_start = i;
+  let mut value = 0;
+  let mut digits = 0;
+  while i < n {
+    let b = text.get(i);
+    let h = hex_value(b);
+    if h >= 0 {
+      value = value * 16 + h;
+      digits = digits + 1;
+      if digits > 4 {
+        return Option<Vec<u8>>::None();
+      }
+      i = i + 1;
+      continue;
+    }
+    if b == 58u8 {
+      if digits == 0 {
+        // A colon right after a colon: the `::`, which can be there only once.
+        if gap >= 0 {
+          return Option<Vec<u8>>::None();
+        }
+        gap = out.len();
+      } else {
+        // A colon ends a group, and the address cannot end in one colon.
+        if i + 1 == n || out.len() + 2 > 16 {
+          return Option<Vec<u8>>::None();
+        }
+        out.push((value / 256) as u8);
+        out.push((value % 256) as u8);
+        value = 0;
+        digits = 0;
+      }
+      i = i + 1;
+      group_start = i;
+      continue;
+    }
+    if b == 46u8 {
+      // The last group was the start of an IPv4 address: it takes the rest of the text.
+      let v4 = parse_ipv4(&rest_from(text, group_start));
+      if v4.is_none() || out.len() + 4 > 16 {
+        return Option<Vec<u8>>::None();
+      }
+      append(&mut out, &v4.unwrap());
+      digits = 0;
+      i = n;
+      continue;
+    }
+    return Option<Vec<u8>>::None();
+  }
+  if digits > 0 {
+    if out.len() + 2 > 16 {
+      return Option<Vec<u8>>::None();
+    }
+    out.push((value / 256) as u8);
+    out.push((value % 256) as u8);
+  }
+  if gap >= 0 {
+    // The `::` must stand for at least one group of zeros.
+    if out.len() == 16 {
+      return Option<Vec<u8>>::None();
+    }
+    let mut full = range_of(&out, 0, gap);
+    let mut zeros = 16 - out.len();
+    while zeros > 0 {
+      full.push(0u8);
+      zeros = zeros - 1;
+    }
+    append_range(&mut full, &out, gap, out.len());
+    out = full;
+  }
+  if out.len() != 16 {
+    return Option<Vec<u8>>::None();
+  }
+  return Option<Vec<u8>>::Some(out);
+}
+
+/// The short text of the 16-byte IPv6 address `a`, as `inet_ntop` writes it: lower-case hex
+/// with no leading zeros, and the longest run of two or more groups of zeros as `::`. When
+/// the address holds an IPv4 address (`::ffff:10.0.0.1`, or `::10.0.0.1`), it ends in that.
+pub fn ipv6_text(a : &Vec<u8>) -> Vec<u8> {
+  let mut words = Vec<i32>::new();
+  let mut k = 0;
+  while k < 8 {
+    words.push((a.get(2 * k) as i32) * 256 + (a.get(2 * k + 1) as i32));
+    k = k + 1;
+  }
+  // The longest run of groups of zeros. Of two runs that are as long, the first one.
+  let mut best_base = -1;
+  let mut best_len = 0;
+  let mut run_base = -1;
+  let mut run_len = 0;
+  k = 0;
+  while k < 8 {
+    if words.get(k) == 0 {
+      if run_base < 0 {
+        run_base = k;
+        run_len = 1;
+      } else {
+        run_len = run_len + 1;
+      }
+      if run_len > best_len {
+        best_base = run_base;
+        best_len = run_len;
+      }
+    } else {
+      run_base = -1;
+      run_len = 0;
+    }
+    k = k + 1;
+  }
+  if best_len < 2 {
+    best_base = -1;
+  }
+  let mut out = Vec<u8>::new();
+  k = 0;
+  while k < 8 {
+    if best_base >= 0 && k >= best_base && k < best_base + best_len {
+      if k == best_base {
+        out.push(58u8);
+      }
+      k = k + 1;
+      continue;
+    }
+    if k != 0 {
+      out.push(58u8);
+    }
+    if k == 6 && best_base == 0 && (best_len == 6 || (best_len == 5 && words.get(5) == 65535)) {
+      push_u64(&mut out, a.get(12) as u64);
+      out.push(46u8);
+      push_u64(&mut out, a.get(13) as u64);
+      out.push(46u8);
+      push_u64(&mut out, a.get(14) as u64);
+      out.push(46u8);
+      push_u64(&mut out, a.get(15) as u64);
+      return out;
+    }
+    push_hex_group(&mut out, words.get(k));
+    k = k + 1;
+  }
+  if best_base >= 0 && best_base + best_len == 8 {
+    out.push(58u8);
+  }
+  return out;
+}
+
+/// Add the group `w` (0 to 65535) to `out` in lower-case hex, with no leading zeros.
+fn push_hex_group(out : &mut Vec<u8>, w : i32) -> void {
+  let mut place = 4096;
+  let mut started = false;
+  while place > 0 {
+    let d = (w / place) % 16;
+    if d != 0 || started || place == 1 {
+      if d < 10 {
+        out.push(48u8 + (d as u8));
+      } else {
+        out.push(87u8 + (d as u8));
+      }
+      started = true;
+    }
+    place = place / 16;
+  }
+}
+
+/// Whether the host of a URL is an IP address. TLS checks an address against the addresses in
+/// the certificate, and a name against its names. `in_brackets` says that the URL had the host
+/// in brackets, which the URL parser allows only for an IPv6 address.
+pub fn host_is_address(host : &Vec<u8>, in_brackets : bool) -> bool {
+  return in_brackets || parse_ipv4(host).is_some();
+}

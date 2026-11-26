@@ -64,6 +64,16 @@ check "IP address in the certificate" 0 "hello over tls" \
 check "host name not in the certificate" 60 "" \
   -sS --cacert "$certs/ca.pem" --resolve "other.example:$https:127.0.0.1" \
   "https://other.example:$https/"
+# 999.1.1.1 is no IPv4 address, so it is a host name, and the certificate does not name it.
+# OpenSSL refuses it as an address, so a check of it as an address would check nothing.
+check "a name that looks like an address" 60 "" \
+  -sS --cacert "$certs/ca.pem" --resolve "999.1.1.1:$https:127.0.0.1" \
+  "https://999.1.1.1:$https/"
+check "a bad IPv6 address" 3 "" \
+  -sS --cacert "$certs/ca.pem" "https://[1:2:3]:$https/"
+stderr_has "  with curl's message" "URL rejected: Bad IPv6 address"
+check "an IPv6 zone is not part of the name" 3 "" \
+  -sS --cacert "$certs/ca.pem" "https://[::1%25lo%zz]:$https/"
 check "missing --cacert file" 77 "" \
   -sS --cacert "$work/no-such-file.pem" "https://localhost:$https/"
 check "1 MiB in chunks" 0 "200 1048576" \

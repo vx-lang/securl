@@ -1,0 +1,105 @@
+// Checks how curlvx::address reads IPv4 and IPv6 addresses, as the C library's `inet_pton`
+// does, and how it writes an IPv6 address in its short form, as `inet_ntop` does. Also checks
+// that the URL parser refuses a bad address in brackets, and keeps a zone out of the host.
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import curlvx::address;
+import curlvx::bytes;
+import curlvx::failure;
+import curlvx::url;
+
+fn ipv4_ok(s : *const i8) -> bool {
+  return parse_ipv4(&lit(s)).is_some();
+}
+
+fn ipv6_ok(s : *const i8) -> bool {
+  return parse_ipv6(&lit(s)).is_some();
+}
+
+/// The short form of the IPv6 address `s`, which must be valid.
+fn short(s : *const i8) -> Vec<u8> {
+  match parse_ipv6(&lit(s)) {
+    Option<Vec<u8>>::Some(a) => {
+      return ipv6_text(&a);
+    },
+    Option<Vec<u8>>::None() => {
+      panic("an IPv6 address that should parse did not");
+    }
+  }
+}
+
+fn url_error(s : *const i8) -> i32 {
+  match parse_url(&lit(s), false) {
+    Result<Url, Failure>::Ok(_u) => {
+      return 0;
+    },
+    Result<Url, Failure>::Err(f) => {
+      return f.code;
+    }
+  }
+}
+
+fn main() -> i32 {
+  // IPv4: four numbers from 0 to 255, with no leading zero.
+  assert(ipv4_ok("127.0.0.1") && ipv4_ok("0.0.0.0") && ipv4_ok("255.255.255.255"),
+    "IPv4 addresses");
+  assert(!ipv4_ok("999.1.1.1"), "an IPv4 number above 255");
+  assert(!ipv4_ok("127.1") && !ipv4_ok("1.2.3.4.5"), "too few or too many IPv4 numbers");
+  assert(!ipv4_ok("1.2.3.04") && !ipv4_ok("1..2.3") && !ipv4_ok("1.2.3.") && !ipv4_ok(""),
+    "a leading zero, an empty number, a dot at the end");
+  assert(!ipv4_ok("1.2.3.a") && !ipv4_ok("localhost"), "letters in an IPv4 address");
+
+  // IPv6: eight groups, or fewer with one `::`, and maybe an IPv4 end.
+  assert(ipv6_ok("::") && ipv6_ok("::1") && ipv6_ok("1::") && ipv6_ok("1:2:3:4:5:6:7:8"),
+    "IPv6 addresses");
+  assert(ipv6_ok("1:2:3:4:5:6:7::") && ipv6_ok("::2:3:4:5:6:7:8") && ipv6_ok("FE80::A"),
+    "a :: for one group, and upper-case hex");
+  assert(ipv6_ok("::ffff:10.0.0.1") && ipv6_ok("1:2:3:4:5:6:1.2.3.4"), "an IPv4 end");
+  assert(!ipv6_ok("1:2:3") && !ipv6_ok("1:2:3:4:5:6:7:8:9"), "too few or too many groups");
+  assert(!ipv6_ok("1::2::3") && !ipv6_ok(":::") && !ipv6_ok("::1:2:3:4:5:6:7:8"),
+    "two ::, three colons, a :: that stands for no group");
+  assert(!ipv6_ok(":1") && !ipv6_ok("1:") && !ipv6_ok("1:2:3:4:5:6:7:"),
+    "one colon at the start or the end");
+  assert(!ipv6_ok("12345::") && !ipv6_ok("g::") && !ipv6_ok(""), "a group too long, a letter");
+  assert(!ipv6_ok("::1.2.3") && !ipv6_ok("1:2:3:4:5:6:7:1.2.3.4") && !ipv6_ok("::1.2.3.4:5"),
+    "a bad IPv4 end, an IPv4 end with too many groups, a group after it");
+
+  // The short form, as inet_ntop writes it.
+  assert(eq_lit(&short("0:0:0:0:0:0:0:1"), "::1"), "::1");
+  assert(eq_lit(&short("0:0:0:0:0:0:0:0"), "::"), "::");
+  assert(eq_lit(&short("2001:DB8:0:0:0:0:0:1"), "2001:db8::1"), "lower case, one ::");
+  assert(eq_lit(&short("1:0:0:2:0:0:0:3"), "1:0:0:2::3"), "the longest run of zeros");
+  assert(eq_lit(&short("1:0:0:2:0:0:3:4"), "1::2:0:0:3:4"), "the first of two runs as long");
+  assert(eq_lit(&short("1:0:2:3:4:5:6:7"), "1:0:2:3:4:5:6:7"), "one zero group stays");
+  assert(eq_lit(&short("1:2:3:4:5:6:7:0"), "1:2:3:4:5:6:7:0"), "a zero group at the end");
+  assert(eq_lit(&short("1:0:0:0:0:0:0:0"), "1::"), "a run at the end");
+  assert(eq_lit(&short("0001:0020:0300:4000::"), "1:20:300:4000::"), "no leading zeros");
+  assert(eq_lit(&short("::ffff:7f00:1"), "::ffff:127.0.0.1"), "IPv4-mapped");
+  assert(eq_lit(&short("::10.0.0.1"), "::10.0.0.1"), "IPv4-compatible");
+
+  // A host is an address when it was in brackets, or when it is an IPv4 address.
+  assert(host_is_address(&lit("::1"), true) && host_is_address(&lit("10.0.0.1"), false),
+    "addresses");
+  assert(!host_is_address(&lit("999.1.1.1"), false) && !host_is_address(&lit("a.b"), false),
+    "names, even when they look like an address");
+
+  // URLs: a bad address in brackets is error 3, and the host has no zone.
+  assert(url_error("http://[1:2:3]/") == 3 && url_error("http://[::1%25]/") == 3,
+    "a bad IPv6 address, an empty zone");
+  assert(url_error("http://[::1%25a/b]/") == 3 && url_error("http://[::1x]/") == 3,
+    "a bad byte in a zone, a letter after the address");
+  match parse_url(&lit("http://[0:0::1%25eth0]:8080/x"), false) {
+    Result<Url, Failure>::Ok(u) => {
+      assert(u.ipv6 && eq_lit(&u.host, "::1") && eq_lit(&u.zone, "eth0"),
+        "the zone is not part of the host");
+      assert(eq_lit(&url_text(&u), "http://[::1%25eth0]:8080/x"), "the URL keeps the zone");
+      assert(eq_lit(&host_header_value(&u), "[::1]:8080"), "the Host header has no zone");
+    },
+    Result<Url, Failure>::Err(_f) => {
+      panic("a URL with a zone should parse");
+    }
+  }
+  return 0;
+}
