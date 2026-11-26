@@ -320,6 +320,12 @@ stderr_has "  with curl's message" "Unrecognized content encoding type"
 check "six encodings" 61 "" -sS --compressed -o /dev/null "http://127.0.0.1:$http/six"
 stderr_has "  with curl's message" "Reject response exceeding limit of 5 content encodings"
 
+# --tr-encoding: gzip as a transfer coding. Without it, curl refuses one that it did not ask for.
+check "--tr-encoding decodes Transfer-Encoding: gzip" 0 "203890" -s --tr-encoding \
+  -w '%{size_delivered}' -o "$work/te" "http://127.0.0.1:$http/te-gzip"
+check "  and without it, curl refuses it" 61 "" -sS -o /dev/null "http://127.0.0.1:$http/te-gzip"
+stderr_has "  with curl's message" "Unsolicited Transfer-Encoding (gzip) found"
+
 # The TCP options of libcurl, in its order: TCP_NODELAY, then keepalive after 60 seconds, every
 # 60 seconds, 9 times.
 sockopts "TCP_NODELAY and keepalive by default" \

@@ -70,6 +70,24 @@ pub fn null_output() -> Output {
   };
 }
 
+/// The names of a list of codings such as `deflate, gzip`, in order.
+fn coding_names(list : &Vec<u8>) -> Vec<Vec<u8>> {
+  let mut names = Vec<Vec<u8>>::new();
+  let mut start = 0;
+  while start < list.len() {
+    let mut end = find_byte(list, 44u8, start);
+    if end < 0 {
+      end = list.len();
+    }
+    let name = trim_blanks(&range_of(list, start, end));
+    start = end + 1;
+    if name.len() > 0 {
+      names.push(name);
+    }
+  }
+  return names;
+}
+
 fn write_error() -> Failure {
   return fail_lit(WRITE_ERROR, "Failure writing output to destination");
 }
@@ -99,27 +117,28 @@ impl Output {
   /// encoding is decoded first. `identity` and `none` change nothing. As in libcurl, more than
   /// five encodings fail at once, and an encoding that securl does not know fails at the first
   /// byte of the body.
-  pub fn start_body(self : &mut Output, encodings : &Vec<u8>) -> Result<i32, Failure> {
+  ///
+  /// `transfer_codings` are the codings of `--tr-encoding` other than chunked, which come off
+  /// first, and their limit was checked with the headers.
+  pub fn start_body(self : &mut Output, transfer_codings : &Vec<u8>, encodings : &Vec<u8>)
+  -> Result<i32, Failure> {
     self.in_body = true;
     self.delivered = 0i64;
-    let mut names = Vec<Vec<u8>>::new();
-    let mut start = 0;
-    while start < encodings.len() {
-      let mut end = find_byte(encodings, 44u8, start);
-      if end < 0 {
-        end = encodings.len();
-      }
-      let name = trim_blanks(&range_of(encodings, start, end));
-      start = end + 1;
-      if name.len() > 0 {
-        if names.len() >= MAX_ENCODE_STACK {
-          return Result<i32, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
-            "Reject response exceeding limit of 5 content encodings"));
-        }
-        names.push(name);
-      }
-    }
     let mut decoders = Vec<Inflate>::new();
+    self.add_decoders(&mut decoders, &coding_names(transfer_codings));
+    let names = coding_names(encodings);
+    if names.len() > MAX_ENCODE_STACK {
+      return Result<i32, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
+        "Reject response exceeding limit of 5 content encodings"));
+    }
+    self.add_decoders(&mut decoders, &names);
+    self.decoders = decoders;
+    return Result<i32, Failure>::Ok(0);
+  }
+
+  /// Add the decoders of the codings `names` to `decoders`, the last coding first.
+  fn add_decoders(self : &mut Output, decoders : &mut Vec<Inflate>, names : &Vec<Vec<u8>>)
+  -> void {
     let mut i = names.len() - 1;
     while i >= 0 {
       let name = names.get_ref(i);
@@ -136,8 +155,6 @@ impl Output {
       }
       i = i - 1;
     }
-    self.decoders = decoders;
-    return Result<i32, Failure>::Ok(0);
   }
 
   /// End the body. Gives how many bytes of it went out, after decoding. A body that ended

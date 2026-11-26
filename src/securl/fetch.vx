@@ -337,8 +337,10 @@ const MAX_HEADER_COUNT : i32 = 5000;
 ///
 /// A status line or header line longer than 100 KiB fails with the text of CURLE_TOO_LARGE, as
 /// in curl, where libcurl gives that error with no message of its own.
-fn read_head(c : &mut Conn, raw : bool, total : &mut i64) -> Result<ResponseHead, Failure> {
+fn read_head(c : &mut Conn, raw : bool, tr_encoding : bool, total : &mut i64)
+-> Result<ResponseHead, Failure> {
   let mut head = empty_head();
+  head.tr_encoding = tr_encoding;
   let mut line = Vec<u8>::new();
   let n = c.read_line(&mut line, MAX_HEADER_LINE, TOO_LARGE,
     "A value or data field grew larger than allowed")?;
@@ -618,7 +620,8 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
     probe : probe,
     form_boundary : form_text(req_kind, form_boundary),
     h2 : false,
-    accept_encoding : cfg.compressed
+    accept_encoding : cfg.compressed,
+    tr_encoding : cfg.tr_encoding
   };
 
   let mut address = Vec<u8>::new();
@@ -670,7 +673,8 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
   }
 
   // Skip each informational response, such as `100 Continue`. With `-i`, curl shows it.
-  let mut head = next_head(&mut c, &mut h2, use_h2, cfg.raw, &mut info.size_header_total)?;
+  let mut head = next_head(&mut c, &mut h2, use_h2, cfg.raw, cfg.tr_encoding,
+    &mut info.size_header_total)?;
   let mut set_cookies = take_cookies(jar, &head, &cookie_host, &cookie_path, secure_context, 0);
   while head.error_code == 0 && head.status >= 100 && head.status < 200 && head.status != 101 {
     info.size_header = info.size_header + (head.raw.len() as i64);
@@ -683,7 +687,8 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
     if sinks.has_headers {
       let _w = sinks.headers.write(&head.raw)?;
     }
-    head = next_head(&mut c, &mut h2, use_h2, cfg.raw, &mut info.size_header_total)?;
+    head = next_head(&mut c, &mut h2, use_h2, cfg.raw, cfg.tr_encoding,
+      &mut info.size_header_total)?;
     set_cookies = take_cookies(jar, &head, &cookie_host, &cookie_path, secure_context,
       set_cookies);
   }
@@ -781,7 +786,7 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
       if cfg.compressed && !cfg.raw {
         encodings = content_encodings(&head);
       }
-      let _stack = sinks.body.start_body(&encodings)?;
+      let _stack = sinks.body.start_body(&head.transfer_codings, &encodings)?;
       let _b = body_of(&mut c, &mut h2, use_h2, &head, cfg.raw, &mut sinks.body, info,
         &mut trailers)?;
       info.size_delivered = info.size_delivered + sinks.body.finish_body()?;
@@ -1213,7 +1218,7 @@ fn open_tunnel(c : &mut Conn, cfg : &Config, u : &Url, proxy : &Proxy, info : &m
     verbose_lines("> ", &request);
   }
   let _sent = c.send(&request)?;
-  let head = read_head(c, false, &mut info.size_header_total)?;
+  let head = read_head(c, false, false, &mut info.size_header_total)?;
   if cfg.verbose {
     verbose_lines("< ", &head.raw);
   }
@@ -1369,12 +1374,13 @@ form_boundary : &Vec<u8>, jar : &mut CookieJar, sinks : &mut Sinks, info : &mut 
 }
 
 /// The next response head, over HTTP/2 or HTTP/1.
-fn next_head(c : &mut Conn, h2 : &mut H2, use_h2 : bool, raw : bool, total : &mut i64)
+fn next_head(c : &mut Conn, h2 : &mut H2, use_h2 : bool, raw : bool, tr_encoding : bool,
+total : &mut i64)
 -> Result<ResponseHead, Failure> {
   if use_h2 {
     return h2_read_head(h2, c);
   }
-  return read_head(c, raw, total);
+  return read_head(c, raw, tr_encoding, total);
 }
 
 /// Copy the body of the response to `out`, over HTTP/2 or HTTP/1. The trailers go to

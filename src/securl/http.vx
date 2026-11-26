@@ -169,6 +169,8 @@ struct RequestInfo {
   h2 : bool,
   // `--compressed`: ask for the encodings that securl decodes.
   accept_encoding : bool,
+  // `--tr-encoding`: ask for gzip as a transfer coding, with `TE: gzip` and `Connection: TE`.
+  tr_encoding : bool,
 }
 
 fn add_line(out : &mut Vec<u8>, name : *const i8, value : &Vec<u8>) -> void {
@@ -258,6 +260,10 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
   if !has_custom(&info.headers, "Accept") {
     push_lit(&mut out, "Accept: */*\r\n");
   }
+  let te = info.tr_encoding && !has_custom(&info.headers, "TE");
+  if te {
+    push_lit(&mut out, "TE: gzip\r\n");
+  }
   if info.accept_encoding && !has_custom(&info.headers, "Accept-Encoding") {
     push_lit(&mut out, "Accept-Encoding: deflate, gzip\r\n");
   }
@@ -328,18 +334,37 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
     }
   }
 
-  // The first custom Connection header with a value comes last, and the others after it.
+  // The first custom Connection header with a value comes last, with the `TE` of curl after
+  // its value, and the other custom Connection headers after it.
+  let mut connection = Vec<u8>::new();
+  let mut has_connection = false;
+  for line in info.headers.iter() {
+    let h = split_header(line);
+    if !has_connection && !h.ignored && !h.remove && !h.empty
+       && eq_lit_nocase(&h.name, "Connection") {
+      connection = clone_bytes(&h.value);
+      has_connection = true;
+    }
+  }
+  if te {
+    if has_connection {
+      push_lit(&mut connection, ", ");
+    }
+    push_lit(&mut connection, "TE");
+    has_connection = true;
+  }
+  if has_connection {
+    add_line(&mut out, "Connection: ", &connection);
+  }
   let mut first_connection = true;
   for line in info.headers.iter() {
     let h = split_header(line);
     if !h.ignored && !h.remove && !h.empty && eq_lit_nocase(&h.name, "Connection") {
-      if first_connection {
-        add_line(&mut out, "Connection: ", &h.value);
-        first_connection = false;
-      } else {
+      if !first_connection {
         append(&mut out, line);
         push_lit(&mut out, "\r\n");
       }
+      first_connection = false;
     }
   }
 
@@ -398,6 +423,12 @@ struct ResponseHead {
   // Not 0 when the head is bad: the exit code, with `error` as the message.
   error_code : i32,
   error : Vec<u8>,
+  // The request asked for transfer codings (`--tr-encoding`), so the Transfer-Encoding codings
+  // other than chunked are decoded: they are in `transfer_codings`, joined with commas.
+  // `transfer_count` counts them with chunked, for libcurl's limit of five.
+  tr_encoding : bool,
+  transfer_codings : Vec<u8>,
+  transfer_count : i32,
 }
 
 /// An empty response head, before the status line is read.
@@ -416,7 +447,10 @@ pub fn empty_head() -> ResponseHead {
     bad_length : false,
     headers : Vec<Vec<u8>>::new(),
     error_code : 0,
-    error : Vec<u8>::new()
+    error : Vec<u8>::new(),
+    tr_encoding : false,
+    transfer_codings : Vec<u8>::new(),
+    transfer_count : 0
   };
 }
 
@@ -480,12 +514,43 @@ fn parse_transfer_encoding(value : &Vec<u8>, raw : bool, head : &mut ResponseHea
     if token.len() == 0 {
       continue;
     }
+    if raw {
+      if eq_lit(&token, "chunked") {
+        head.chunked = true;
+        continue;
+      }
+      return;
+    }
+    if head.tr_encoding {
+      // As libcurl with CURLOPT_TRANSFER_ENCODING: decode each coding, with chunked last.
+      if head.transfer_count >= 5 {
+        set_error(head, BAD_CONTENT_ENCODING,
+          lit("Reject response exceeding limit of 5 transfer encodings"));
+        return;
+      }
+      if eq_lit(&token, "chunked") {
+        // A second chunked is ignored.
+        if !head.chunked {
+          head.chunked = true;
+          head.transfer_count = head.transfer_count + 1;
+        }
+        continue;
+      }
+      if head.chunked {
+        set_error(head, BAD_CONTENT_ENCODING,
+          lit("Reject response due to 'chunked' not being the last Transfer-Encoding"));
+        return;
+      }
+      if head.transfer_codings.len() > 0 {
+        push_lit(&mut head.transfer_codings, ",");
+      }
+      append(&mut head.transfer_codings, &token);
+      head.transfer_count = head.transfer_count + 1;
+      continue;
+    }
     if eq_lit(&token, "chunked") {
       head.chunked = true;
       continue;
-    }
-    if raw {
-      return;
     }
     if head.chunked {
       let mut m = lit("A Transfer-Encoding (");

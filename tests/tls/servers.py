@@ -81,7 +81,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path in ENCODED:
+        if self.path == "/te-gzip":
+            # gzip as a transfer coding, in chunks.
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "gzip, chunked")
+            self.end_headers()
+            for i in range(0, len(_GZ), 1000):
+                part = _GZ[i:i + 1000]
+                self.wfile.write(b"%x\r\n" % len(part) + part + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+        elif self.path in ENCODED:
             encoding, body, chunked = ENCODED[self.path]
             self.send_response(200)
             self.send_header("Content-Encoding", encoding)

@@ -60,9 +60,9 @@ Vx main 860f9f31a.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 403 of 743 (54%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 367 of 442 (83%) |
-| TLS, client-certificate, proxy, compression, socket-option and limit tests against local servers (`tests/tls`) | 114 of 114 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 414 of 743 (55%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 377 of 453 (83%) |
+| TLS, client-certificate, proxy, compression, socket-option and limit tests against local servers (`tests/tls`) | 117 of 117 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 9 of 9 |
 
@@ -87,7 +87,7 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 10,470 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 10,567 | none, and `--no-trusted-code` enforces this |
 | `src/cli/` (the tool) and `src/disk/` (its files) | 701 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` to `cli`) | 11 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,302 | 45 `extern` functions, 76 `unsafe` blocks |
@@ -175,6 +175,8 @@ needs no zlib and no trusted code. It follows libcurl and zlib: the CRC-32 and A
 zlib's error texts after "Error while processing content unencoding: ", raw DEFLATE for a
 `deflate` body that has no zlib header, a chain of up to five encodings, and exit 61 for a body
 that ends inside the compressed data. `-w %{size_delivered}` gives the decoded size.
+`--tr-encoding` sends `TE: gzip` and `Connection: TE`, and decodes the transfer codings of the
+response before its content codings, with libcurl's rules: at most five, and chunked last.
 `tests/unit/inflate.vx` feeds data from Python's zlib in one piece and one byte at a time, so
 that each block header and symbol is cut once. A curl 8.23.1-DEV built with zlib passes the
 compression checks of `tests/tls` too.
@@ -247,7 +249,7 @@ missing options that block the most tests.
 `-X` `-x` `-U` `-p` `--proxytunnel` `--socks4` `--socks4a` `--socks5` `--socks5-hostname`
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
 `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
-`--connect-timeout` `--compressed` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay` `-h`
+`--connect-timeout` `--compressed` `--tr-encoding` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay` `-h`
 `-V`, and the options that runtests.pl adds: `-q` `--trace-ascii` `--trace-time`.
 
 As libcurl does, each connection sets TCP_NODELAY and TCP keepalive: the first probe after 60
@@ -279,7 +281,7 @@ time variables yet.
 In order of how much users need them:
 
 1. Connection reuse (and with it, HTTP/2 multiplexing), brotli and zstd for `--compressed`,
-   `--tr-encoding`, the
+   the
    `Upgrade: h2c` of `--http2` on plain HTTP, and HTTP/2 through an HTTP proxy.
 1. URL globbing (`{a,b}` and `[1-9]`), `--next`, `-J`, `-C` resume, `-K` config files,
    `--netrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`

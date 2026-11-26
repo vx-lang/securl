@@ -133,6 +133,8 @@ struct Config {
   keepalive_cnt : i64,
   // `--compressed`: ask for gzip and deflate, and decode them.
   compressed : bool,
+  // `--tr-encoding`: ask for gzip as a transfer coding, and decode the transfer codings.
+  tr_encoding : bool,
   // `-p`: reach the server through a CONNECT tunnel of the HTTP proxy, for `http://` too.
   proxytunnel : bool,
   // `-x` was given, perhaps with an empty value, which turns the proxy variables off.
@@ -230,6 +232,7 @@ pub fn default_config() -> Config {
     keepalive_time : 0i64,
     keepalive_cnt : 0i64,
     compressed : false,
+    tr_encoding : false,
     proxytunnel : false,
     proxy_set : false,
     proxy_kind : PROXY_HTTP,
@@ -328,6 +331,7 @@ const OPT_CERT_TYPE : i32 = 81;
 const OPT_KEY : i32 = 82;
 const OPT_KEY_TYPE : i32 = 83;
 const OPT_PASS : i32 = 84;
+const OPT_TR_ENCODING : i32 = 85;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -419,6 +423,7 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "key") { return OPT_KEY; }
   if eq_lit(name, "key-type") { return OPT_KEY_TYPE; }
   if eq_lit(name, "pass") { return OPT_PASS; }
+  if eq_lit(name, "tr-encoding") { return OPT_TR_ENCODING; }
   return OPT_UNKNOWN;
 }
 
@@ -989,6 +994,10 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
   }
   if id == OPT_COMPRESSED {
     cfg.compressed = enable;
+    return done();
+  }
+  if id == OPT_TR_ENCODING {
+    cfg.tr_encoding = enable;
     return done();
   }
   // OPT_DISABLE,
