@@ -60,9 +60,9 @@ Vx main 860f9f31a.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 429 of 747 (57%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 387 of 457 (84%) |
-| TLS, client-certificate, proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 142 of 142 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 434 of 750 (57%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 388 of 457 (84%) |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 154 of 154 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 9 of 9 |
 
@@ -88,12 +88,12 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 11,222 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 751 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 11,277 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 806 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` to `cli`) | 11 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
-| `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,302 | 45 `extern` functions, 76 `unsafe` blocks |
+| `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,501 | 52 `extern` functions, 105 `unsafe` blocks |
 
-Of the trusted code in `src/sys/`, 96 of the 121 items are the OpenSSL bindings: TLS (with the
+Of the trusted code in `src/sys/`, 132 of the 157 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
 `hash.vx`.
 Two safe functions of `sys` read through a raw pointer with no check, `lit` and `push_lit`,
@@ -136,6 +136,16 @@ an HTTP proxy uses a CONNECT tunnel, and so does an `http://` URL with `-p`. As 
 leaves it out, `%{http_connect}` gives its status, and a proxy that refuses the tunnel gives
 exit 7. The exit codes are curl's: 60 for a certificate problem, 35 for a failed handshake, and
 77 for a file of certificate authorities that cannot be read.
+
+A proxy URL with `https://`, from `-x` or a proxy variable, names an HTTPS proxy, on port 443
+unless the URL gives one. securl speaks TLS to it, with ALPN for HTTP/1.1 only, and checks its
+certificate against the certificate authorities of `--proxy-cacert` and `--proxy-capath` (or
+`--capath`), or else those of the system, as curl does: `--cacert` is for the server only, and
+`--proxy-insecure` turns the check off. An `http://` URL goes to the proxy as a plain proxy
+request over that TLS connection, or through a tunnel with `-p`. An `https://` URL goes through
+a CONNECT tunnel, and TLS to the server runs inside the TLS to the proxy, HTTP/2 included.
+OpenSSL cannot put one connection on another directly, so `src/sys/tls.vx` gives the inner
+connection two memory BIOs and moves their records through the outer connection.
 
 `--hsts FILE` turns on HSTS, a port of libcurl's `hsts.c` in `src/securl/hsts.vx`. The tool
 reads the file before the transfers and writes it after them, in libcurl's format. A
@@ -260,8 +270,8 @@ missing options that block the most tests.
 `name;` forms) `-I` `-i` `-k` `--cacert` `--capath` `-E` (`--cert`) `--cert-type` `--key` `--key-type` `--pass` `-L` `--location-trusted` `--max-redirs`
 `-o` `-O` `--remote-name-all` `--output-dir` `-r` `-s` `-S` `-T` `-u` `--digest` `--basic`
 `--anyauth` `-v` `-w` (most variables, `%header{}`, `%{header_json}`, `%output{}`, `%{stderr}`)
-`-X` `-x` `-U` `-p` `--proxytunnel` `--suppress-connect-headers` `--socks4` `--socks4a`
-`--socks5` `--socks5-hostname` `--hsts`
+`-X` `-x` `-U` `-p` `--proxytunnel` `--suppress-connect-headers` `--proxy-insecure`
+`--proxy-cacert` `--proxy-capath` `--socks4` `--socks4a` `--socks5` `--socks5-hostname` `--hsts`
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
 `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
 `--connect-timeout` `--compressed` `--tr-encoding` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay` `-h`
@@ -300,7 +310,8 @@ In order of how much users need them:
    `Upgrade: h2c` of `--http2` on plain HTTP, and HTTP/2 through an HTTP proxy.
 1. URL globbing (`{a,b}` and `[1-9]`), `--next`, `-J`, `-C` resume, `-K` config files,
    `--netrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
-   encoders, `--preproxy`, SOCKS5 with GSS-API, HTTPS proxies, Digest with the proxy of a
+   encoders, `--preproxy`, SOCKS5 with GSS-API, `--proxy-http2` and client certificates for an
+   HTTPS proxy, Digest with the proxy of a
    CONNECT tunnel, and client certificates in PKCS#12 files or from engines and providers.
 1. HTTP/3.
 

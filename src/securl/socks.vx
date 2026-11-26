@@ -19,6 +19,8 @@ import securl::failure;
 
 // The kinds of proxy. HTTP is libcurl's default.
 const PROXY_HTTP : i32 = 0;
+// An HTTP proxy that securl reaches over TLS: `-x https://`.
+const PROXY_HTTPS : i32 = 1;
 const PROXY_SOCKS4 : i32 = 4;
 const PROXY_SOCKS4A : i32 = 6;
 const PROXY_SOCKS5 : i32 = 5;
@@ -26,7 +28,12 @@ const PROXY_SOCKS5H : i32 = 7;
 
 /// Whether a proxy of `kind` is a SOCKS proxy.
 pub fn is_socks(kind : i32) -> bool {
-  return kind != PROXY_HTTP;
+  return !is_http_proxy(kind);
+}
+
+/// Whether a proxy of `kind` speaks HTTP, over TCP or over TLS.
+pub fn is_http_proxy(kind : i32) -> bool {
+  return kind == PROXY_HTTP || kind == PROXY_HTTPS;
 }
 
 /// Whether a proxy of `kind` needs the address of the server, which the caller looks up.
@@ -38,7 +45,8 @@ pub fn socks_resolves_locally(kind : i32) -> bool {
 /// not speak.
 pub fn proxy_kind_of_scheme(scheme : &Vec<u8>) -> i32 {
   if eq_lit_nocase(scheme, "http") { return PROXY_HTTP; }
-  if eq_lit_nocase(scheme, "socks4") { return PROXY_SOCKS4; }
+  if eq_lit_nocase(scheme, "https") { return PROXY_HTTPS; }
+  if eq_lit_nocase(scheme, "socks4") || eq_lit_nocase(scheme, "socks") { return PROXY_SOCKS4; }
   if eq_lit_nocase(scheme, "socks4a") { return PROXY_SOCKS4A; }
   if eq_lit_nocase(scheme, "socks5") { return PROXY_SOCKS5; }
   if eq_lit_nocase(scheme, "socks5h") { return PROXY_SOCKS5H; }

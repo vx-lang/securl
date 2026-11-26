@@ -101,6 +101,10 @@ struct Config {
   insecure : bool,
   cacert : Vec<u8>,
   capath : Vec<u8>,
+  // The same for an HTTPS proxy: `--proxy-insecure`, `--proxy-cacert`, `--proxy-capath`.
+  proxy_insecure : bool,
+  proxy_cacert : Vec<u8>,
+  proxy_capath : Vec<u8>,
   // The authentication methods of `--basic`, `--digest` and `--anyauth`, as `AUTH_` bits. 0
   // means Basic, libcurl's default.
   auth_type : i32,
@@ -222,6 +226,9 @@ pub fn default_config() -> Config {
     insecure : false,
     cacert : Vec<u8>::new(),
     capath : Vec<u8>::new(),
+    proxy_insecure : false,
+    proxy_cacert : Vec<u8>::new(),
+    proxy_capath : Vec<u8>::new(),
     auth_type : 0,
     proxy_auth_type : 0,
     forms : Vec<FormArg>::new(),
@@ -342,6 +349,9 @@ const OPT_PASS : i32 = 84;
 const OPT_TR_ENCODING : i32 = 85;
 const OPT_HSTS : i32 = 86;
 const OPT_SUPPRESS_CONNECT_HEADERS : i32 = 87;
+const OPT_PROXY_INSECURE : i32 = 88;
+const OPT_PROXY_CACERT : i32 = 89;
+const OPT_PROXY_CAPATH : i32 = 90;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -436,6 +446,9 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "tr-encoding") { return OPT_TR_ENCODING; }
   if eq_lit(name, "hsts") { return OPT_HSTS; }
   if eq_lit(name, "suppress-connect-headers") { return OPT_SUPPRESS_CONNECT_HEADERS; }
+  if eq_lit(name, "proxy-insecure") { return OPT_PROXY_INSECURE; }
+  if eq_lit(name, "proxy-cacert") { return OPT_PROXY_CACERT; }
+  if eq_lit(name, "proxy-capath") { return OPT_PROXY_CAPATH; }
   return OPT_UNKNOWN;
 }
 
@@ -486,7 +499,8 @@ fn takes_value(id : i32) -> bool {
   return (id >= OPT_USER_AGENT && id <= OPT_OUTPUT_DIR) || id == OPT_CACERT || id == OPT_CAPATH
     || id == OPT_FORM || id == OPT_FORM_STRING || id == OPT_COOKIE_JAR
     || id == OPT_KEEPALIVE_TIME || id == OPT_KEEPALIVE_CNT
-    || (id >= OPT_SOCKS4 && id <= OPT_PASS) || id == OPT_HSTS;
+    || (id >= OPT_SOCKS4 && id <= OPT_PASS) || id == OPT_HSTS || id == OPT_PROXY_CACERT
+    || id == OPT_PROXY_CAPATH;
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -842,6 +856,18 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
   }
   if id == OPT_CAPATH {
     cfg.capath = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_PROXY_INSECURE {
+    cfg.proxy_insecure = enable;
+    return done();
+  }
+  if id == OPT_PROXY_CACERT {
+    cfg.proxy_cacert = clone_bytes(value);
+    return done();
+  }
+  if id == OPT_PROXY_CAPATH {
+    cfg.proxy_capath = clone_bytes(value);
     return done();
   }
   if id == OPT_HTTP10 {

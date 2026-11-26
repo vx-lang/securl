@@ -91,6 +91,13 @@ pub fn new_info() -> TransferInfo {
   };
 }
 
+/// The TLS settings of a run: for the servers, and for an HTTPS proxy, which has its own
+/// certificate authorities (`--proxy-cacert`, `--proxy-capath`) and check (`--proxy-insecure`).
+struct TlsSettings {
+  server : TlsConfig,
+  proxy : TlsConfig,
+}
+
 /// What the transfers of a run share: the cookies and the HSTS cache.
 struct Session {
   jar : CookieJar,
@@ -558,7 +565,7 @@ struct Hop {
 
 /// Send one request for `u` and read its response. The body of the response goes to
 /// `sinks`, unless curl follows the redirect that the response gives.
-fn one_hop(network : &Network, tls : &TlsConfig, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
+fn one_hop(network : &Network, tls : &TlsSettings, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
 req_kind : i32, body : &Vec<u8>, creds : &Credentials, same_host : bool, has_referer : bool,
 referer : &Vec<u8>, deadline : Instant, form_boundary : &Vec<u8>, auth : &mut AuthContext,
 session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop, Failure> {
@@ -602,7 +609,7 @@ session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<
     &creds.password, has_custom(headers, "Authorization"), &method, &u.path, &origin_of(u));
   // The credentials of an HTTP proxy go with each request that goes through it. The CONNECT of
   // a tunnel sends its own.
-  let via_proxy = proxy.used && proxy.kind == PROXY_HTTP && !secure && !cfg.proxytunnel;
+  let via_proxy = proxy.used && is_http_proxy(proxy.kind) && !secure && !cfg.proxytunnel;
   let proxy_allowed = via_proxy && proxy.has_credentials;
   let proxy_header = output_auth(&mut auth.proxy, &mut auth.proxy_digest, proxy_allowed,
     &proxy.user, &proxy.password, has_custom(headers, "Proxy-Authorization"), &method, &u.path,
@@ -1009,7 +1016,7 @@ fn earliest(a : Instant, b : Instant) -> Instant {
 
 /// Connect to `address`, then make the tunnel of a proxy and start TLS when `secure`. Each step
 /// gives up at `deadline`.
-fn connect_phase(network : &Network, tls : &TlsConfig, cfg : &Config, u : &Url, proxy : &Proxy,
+fn connect_phase(network : &Network, tls : &TlsSettings, cfg : &Config, u : &Url, proxy : &Proxy,
 address : &Vec<u8>, secure : bool, deadline : Instant, info : &mut TransferInfo,
 sinks : &mut Sinks) -> Result<Conn, Failure> {
   if cfg.verbose {
@@ -1028,6 +1035,15 @@ sinks : &mut Sinks) -> Result<Conn, Failure> {
     push_u64(&mut m, u.port as u64);
     verbose_info(&m);
   }
+  // An HTTPS proxy speaks TLS, with ALPN for HTTP/1.1 only, as curl does without
+  // `--proxy-http2`.
+  if proxy.used && proxy.kind == PROXY_HTTPS {
+    let _proxy_tls = c.start_tls(&tls.proxy, &proxy.url.host,
+      host_is_address(&proxy.url.host, proxy.url.ipv6), false)?;
+    if cfg.verbose {
+      verbose_info(&lit("TLS handshake with the proxy done"));
+    }
+  }
   // A SOCKS proxy connects to the server. HTTPS through an HTTP proxy goes through a CONNECT
   // tunnel, and so does HTTP with `-p`.
   if proxy.used && is_socks(proxy.kind) {
@@ -1039,7 +1055,7 @@ sinks : &mut Sinks) -> Result<Conn, Failure> {
   }
   if secure {
     // curl offers HTTP/2 over TLS unless `--http1.1` or `--http1.0` says no.
-    let _tls = c.start_tls(tls, &u.host, host_is_address(&u.host, u.ipv6),
+    let _tls = c.start_tls(&tls.server, &u.host, host_is_address(&u.host, u.ipv6),
       !cfg.no_h2 && !cfg.http10)?;
     if cfg.verbose {
       verbose_info(&lit("TLS handshake done"));
@@ -1110,7 +1126,7 @@ fn http_error(status : i32) -> Failure {
 /// The HTTP proxy of a request, from `-x`.
 struct Proxy {
   used : bool,
-  // PROXY_HTTP, or a kind of SOCKS proxy (securl::socks).
+  // PROXY_HTTP, PROXY_HTTPS, or a kind of SOCKS proxy (securl::socks).
   kind : i32,
   // The proxy as a URL: its host and port are where curl connects.
   url : Url,
@@ -1231,7 +1247,11 @@ fn proxy_for(cfg : &Config, u : &Url) -> Result<Proxy, Failure> {
   }
   let mut url = parse_url(&text, false)?;
   if !has_port_in(&text) {
+    // libcurl's default ports for a proxy: 443 over TLS, and else 1080.
     url.port = 1080;
+    if kind == PROXY_HTTPS {
+      url.port = 443;
+    }
   }
   let mut has_credentials = url.has_user;
   let mut user = clone_bytes(&url.user);
@@ -1351,7 +1371,7 @@ fn credentials_of(cfg : &Config, u : &Url) -> Credentials {
 /// Run the transfer of `url_text`. `body` is the request body for a POST or a PUT. `kind` is
 /// `REQ_GET`, `REQ_POST`, `REQ_PUT` or `REQ_HEAD`. With `-m`, the whole transfer, redirects
 /// included, has that time limit.
-pub fn run_transfer(network : &Network, tls : &TlsConfig, cfg : &Config, headers : &Vec<Vec<u8>>,
+pub fn run_transfer(network : &Network, tls : &TlsSettings, cfg : &Config, headers : &Vec<Vec<u8>>,
 url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>, session : &mut Session,
 sinks : &mut Sinks, info : &mut TransferInfo) -> Result<i32, Failure> {
   let started = Instant::now();
@@ -1389,7 +1409,7 @@ fn timeout_message(f : Failure, started : &Instant, info : &TransferInfo) -> Fai
 }
 
 /// The transfer of `url_text`, and of each redirect that it follows, until `deadline`.
-fn follow_redirects(network : &Network, tls : &TlsConfig, cfg : &Config,
+fn follow_redirects(network : &Network, tls : &TlsSettings, cfg : &Config,
 headers : &Vec<Vec<u8>>, url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, deadline : Instant,
 form_boundary : &Vec<u8>, session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo)
 -> Result<i32, Failure> {

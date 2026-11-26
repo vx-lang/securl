@@ -67,14 +67,10 @@ pub fn tool_main(root : Root) -> i32 {
     Result<Config, Failure>::Ok(parsed) => {
       let mut cfg = parsed;
       cfg.proxy_env = proxy_env(&root.env);
-      // As curl does while it reads the command line: a `--cacert` file must exist.
-      if cfg.cacert.len() > 0 && !file_exists(&root.files, &cfg.cacert) {
-        let mut m = lit("curl: The file '");
-        append(&mut m, &cfg.cacert);
-        push_lit(&mut m, "' provided to --cacert does not exist\n");
-        push_lit(&mut m, "curl: option --cacert: is badly used here\n");
-        push_lit(&mut m, "curl: try 'curl --help' for more information\n");
-        to_stderr(&m);
+      // As curl does while it reads the command line: a `--cacert` or `--proxy-cacert` file
+      // must exist.
+      if !file_given_exists(&root.files, &cfg.cacert, "cacert")
+         || !file_given_exists(&root.files, &cfg.proxy_cacert, "proxy-cacert") {
         return FAILED_INIT;
       }
       return run(&root.network, &root.files, &cfg);
@@ -100,6 +96,13 @@ fn report(cfg : &Config, f : &Failure) -> void {
   push_lit(&mut m, ") ");
   append(&mut m, &f.message);
   push_lit(&mut m, "\n");
+  if f.code == PEER_FAILED_VERIFICATION {
+    // curl's advice after a certificate that it could not check.
+    push_lit(&mut m, "More details here: https://curl.se/docs/sslcerts.html\n\n");
+    push_lit(&mut m, "curl failed to verify the legitimacy of the server and therefore could not\n");
+    push_lit(&mut m, "establish a secure connection to it. To learn more about this situation and\n");
+    push_lit(&mut m, "how to fix it, please visit the webpage mentioned above.\n");
+  }
   to_stderr(&m);
 }
 
@@ -110,7 +113,7 @@ fn print_version() -> void {
   append(&mut m, &securl_version());
   push_lit(&mut m, " ");
   append(&mut m, &tls_library_version());
-  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: HSTS HTTP2 IPv6 Largefile libz SSL\n");
+  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: HSTS HTTP2 HTTPS-proxy IPv6 Largefile libz SSL\n");
   let _ok = write_stdout(&m);
 }
 
@@ -431,11 +434,32 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
           pass : clone_bytes(&cfg.pass)
         });
       }
-      let code = run_all(network, files, &tls, cfg, &headers, &request_body, &upload_body, kind,
-        other_kind, &form_boundary, &mut session, hsts_too_long);
-      save_jar(files, cfg, &mut session.jar);
-      save_hsts(files, cfg, &session.hsts);
-      return code;
+      // The settings for an HTTPS proxy. curl takes `--capath` for it too when there is no
+      // `--proxy-capath`. A run that cannot meet an HTTPS proxy gets settings that load no
+      // certificates, and never uses them.
+      let mut proxy_capath = clone_bytes(&cfg.proxy_capath);
+      if proxy_capath.len() == 0 {
+        proxy_capath = clone_bytes(&cfg.capath);
+      }
+      let skip_proxy_check = cfg.proxy_insecure || !may_use_https_proxy(cfg);
+      match TlsConfig::new(files, skip_proxy_check, &cfg.proxy_cacert, &proxy_capath) {
+        Result<TlsConfig, TlsError>::Ok(p) => {
+          let settings = TlsSettings {
+            server : tls,
+            proxy : p
+          };
+          let code = run_all(network, files, &settings, cfg, &headers, &request_body,
+            &upload_body, kind, other_kind, &form_boundary, &mut session, hsts_too_long);
+          save_jar(files, cfg, &mut session.jar);
+          save_hsts(files, cfg, &session.hsts);
+          return code;
+        },
+        Result<TlsConfig, TlsError>::Err(e) => {
+          let f = fail_with(e.code, e.message);
+          report(cfg, &f);
+          return f.code;
+        }
+      }
     },
     Result<TlsConfig, TlsError>::Err(e) => {
       let f = fail_with(e.code, e.message);
@@ -443,6 +467,37 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
       return f.code;
     }
   }
+}
+
+/// Whether the file `name` of the option `--option` exists, when it is given. curl stops with
+/// its message when it does not.
+fn file_given_exists(files : &Files, name : &Vec<u8>, option : *const i8) -> bool {
+  if name.len() == 0 || file_exists(files, name) {
+    return true;
+  }
+  let mut m = lit("curl: The file '");
+  append(&mut m, name);
+  push_lit(&mut m, "' provided to --");
+  push_lit(&mut m, option);
+  push_lit(&mut m, " does not exist\ncurl: option --");
+  push_lit(&mut m, option);
+  push_lit(&mut m, ": is badly used here\ncurl: try 'curl --help' for more information\n");
+  to_stderr(&m);
+  return false;
+}
+
+/// Whether a transfer of the run may go through an HTTPS proxy: `-x` or a proxy variable names
+/// one with `https://`.
+fn may_use_https_proxy(cfg : &Config) -> bool {
+  if starts_lit_nocase(&cfg.proxy, "https://") {
+    return true;
+  }
+  for v in cfg.proxy_env.iter() {
+    if starts_lit_nocase(&v.value, "https://") {
+      return true;
+    }
+  }
+  return false;
 }
 
 /// Write the cookies to the jar file of `-c`, or to standard output for `-`. libcurl only notes
@@ -491,7 +546,7 @@ fn effective_url(text : &Vec<u8>, path_as_is : bool) -> Vec<u8> {
 }
 
 /// Run the transfer of each URL, and give the exit code of the last one that failed.
-fn run_all(network : &Network, files : &Files, tls : &TlsConfig, cfg : &Config,
+fn run_all(network : &Network, files : &Files, tls : &TlsSettings, cfg : &Config,
 headers : &Vec<Vec<u8>>, request_body : &Vec<u8>, upload_body : &Vec<u8>, kind : i32,
 other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first : bool) -> i32 {
   let mut exit_code = 0;
@@ -584,7 +639,7 @@ fn write_pieces(files : &Files, pieces : &Vec<WriteOutPiece>) -> void {
   }
 }
 
-fn transfer_one(network : &Network, files : &Files, tls : &TlsConfig, cfg : &Config,
+fn transfer_one(network : &Network, files : &Files, tls : &TlsSettings, cfg : &Config,
 headers : &Vec<Vec<u8>>,
 url_text : &Vec<u8>, request_body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>,
 session : &mut Session, index : i32, info : &mut TransferInfo) -> Result<i32, Failure> {

@@ -25,7 +25,7 @@ while [ ! -s "$work/ports" ] && [ $tries -lt 50 ]; do
   sleep 0.1
   tries=$((tries + 1))
 done
-read -r https http proxy mute socks mtls < "$work/ports"
+read -r https http proxy mute socks mtls tlsproxy < "$work/ports"
 
 fail=0
 # check NAME EXPECTED_EXIT EXPECTED_STDOUT CURL_ARGUMENTS...
@@ -190,6 +190,42 @@ check "a tunnel that the proxy refuses" 7 "" -sS -x "127.0.0.1:$proxy" "https://
 stderr_has "  with curl's message" "CONNECT tunnel failed, response 403"
 first_line "  and -i shows the refusal" "HTTP/1.1 403 Forbidden" -si -x "127.0.0.1:$proxy" \
   "https://localhost:1/"
+
+# An HTTPS proxy: TLS to the proxy, and for an https:// URL, TLS to the server inside it.
+# --cacert is for the server only. The proxy has --proxy-cacert, or the CAs of the system.
+pcert="--proxy-cacert $certs/ca.pem"
+# shellcheck disable=SC2086
+check "https through an HTTPS proxy" 0 "hello over tls" -sS $pcert \
+  -x "https://localhost:$tlsproxy" --cacert "$certs/ca.pem" "https://localhost:$https/"
+check "  which must have a certificate that securl trusts" 60 "" -sS \
+  -x "https://localhost:$tlsproxy" --cacert "$certs/ca.pem" "https://localhost:$https/"
+stderr_has "  with curl's message" "SSL certificate problem: unable to get local issuer certificate"
+check "  unless --proxy-insecure" 0 "hello over tls" -sS --proxy-insecure \
+  -x "https://127.0.0.1:$tlsproxy" --cacert "$certs/ca.pem" "https://localhost:$https/"
+# shellcheck disable=SC2086
+check "  1 MiB in chunks, TLS inside TLS" 0 "200 1048576" -s $pcert \
+  -x "https://localhost:$tlsproxy" --cacert "$certs/ca.pem" -o /dev/null \
+  -w '%{http_code} %{size_download}' "https://localhost:$https/big"
+# shellcheck disable=SC2086
+check "  a server that refuses inside the tunnel" 56 "" -sS $pcert \
+  -x "https://localhost:$tlsproxy" -k "https://localhost:$mtls/whoami"
+stderr_has "  with curl's message" "tlsv13 alert certificate required"
+# shellcheck disable=SC2086
+check "  a tunnel that it refuses" 7 "" -sS $pcert -x "https://localhost:$tlsproxy" \
+  "https://localhost:1/"
+# shellcheck disable=SC2086
+check "http through an HTTPS proxy" 0 "405" -s $pcert -x "https://localhost:$tlsproxy" \
+  -o /dev/null -w '%{http_code}' "http://127.0.0.1:$http/"
+# shellcheck disable=SC2086
+check "  and with -p, through a tunnel" 0 "hello over tls" -sS $pcert -p \
+  -x "https://localhost:$tlsproxy" "http://127.0.0.1:$http/"
+curl_env="https_proxy=https://localhost:$tlsproxy"
+# shellcheck disable=SC2086
+check "an https:// proxy in https_proxy" 0 "hello over tls" -sS $pcert \
+  --cacert "$certs/ca.pem" "https://localhost:$https/"
+curl_env=
+check "a --proxy-cacert file that does not exist" 2 "" -sS --proxy-cacert "$work/no-such-file" \
+  -x "https://localhost:$tlsproxy" "https://localhost:$https/"
 
 # Proxies from the environment, as libcurl reads them. The proxy of servers.py does only
 # CONNECT and answers 405 to anything else, so a request that went to it directly gives 405.

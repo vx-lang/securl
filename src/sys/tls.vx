@@ -67,6 +67,15 @@ extern "C" {
   // the `short` events that happened. Two `i32` values hold it on a little-endian machine.
   fn poll(fds : *mut i32, count : u64, timeout_ms : i32) -> i32;
   fn OpenSSL_version(kind : i32) -> *const i8;
+  // Memory BIOs, for TLS inside TLS: the records of the inner connection.
+  fn BIO_s_mem() -> *const i8;
+  fn BIO_new(method : *const i8) -> *mut i8;
+  fn BIO_read(bio : *mut i8, data : *mut u8, len : i32) -> i32;
+  fn BIO_write(bio : *mut i8, data : *const u8, len : i32) -> i32;
+  fn BIO_ctrl(bio : *mut i8, cmd : i32, larg : i64, parg : *mut i8) -> i64;
+  fn BIO_free(bio : *mut i8) -> i32;
+  // The connection takes both BIOs, and SSL_free frees them.
+  fn SSL_set_bio(ssl : *mut i8, rbio : *mut i8, wbio : *mut i8) -> void;
 }
 
 /// The TLS library and its version, such as `OpenSSL/3.5.9`, for `securl --version`.
@@ -104,6 +113,12 @@ const SSL_ERROR_SYSCALL : i32 = 5;
 const SSL_ERROR_ZERO_RETURN : i32 = 6;
 const POLLIN : i32 = 1;
 const POLLOUT : i32 = 4;
+const BIO_CTRL_PENDING : i32 = 10;
+// BIO_set_mem_eof_return: what a read of an empty memory BIO gives.
+const BIO_C_SET_BUF_MEM_EOF_RETURN : i32 = 130;
+// How many bytes of the outer connection one read gives the inner one, and how many bytes one
+// write of the inner connection takes: one TLS record.
+const INNER_READ : i32 = 16384;
 
 // The exit codes of curl for TLS errors.
 const CURLE_SEND_ERROR : i32 = 55;
@@ -595,12 +610,22 @@ impl Drop for TlsConfig {
   }
 }
 
-/// A connection to a server: plain TCP, or TLS over TCP. With TLS, OpenSSL reads and writes the
-/// socket of `tcp`. The `TcpStream` closes the socket when the stream drops.
+/// A connection to a server: plain TCP, TLS over TCP, or TLS inside TLS. With TLS, OpenSSL
+/// reads and writes the socket of `tcp`. The `TcpStream` closes the socket when the stream
+/// drops.
+///
+/// TLS inside TLS is HTTPS through an HTTPS proxy: `ssl` is the connection to the proxy, and
+/// `inner` the one to the server, through the tunnel. OpenSSL writes the records of `inner` to
+/// the memory BIO `inner_out`, and this file sends them over `ssl`. What arrives over `ssl`
+/// goes into the memory BIO `inner_in`, where `inner` reads it.
 struct NetStream {
   tcp : TcpStream,
   // The OpenSSL connection, or null for plain TCP.
   ssl : *mut i8,
+  // The OpenSSL connection inside `ssl`, or null. It owns its two BIOs.
+  inner : *mut i8,
+  inner_in : *mut i8,
+  inner_out : *mut i8,
   // Each wait gives up at this time. `Instant::never()` means no time limit.
   deadline : Instant,
   // ALPN chose HTTP/2 in the TLS handshake.
@@ -661,6 +686,9 @@ impl NetStream {
     return NetStream {
       tcp : tcp,
       ssl : unsafe { 0 as *mut i8 },
+      inner : unsafe { 0 as *mut i8 },
+      inner_in : unsafe { 0 as *mut i8 },
+      inner_out : unsafe { 0 as *mut i8 },
       deadline : Instant::never(),
       alpn_h2 : false
     };
@@ -671,12 +699,13 @@ impl NetStream {
     self.deadline = at;
   }
 
-  /// Start TLS on this plain connection, for the server `host`, with the settings of `config`.
-  /// It checks the certificate of the server against `host`, unless `config` says `-k`. A
-  /// tunnel through a proxy starts TLS after the proxy said yes to CONNECT.
+  /// Start TLS on this connection, for the server `host`, with the settings of `config`. It
+  /// checks the certificate of the server against `host`, unless `config` says `-k`. A tunnel
+  /// through a proxy starts TLS after the proxy said yes to CONNECT. On a connection that uses
+  /// TLS already, to an HTTPS proxy, it starts TLS inside that one.
   pub fn start_tls(self : &mut NetStream, config : &TlsConfig, host : &Vec<u8>, host_is_ip : bool,
   offer_h2 : bool) -> Result<i32, TlsError> {
-    assert(!self.is_tls(), "start_tls on a stream that uses TLS already");
+    assert(is_null(self.inner as *const i8), "start_tls on a stream with TLS inside TLS already");
     if config.has_cert_error {
       return Result<i32, TlsError>::Err(tls_error(config.cert_error.code,
         clone_of(&config.cert_error.message)));
@@ -685,15 +714,8 @@ impl NetStream {
       return Result<i32, TlsError>::Err(tls_error(CURLE_SSL_CACERT_BADFILE,
         clone_of(&config.ca_error)));
     }
-    let mut name = Vec<i8>::new();
-    match c_string(host) {
-      Option<Vec<i8>>::Some(c) => {
-        name = c;
-      },
-      Option<Vec<i8>>::None() => {
-        return Result<i32, TlsError>::Err(tls_error(CURLE_SSL_CONNECT_ERROR,
-          lit("SSL: bad host name")));
-      }
+    if self.is_tls() {
+      return self.start_inner_tls(config, host, host_is_ip, offer_h2);
     }
     let ssl = unsafe { SSL_new(config.ctx) };
     if is_null(ssl as *const i8) {
@@ -706,30 +728,7 @@ impl NetStream {
     if unsafe { SSL_set_fd(ssl, fd) } != 1 {
       return Result<i32, TlsError>::Err(setup_error("SSL: SSL_set_fd failed"));
     }
-    // A name gets SNI, so that the server can pick its certificate. An address gets none.
-    if !host_is_ip {
-      let sni = unsafe {
-        SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_HOST_NAME,
-          name.as_mut_ptr() as *const i8)
-      };
-      if sni != 1i64 {
-        return Result<i32, TlsError>::Err(setup_error("Failed set SNI"));
-      }
-    }
-    let identity = check_identity(ssl, config, host, &mut name, host_is_ip)?;
-    // Offer HTTP/1.1 with ALPN, as curl does when it does not use HTTP/2.
-    // With `offer_h2`, offer HTTP/2 first, as curl does for HTTPS.
-    let mut alpn = Vec<u8>::new();
-    if offer_h2 {
-      alpn.push(2u8);
-      push_bytes(&mut alpn, &lit("h2"));
-    }
-    alpn.push(8u8);
-    push_bytes(&mut alpn, &lit("http/1.1"));
-    // SSL_set_alpn_protos gives 0 when it took the list.
-    if unsafe { SSL_set_alpn_protos(ssl, alpn.as_mut_ptr() as *const u8, alpn.len() as u32) } != 0 {
-      return Result<i32, TlsError>::Err(setup_error("Error setting ALPN"));
-    }
+    let identity = prepare(ssl, config, host, host_is_ip, offer_h2)?;
     return self.handshake(fd, &identity);
   }
 
@@ -756,25 +755,89 @@ impl NetStream {
         }
         continue;
       }
-      let verify_result = unsafe { SSL_get_verify_result(ssl) };
-      if identity.checked && verify_result != 0i64 {
-        unsafe { ERR_clear_error(); }
-        let mut m = lit("SSL certificate problem: ");
-        push_bytes(&mut m, &bytes_of_c_string(unsafe { X509_verify_cert_error_string(verify_result) }));
-        return Result<i32, TlsError>::Err(tls_error(CURLE_PEER_FAILED_VERIFICATION, m));
-      }
-      let mut m = lit("TLS connect error: ");
-      let detail = openssl_error_text();
-      if detail.len() > 0 {
-        push_bytes(&mut m, &detail);
-      } else {
-        push_bytes(&mut m, &lit("the connection closed during the handshake"));
-      }
-      return Result<i32, TlsError>::Err(tls_error(CURLE_SSL_CONNECT_ERROR, m));
+      return Result<i32, TlsError>::Err(handshake_error(ssl, identity));
     }
   }
 
-  /// Whether ALPN chose HTTP/2 in the TLS handshake.
+  /// Start TLS inside the TLS connection to an HTTPS proxy, through its tunnel. The handshake
+  /// goes through the memory BIOs.
+  fn start_inner_tls(self : &mut NetStream, config : &TlsConfig, host : &Vec<u8>,
+  host_is_ip : bool, offer_h2 : bool) -> Result<i32, TlsError> {
+    let ssl = unsafe { SSL_new(config.ctx) };
+    if is_null(ssl as *const i8) {
+      return Result<i32, TlsError>::Err(tls_error(CURLE_SSL_CONNECT_ERROR,
+        lit("SSL: could not create a connection")));
+    }
+    let records_in = unsafe { BIO_new(BIO_s_mem()) };
+    let records_out = unsafe { BIO_new(BIO_s_mem()) };
+    if is_null(records_in as *const i8) || is_null(records_out as *const i8) {
+      if !is_null(records_in as *const i8) {
+        let _f = unsafe { BIO_free(records_in) };
+      }
+      if !is_null(records_out as *const i8) {
+        let _f = unsafe { BIO_free(records_out) };
+      }
+      unsafe { SSL_free(ssl); }
+      return Result<i32, TlsError>::Err(tls_error(CURLE_SSL_CONNECT_ERROR,
+        lit("SSL: could not create a connection")));
+    }
+    unsafe { SSL_set_bio(ssl, records_in, records_out); }
+    // From here, the drop of the stream frees `ssl`, and with it the BIOs.
+    self.inner = ssl;
+    self.inner_in = records_in;
+    self.inner_out = records_out;
+    let identity = prepare(ssl, config, host, host_is_ip, offer_h2)?;
+    loop {
+      let r = unsafe { SSL_connect(ssl) };
+      if r == 1 {
+        let _sent = self.flush_inner()?;
+        self.alpn_h2 = alpn_is_h2(ssl);
+        return Result<i32, TlsError>::Ok(0);
+      }
+      let e = unsafe { SSL_get_error(ssl, r) };
+      if e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE {
+        let _sent = self.flush_inner()?;
+        if e == SSL_ERROR_WANT_READ && self.fill_inner()? == 0u64 {
+          return Result<i32, TlsError>::Err(handshake_error(ssl, &identity));
+        }
+        continue;
+      }
+      return Result<i32, TlsError>::Err(handshake_error(ssl, &identity));
+    }
+  }
+
+  /// Send the records that the inner connection wrote over the outer one.
+  fn flush_inner(self : &mut NetStream) -> Result<i32, TlsError> {
+    loop {
+      let pending = unsafe { BIO_ctrl(self.inner_out, BIO_CTRL_PENDING, 0i64, 0 as *mut i8) };
+      if pending <= 0i64 {
+        return Result<i32, TlsError>::Ok(0);
+      }
+      let mut records = unsafe { Vec<u8>::zeroed(pending as i32) };
+      let n = unsafe { BIO_read(self.inner_out, records.as_mut_ptr(), pending as i32) };
+      if n <= 0 {
+        return Result<i32, TlsError>::Ok(0);
+      }
+      let _sent = self.outer_write_all(&records)?;
+    }
+  }
+
+  /// Give the inner connection what the outer one reads next, and how many bytes that was. At
+  /// 0 the outer connection ended, and the inner one sees the end of its records too.
+  fn fill_inner(self : &mut NetStream) -> Result<u64, TlsError> {
+    let mut buffer = unsafe { Vec<u8>::zeroed(INNER_READ) };
+    let n = self.outer_read(&mut buffer)?;
+    if n == 0u64 {
+      let _end = unsafe {
+        BIO_ctrl(self.inner_in, BIO_C_SET_BUF_MEM_EOF_RETURN, 0i64, 0 as *mut i8)
+      };
+      return Result<u64, TlsError>::Ok(0u64);
+    }
+    let _put = unsafe { BIO_write(self.inner_in, buffer.as_mut_ptr() as *const u8, n as i32) };
+    return Result<u64, TlsError>::Ok(n);
+  }
+
+  /// Whether ALPN chose HTTP/2 in the TLS handshake with the server.
   pub fn is_h2(self : &NetStream) -> bool {
     return self.alpn_h2;
   }
@@ -787,6 +850,67 @@ impl NetStream {
   /// Read up to `buffer.len()` bytes into `buffer` and give how many arrived. 0 means that the
   /// server closed the connection.
   pub fn read(self : &mut NetStream, buffer : &mut Vec<u8>) -> Result<u64, TlsError> {
+    if is_null(self.inner as *const i8) {
+      return self.outer_read(buffer);
+    }
+    let mut ended = false;
+    loop {
+      let r = unsafe { SSL_read(self.inner, buffer.as_mut_ptr(), buffer.len()) };
+      if r > 0 {
+        return Result<u64, TlsError>::Ok(r as u64);
+      }
+      let e = unsafe { SSL_get_error(self.inner, r) };
+      if e == SSL_ERROR_ZERO_RETURN {
+        return Result<u64, TlsError>::Ok(0u64);
+      }
+      if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) && !ended {
+        let _sent = self.flush_inner()?;
+        if e == SSL_ERROR_WANT_READ && self.fill_inner()? == 0u64 {
+          ended = true;
+        }
+        continue;
+      }
+      return Result<u64, TlsError>::Err(read_failure(e, r));
+    }
+  }
+
+  /// Write all of `bytes`.
+  pub fn write_all(self : &mut NetStream, bytes : &Vec<u8>) -> Result<u64, TlsError> {
+    if is_null(self.inner as *const i8) {
+      return self.outer_write_all(bytes);
+    }
+    let base = bytes.as_mut_ptr() as *const u8;
+    let mut done : i32 = 0;
+    while done < bytes.len() {
+      // One record at a time, so that the memory BIO holds at most one record's worth.
+      let mut part = bytes.len() - done;
+      if part > INNER_READ {
+        part = INNER_READ;
+      }
+      let r = unsafe { SSL_write(self.inner, add(base, done as usize), part) };
+      if r > 0 {
+        done = done + r;
+        let _sent = self.flush_inner()?;
+        continue;
+      }
+      let e = unsafe { SSL_get_error(self.inner, r) };
+      if e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE {
+        let _sent = self.flush_inner()?;
+        if e == SSL_ERROR_WANT_READ && self.fill_inner()? == 0u64 {
+          return Result<u64, TlsError>::Err(tls_error(CURLE_SEND_ERROR,
+            lit("Connection closed abruptly")));
+        }
+        continue;
+      }
+      let error = take_openssl_error();
+      unsafe { ERR_clear_error(); }
+      return Result<u64, TlsError>::Err(write_failure(e, &error));
+    }
+    return Result<u64, TlsError>::Ok(bytes.len() as u64);
+  }
+
+  /// Read from the socket: plain, or through the TLS connection `ssl`.
+  fn outer_read(self : &mut NetStream, buffer : &mut Vec<u8>) -> Result<u64, TlsError> {
     if !self.is_tls() {
       match read_by(&mut self.tcp, buffer, self.deadline) {
         Result<u64, NetError>::Ok(n) => {
@@ -820,25 +944,12 @@ impl NetStream {
       if e == SSL_ERROR_ZERO_RETURN {
         return Result<u64, TlsError>::Ok(0u64);
       }
-      // Only the TLS close message (SSL_ERROR_ZERO_RETURN above) ends the stream. When the
-      // connection closes without it, a body that ends with the connection could be cut, so
-      // this is an error, as in curl: OpenSSL 3 reports "unexpected eof while reading".
-      let detail = openssl_error_text();
-      if e == SSL_ERROR_SYSCALL && detail.len() == 0 {
-        // No reason from OpenSSL: the socket failed, or (in OpenSSL before 3) it closed.
-        if r < 0 {
-          return Result<u64, TlsError>::Err(tls_error(CURLE_RECV_ERROR,
-            lit("Recv failure: Connection reset by peer")));
-        }
-        return Result<u64, TlsError>::Err(tls_error(CURLE_RECV_ERROR,
-          lit("Connection closed abruptly")));
-      }
-      return Result<u64, TlsError>::Err(read_error(&detail));
+      return Result<u64, TlsError>::Err(read_failure(e, r));
     }
   }
 
-  /// Write all of `bytes`.
-  pub fn write_all(self : &mut NetStream, bytes : &Vec<u8>) -> Result<u64, TlsError> {
+  /// Write all of `bytes` to the socket: plain, or through the TLS connection `ssl`.
+  fn outer_write_all(self : &mut NetStream, bytes : &Vec<u8>) -> Result<u64, TlsError> {
     if !self.is_tls() {
       match write_all_by(&mut self.tcp, bytes, self.deadline) {
         Result<u64, NetError>::Ok(n) => {
@@ -885,28 +996,109 @@ impl NetStream {
         }
       }
       unsafe { ERR_clear_error(); }
-      // curl's texts for the errors of SSL_write.
-      if e == SSL_ERROR_SSL {
-        let mut m = lit("SSL_write() error: ");
-        push_bytes(&mut m, &tls_library_version());
-        push_bytes(&mut m, &lit(": "));
-        push_bytes(&mut m, &error.text);
-        return Result<u64, TlsError>::Err(tls_error(CURLE_SEND_ERROR, m));
-      }
-      let mut m = lit("OpenSSL SSL_write: ");
-      if error.text.len() > 0 {
-        push_bytes(&mut m, &tls_library_version());
-        push_bytes(&mut m, &lit(": "));
-        push_bytes(&mut m, &error.text);
-      } else {
-        push_bytes(&mut m, &lit("SSL_ERROR_SYSCALL"));
-      }
-      push_bytes(&mut m, &lit(", errno "));
-      push_bytes(&mut m, &u64_text(errno_of(error.code)));
-      return Result<u64, TlsError>::Err(tls_error(CURLE_SEND_ERROR, m));
+      return Result<u64, TlsError>::Err(write_failure(e, &error));
     }
     return Result<u64, TlsError>::Ok(bytes.len() as u64);
   }
+}
+
+/// Prepare the connection `ssl` for its handshake with `host`: SNI for a name, so that the
+/// server can pick its certificate (an address gets none), the check of the certificate, and
+/// ALPN. ALPN offers HTTP/1.1, as curl does when it does not use HTTP/2 and for a proxy. With
+/// `offer_h2`, it offers HTTP/2 first, as curl does for HTTPS.
+fn prepare(ssl : *mut i8, config : &TlsConfig, host : &Vec<u8>, host_is_ip : bool,
+offer_h2 : bool) -> Result<PeerIdentity, TlsError> {
+  let mut name = Vec<i8>::new();
+  match c_string(host) {
+    Option<Vec<i8>>::Some(c) => {
+      name = c;
+    },
+    Option<Vec<i8>>::None() => {
+      return Result<PeerIdentity, TlsError>::Err(tls_error(CURLE_SSL_CONNECT_ERROR,
+        lit("SSL: bad host name")));
+    }
+  }
+  if !host_is_ip {
+    let sni = unsafe {
+      SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_HOST_NAME,
+        name.as_mut_ptr() as *const i8)
+    };
+    if sni != 1i64 {
+      return Result<PeerIdentity, TlsError>::Err(setup_error("Failed set SNI"));
+    }
+  }
+  let identity = check_identity(ssl, config, host, &mut name, host_is_ip)?;
+  let mut alpn = Vec<u8>::new();
+  if offer_h2 {
+    alpn.push(2u8);
+    push_bytes(&mut alpn, &lit("h2"));
+  }
+  alpn.push(8u8);
+  push_bytes(&mut alpn, &lit("http/1.1"));
+  // SSL_set_alpn_protos gives 0 when it took the list.
+  if unsafe { SSL_set_alpn_protos(ssl, alpn.as_mut_ptr() as *const u8, alpn.len() as u32) } != 0 {
+    return Result<PeerIdentity, TlsError>::Err(setup_error("Error setting ALPN"));
+  }
+  return Result<PeerIdentity, TlsError>::Ok(identity);
+}
+
+/// The error of a handshake of `ssl` that failed: curl's 60 when the check of the certificate
+/// refused it, and else 35 with the reason from OpenSSL.
+fn handshake_error(ssl : *mut i8, identity : &PeerIdentity) -> TlsError {
+  let verify_result = unsafe { SSL_get_verify_result(ssl) };
+  if identity.checked && verify_result != 0i64 {
+    unsafe { ERR_clear_error(); }
+    let mut m = lit("SSL certificate problem: ");
+    push_bytes(&mut m, &bytes_of_c_string(unsafe { X509_verify_cert_error_string(verify_result) }));
+    return tls_error(CURLE_PEER_FAILED_VERIFICATION, m);
+  }
+  let mut m = lit("TLS connect error: ");
+  let detail = openssl_error_text();
+  if detail.len() > 0 {
+    push_bytes(&mut m, &detail);
+  } else {
+    push_bytes(&mut m, &lit("the connection closed during the handshake"));
+  }
+  return tls_error(CURLE_SSL_CONNECT_ERROR, m);
+}
+
+/// The error of an `SSL_read` that gave `r`, with the error `e` of `SSL_get_error`. Only the
+/// TLS close message ends a stream. When the connection closes without it, a body that ends
+/// with the connection could be cut, so this is an error, as in curl: OpenSSL 3 reports
+/// "unexpected eof while reading".
+fn read_failure(e : i32, r : i32) -> TlsError {
+  let detail = openssl_error_text();
+  if e == SSL_ERROR_SYSCALL && detail.len() == 0 {
+    // No reason from OpenSSL: the socket failed, or (in OpenSSL before 3) it closed.
+    if r < 0 {
+      return tls_error(CURLE_RECV_ERROR, lit("Recv failure: Connection reset by peer"));
+    }
+    return tls_error(CURLE_RECV_ERROR, lit("Connection closed abruptly"));
+  }
+  return read_error(&detail);
+}
+
+/// The error of an `SSL_write` that failed with the error `e` of `SSL_get_error`, in curl's
+/// words. `error` is the first error of OpenSSL's queue.
+fn write_failure(e : i32, error : &OpenSslError) -> TlsError {
+  if e == SSL_ERROR_SSL {
+    let mut m = lit("SSL_write() error: ");
+    push_bytes(&mut m, &tls_library_version());
+    push_bytes(&mut m, &lit(": "));
+    push_bytes(&mut m, &error.text);
+    return tls_error(CURLE_SEND_ERROR, m);
+  }
+  let mut m = lit("OpenSSL SSL_write: ");
+  if error.text.len() > 0 {
+    push_bytes(&mut m, &tls_library_version());
+    push_bytes(&mut m, &lit(": "));
+    push_bytes(&mut m, &error.text);
+  } else {
+    push_bytes(&mut m, &lit("SSL_ERROR_SYSCALL"));
+  }
+  push_bytes(&mut m, &lit(", errno "));
+  push_bytes(&mut m, &u64_text(errno_of(error.code)));
+  return tls_error(CURLE_SEND_ERROR, m);
 }
 
 fn clone_of(src : &Vec<u8>) -> Vec<u8> {
@@ -916,9 +1108,22 @@ fn clone_of(src : &Vec<u8>) -> Vec<u8> {
 }
 
 impl Drop for NetStream {
-  /// Send the TLS close message and free the OpenSSL connection. The `TcpStream` closes the
-  /// socket after this.
+  /// Send the TLS close messages and free the OpenSSL connections. The `TcpStream` closes the
+  /// socket after this. The close message of the inner connection goes out with one write of
+  /// the outer one, which does not wait.
   fn drop(self : &mut NetStream) -> void {
+    if !is_null(self.inner as *const i8) {
+      let _closed = unsafe { SSL_shutdown(self.inner) };
+      let pending = unsafe { BIO_ctrl(self.inner_out, BIO_CTRL_PENDING, 0i64, 0 as *mut i8) };
+      if pending > 0i64 {
+        let mut records = unsafe { Vec<u8>::zeroed(pending as i32) };
+        let n = unsafe { BIO_read(self.inner_out, records.as_mut_ptr(), pending as i32) };
+        if n > 0 {
+          let _w = unsafe { SSL_write(self.ssl, records.as_mut_ptr() as *const u8, n) };
+        }
+      }
+      unsafe { SSL_free(self.inner); }
+    }
     if self.is_tls() {
       let _closed = unsafe { SSL_shutdown(self.ssl) };
       unsafe { SSL_free(self.ssl); }

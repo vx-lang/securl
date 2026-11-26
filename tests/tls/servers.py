@@ -3,8 +3,8 @@
 
     python3 tests/tls/servers.py CERT_DIR PORT_FILE PROXY_LOG
 
-It starts six servers on free ports of 127.0.0.1 and writes their ports to PORT_FILE as
-"https http proxy mute socks mtls":
+It starts seven servers on free ports of 127.0.0.1 and writes their ports to PORT_FILE as
+"https http proxy mute socks mtls tlsproxy":
 
 - an HTTPS server with the certificate in CERT_DIR. `/` answers "hello over tls", and `/big`
   answers 1 MiB in chunks, so that TLS reads have to wait for more data.
@@ -18,6 +18,7 @@ It starts six servers on free ports of 127.0.0.1 and writes their ports to PORT_
   port 1 with the error code of the protocol.
 - an HTTPS server that asks for a client certificate signed by client-ca.pem. `/whoami`
   answers with the common name of the certificate.
+- the HTTP proxy again, over TLS with the certificate of the HTTPS server: an HTTPS proxy.
 
 On both HTTP servers, `/stall` sends 10 of the 100 bytes of its body and then waits, for the
 time limits of reads, and `/huge-chunk` sends a chunk size too large for 64 bits. The paths of
@@ -30,6 +31,7 @@ It runs until it is killed.
 """
 import http.server
 import os
+import select
 import socket
 import socketserver
 import ssl
@@ -231,10 +233,34 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             return
         upstream = socket.create_connection((host.decode(), int(port)))
         self.request.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        if isinstance(self.request, ssl.SSLSocket):
+            # One TLS socket must not be read and written from two threads at once.
+            relay(self.request, upstream)
+            upstream.close()
+            return
         t = threading.Thread(target=pipe, args=(upstream, self.request), daemon=True)
         t.start()
         pipe(self.request, upstream)
         t.join()
+
+
+def relay(tls, plain):
+    """Copy bytes both ways between the TLS socket `tls` and `plain`, until one side ends."""
+    while True:
+        if tls.pending():
+            ready = [tls]
+        else:
+            ready, _, _ = select.select([tls, plain], [], [], 30)
+        if not ready:
+            return
+        for s in ready:
+            try:
+                data = s.recv(65536)
+            except OSError:
+                return
+            if not data:
+                return
+            (plain if s is tls else tls).sendall(data)
 
 
 def recv_exact(sock, n):
@@ -371,12 +397,15 @@ def main():
     mtls_context.load_verify_locations(os.path.join(CERT_DIR, "client-ca.pem"))
     mtls = Server(("127.0.0.1", 0), Handler)
     mtls.socket = mtls_context.wrap_socket(mtls.socket, server_side=True)
-    for server in (https, plain, proxy, mute, socks, mtls):
+    # The proxy again, over TLS with the certificate of the HTTPS server: an HTTPS proxy.
+    tls_proxy = Proxy(("127.0.0.1", 0), ProxyHandler)
+    tls_proxy.socket = context.wrap_socket(tls_proxy.socket, server_side=True)
+    for server in (https, plain, proxy, mute, socks, mtls, tls_proxy):
         threading.Thread(target=server.serve_forever, daemon=True).start()
     with open(PORT_FILE + ".tmp", "w") as f:
         f.write(f"{https.server_address[1]} {plain.server_address[1]} {proxy.server_address[1]} "
                 f"{mute.server_address[1]} {socks.server_address[1]} "
-                f"{mtls.server_address[1]}\n")
+                f"{mtls.server_address[1]} {tls_proxy.server_address[1]}\n")
     os.replace(PORT_FILE + ".tmp", PORT_FILE)
     threading.Event().wait()
 
