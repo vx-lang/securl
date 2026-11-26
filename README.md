@@ -1,4 +1,4 @@
-# curl-vx
+# securl
 
 The curl command-line tool, rewritten in [Vx](https://github.com/vx-lang/Vx). It speaks HTTP/1.1,
 HTTP/2 and HTTPS, and it implements the options that curl users use most. TLS comes from OpenSSL,
@@ -6,7 +6,7 @@ which is a git submodule. HTTP/2 is written in Vx.
 
 The goal is to show what Vx's type system buys a network tool:
 
-- **No trusted code outside one small package, checked by the compiler.** The package `curlvx`
+- **No trusted code outside one small package, checked by the compiler.** The package `securl`
   holds the URL parser, the command-line parser, the request builder, the response parser,
   chunked decoding, redirects and proxies. The package `cli` holds the tool around it, and
   `disk` its files. They are compiled with `--no-trusted-code`, so any `unsafe`, `extern`,
@@ -43,7 +43,7 @@ LLVM_BIN  = /usr/lib/llvm-22/bin
 ```
 
 ```sh
-make            # builds OpenSSL once (build/openssl), then build/curl-vx
+make            # builds OpenSSL once (build/openssl), then build/securl
 make audit      # lists the trusted code, and checks that no code outside src/sys makes a raw pointer
 make unit       # unit tests
 make test-tls   # HTTPS and time-limit tests against local servers (needs python3)
@@ -53,19 +53,19 @@ make test-h2    # HTTP/2 tests against a local server (makes a virtualenv with h
 ## Status (2026-11-26)
 
 Measured with curl's own test suite: curl's `runtests.pl` and its test servers, pointed at
-`build/curl-vx` with `-c`. The tests come from curl commit 2f5c657, and the compiler is vxc from
+`build/securl` with `-c`. The tests come from curl commit 2f5c657, and the compiler is vxc from
 Vx main d3ed6cf0b.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for curl-vx | 372 of 720 (52%) |
-| The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 348 of 419 (83%) |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 372 of 720 (52%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 348 of 419 (83%) |
 | TLS, time-limit and size-limit tests against local servers (`tests/tls`) | 36 of 36 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 7 of 7 |
 
 Some HTTP tests have the keyword `libtest` or `unittest`. For those, runtests.pl runs a C
-program of the curl build, linked with curl's own libcurl, so they never run curl-vx.
+program of the curl build, linked with curl's own libcurl, so they never run securl.
 `tests/run-curl-tests.sh` and `tests/scan-supported-tests.py` leave them out. Until 2026-11-26
 the counts above included them by mistake: 152 of them passed, and the table said 522 of 874.
 Test 1070 depends on timing: it passes in about one run of four, with and without recent
@@ -78,7 +78,7 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/curlvx/` (the package with all protocol code) | 8,599 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 8,599 | none, and `--no-trusted-code` enforces this |
 | `src/cli/` (the tool) and `src/disk/` (its files) | 619 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` to `cli`) | 11 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 908 | 38 `extern` functions, 55 `unsafe` blocks |
@@ -102,12 +102,12 @@ Rust's `std` is for a Rust program. OpenSSL itself is C.
 The Rust rewrite [kov/curl](https://github.com/kov/curl) counts 3,711 uses of `unsafe`, of which
 2,871 are `unsafe` blocks. Its own write-up says that its core, tool and backend crates have none.
 Most of them are in its C ABI shim (a drop-in `libcurl.so`) and in the wrappers of OpenSSL and
-other C libraries. curl-vx has no C ABI, and it uses only the part of OpenSSL that a TLS client
+other C libraries. securl has no C ABI, and it uses only the part of OpenSSL that a TLS client
 needs. So the counts do not compare one to one. Also, Rust's `#![forbid(unsafe_code)]` does what
 `--no-trusted-code` does.
 
 What Rust does not have is the capability check. In Rust, any function can call
-`std::fs::File::open` or `std::net::TcpStream::connect`. In curl-vx, the type system keeps the
+`std::fs::File::open` or `std::net::TcpStream::connect`. In securl, the type system keeps the
 parsers away from the disk and the network.
 
 ## HTTPS
@@ -128,17 +128,17 @@ give exit code 28 with curl's messages: `Connection timed out after N millisecon
 `Operation timed out after N milliseconds with B out of T bytes received`. The lookup of a host
 name has no time limit yet.
 
-`curlvx` turns each limit into a deadline (`std::time::Instant`) for the connection. A socket
-call in `src/sys/tls.vx` runs in `std::sync::wait::within` until that deadline, so the runtime
-of Vx ends the wait. The TLS code polls in slices of 20 ms and checks the clock between them.
-`within` takes a closure. The calls are in `src/sys` and not in `curlvx` only because of a Vx
-bug (below).
+The package `securl` turns each limit into a deadline (`std::time::Instant`) for the connection.
+A socket call in `src/sys/tls.vx` runs in `std::sync::wait::within` until that deadline, so the
+runtime of Vx ends the wait. The TLS code polls in slices of 20 ms and checks the clock between
+them. `within` takes a closure. The calls are in `src/sys` and not in `securl` only because of a
+Vx bug (below).
 
 ## HTTP/2
 
-curl-vx speaks HTTP/2 (RFC 9113) over TLS when the server takes it with ALPN, as curl does by
+securl speaks HTTP/2 (RFC 9113) over TLS when the server takes it with ALPN, as curl does by
 default, and over plain TCP with `--http2-prior-knowledge`. `--http1.1` turns it off. All of it
-is in `src/curlvx/`, with no trusted code; only the ALPN choice comes from OpenSSL:
+is in `src/securl/`, with no trusted code; only the ALPN choice comes from OpenSSL:
 
 - `hpack.vx`: HPACK (RFC 7541) with the Huffman code and the dynamic table. Its tables come
   from the text of the RFC (`tools/gen-hpack-tables.py`), and a unit test decodes all the
@@ -151,7 +151,7 @@ is in `src/curlvx/`, with no trusted code; only the ALPN choice comes from OpenS
 
 curl's own HTTP/2 tests run through `nghttpx` (see "Run curl's test suite"). `tests/h2` tests
 more of the protocol against a server built on the `h2` package of python-hyper, an independent
-implementation. curl-vx also fetches real sites over HTTP/2, such as Cloudflare's 1.3 MB home
+implementation. securl also fetches real sites over HTTP/2, such as Cloudflare's 1.3 MB home
 page.
 
 ## Authentication
@@ -163,18 +163,18 @@ SHA-512/256, their `-sess` variants, `qop=auth` and `auth-int`, `userhash`, and 
 count. `--anyauth` takes Digest when the server offers it, and else Basic. `--proxy-digest`
 and `--proxy-anyauth` do the same with an HTTP proxy and its 407.
 
-`src/curlvx/auth.vx` holds all of it, as libcurl's `http.c` and `vauth/digest.c` do it, with no
+`src/securl/auth.vx` holds all of it, as libcurl's `http.c` and `vauth/digest.c` do it, with no
 trusted code. Only the hash functions and the random client nonce come from OpenSSL, through
 `src/sys/hash.vx`. The unit tests check the examples of RFC 2617 and RFC 7616.
 
 ## Cookies
 
 `-b` with a file name, or `-c`, turns on the cookie engine, a port of libcurl's `cookie.c` in
-`src/curlvx/cookie.vx`. It reads Netscape cookie files and `Set-Cookie:` lines, takes the
+`src/securl/cookie.vx`. It reads Netscape cookie files and `Set-Cookie:` lines, takes the
 `Set-Cookie` headers of each response, redirects included, and sends the cookies that match the
 host, the path and the security of each request, in libcurl's order. It follows libcurl's rules
 for `domain`, `path`, `secure`, `httponly`, `max-age` and `expires` (with a port of libcurl's
-date parser in `src/curlvx/date.vx`), the `__Secure-` and `__Host-` prefixes, and the limits.
+date parser in `src/securl/date.vx`), the `__Secure-` and `__Host-` prefixes, and the limits.
 `-c` writes the jar in the Netscape format at the end. Without libpsl, as in a libcurl without
 it, a cookie for a domain with no dot is refused.
 
@@ -205,9 +205,9 @@ pip cannot install either, so `tools/build-test-tools.sh` builds them from sourc
 the submodule. It checks each download against a SHA-256, and puts nothing into the system.
 `tests/run-curl-tests.sh` finds them there.
 
-`curl-vx --version` says `Protocols: http https`, so runtests.pl skips the tests of other
+`securl --version` says `Protocols: http https`, so runtests.pl skips the tests of other
 protocols and of features such as compression.
-`tests/scan-supported-tests.py` lists the tests that use only options curl-vx has, and the
+`tests/scan-supported-tests.py` lists the tests that use only options securl has, and the
 missing options that block the most tests.
 
 ## Options
@@ -225,7 +225,7 @@ missing options that block the most tests.
 `--connect-timeout` `-h` `-V`, and the options that
 runtests.pl adds: `-q` `--trace-ascii` `--trace-time`.
 
-The 2025 curl user survey asked for each user's favourite option. curl-vx accepts 19 of the top
+The 2025 curl user survey asked for each user's favourite option. securl accepts 19 of the top
 20 answers. It does not have `--libcurl`. `-vv` and `-vvv` work as `-v`, and `-w` has no
 time variables yet.
 
@@ -241,7 +241,7 @@ In order of how much users need them:
    environment), HTTPS proxies, and Digest with the proxy of a CONNECT tunnel.
 1. HTTP/3.
 
-## Vx issues found while writing curl-vx
+## Vx issues found while writing securl
 
 The Vx project tracks these.
 
@@ -258,7 +258,7 @@ The Vx project tracks these.
   to write a `Vec<u8>` to standard output, to copy the bytes of a string literal, or to read an
   environment variable. Vx PR #3975 adds `root.args`. `src/sys/` wraps each of these.
 - [#4001](https://github.com/vx-lang/Vx/issues/4001) The flat code generator declines `?` on a
-  `Result` of a struct with an `Option` field, so curl-vx compiles through the older AST path.
+  `Result` of a struct with an `Option` field, so securl compiles through the older AST path.
 - [#4002](https://github.com/vx-lang/Vx/issues/4002), [#4003](https://github.com/vx-lang/Vx/issues/4003),
   [#4004](https://github.com/vx-lang/Vx/issues/4004): a reference cannot be pointed at another
   field, `assert(false, ..)` fails at compile time on a path that never runs, and there is no
@@ -269,16 +269,17 @@ The Vx project tracks these.
   instead. Binding the result first (`let t = url_text(&u); info.url_effective = t;`) also
   works.
 - [#4092](https://github.com/vx-lang/Vx/issues/4092) `--no-trusted-code` takes the body of each
-  closure for an `unsafe` block (E5003), while `--audit` lists nothing for it. So `curlvx`
-  cannot pass a closure to `std::sync::wait::within`, and `src/sys/tls.vx` holds those calls.
+  closure for an `unsafe` block (E5003), while `--audit` lists nothing for it. So the package
+  `securl` cannot pass a closure to `std::sync::wait::within`, and `src/sys/tls.vx` holds those
+  calls.
 
 ## License
 
-curl-vx uses curl's license (SPDX `curl`), an MIT-style license, as curl does. See `LICENSE`.
-It keeps curl's copyright notice, because curl-vx takes its help text, its messages and its
+securl uses curl's license (SPDX `curl`), an MIT-style license, as curl does. See `LICENSE`.
+It keeps curl's copyright notice, because securl takes its help text, its messages and its
 behavior from curl.
 
-A curl-vx binary also holds code under other licenses:
+A securl binary also holds code under other licenses:
 
 - OpenSSL, under the Apache License 2.0 (`third_party/openssl/LICENSE.txt`). By default the
   Makefile links it statically, so a copy of the binary must come with that license.
@@ -291,7 +292,7 @@ src/main.vx          gets `Root`, and hands it to cli::tool_main
 src/cli/tool.vx      the tool: the command line, the transfers, opening files, the TLS settings
 src/disk/files.vx    reads and creates files; each function takes `&Files`
 src/sys/             trusted code: OpenSSL (tls.vx), arguments, standard output, literals
-src/curlvx/          the protocol code; no trusted code
+src/securl/          the protocol code; no trusted code
   options.vx           the command line
   url.vx               URLs and redirects
   http.vx              the request bytes, in libcurl's header order; the response head
@@ -301,9 +302,9 @@ src/curlvx/          the protocol code; no trusted code
   output.vx            standard output or a file that main opened
   writeout.vx          -w
 third_party/openssl  OpenSSL 3.5.9 (LTS), a shallow git submodule
-LICENSE              curl's license, with the copyright of curl-vx and of curl
+LICENSE              curl's license, with the copyright of securl and of curl
 tests/unit/          unit tests of the parsers
 tests/tls/           HTTPS tests against local servers, with test certificates
-tests/run-curl-tests.sh   runs curl's runtests.pl against build/curl-vx
+tests/run-curl-tests.sh   runs curl's runtests.pl against build/securl
 tools/check-no-pointers.sh  refuses code that makes a raw pointer outside src/sys
 ```

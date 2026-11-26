@@ -1,8 +1,8 @@
 COPYRIGHT AND PERMISSION NOTICE
 
-Copyright (c) 2026, Aditya Kumar, and the contributors of curl-vx.
+Copyright (c) 2026, Aditya Kumar, and the contributors of securl.
 
-curl-vx follows curl closely: its help text, its messages and the behavior that curl's test
+securl follows curl closely: its help text, its messages and the behavior that curl's test
 suite checks come from curl. For those parts:
 
 Copyright (c) 1996 - 2026, Daniel Stenberg, <daniel@haxx.se>, and many

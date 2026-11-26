@@ -8,18 +8,18 @@
 // The response head becomes a `ResponseHead` with the status line `HTTP/2 200 `, as curl writes
 // it, so the rest of a transfer does not care about the version. `next_data` gives the body.
 //
-// Flow control: curl-vx gives the server a window of 1 MiB on the stream and on the
+// Flow control: securl gives the server a window of 1 MiB on the stream and on the
 // connection, and sends WINDOW_UPDATE when half of it is used. It sends its own body within
 // the windows of the server, and waits for WINDOW_UPDATE when they are empty.
 import core::option;
 import core::result;
 import std::vec;
 import sys::text;
-import curlvx::bytes;
-import curlvx::conn;
-import curlvx::failure;
-import curlvx::hpack;
-import curlvx::http;
+import securl::bytes;
+import securl::conn;
+import securl::failure;
+import securl::hpack;
+import securl::http;
 
 // Frame types and flags (RFC 9113, section 6).
 const FRAME_DATA : i32 = 0;
@@ -40,9 +40,9 @@ const FLAG_PRIORITY : i32 = 32;
 
 // The stream of the request.
 const STREAM : i32 = 1;
-// The largest frame that curl-vx takes: the default of SETTINGS_MAX_FRAME_SIZE.
+// The largest frame that securl takes: the default of SETTINGS_MAX_FRAME_SIZE.
 const MAX_FRAME_IN : i32 = 16384;
-// The window that curl-vx gives the server, on the stream and on the connection.
+// The window that securl gives the server, on the stream and on the connection.
 const RECV_WINDOW : i64 = 1048576i64;
 // The window of a new stream and connection before SETTINGS say more.
 const DEFAULT_WINDOW : i64 = 65535i64;
@@ -56,17 +56,17 @@ struct H2 {
   peer_max_frame : i32,
   // SETTINGS_INITIAL_WINDOW_SIZE of the server.
   peer_initial_window : i64,
-  // What curl-vx may still send: on the connection and on the stream.
+  // What securl may still send: on the connection and on the stream.
   send_conn : i64,
   send_stream : i64,
-  // What the server sent since the last WINDOW_UPDATE of curl-vx.
+  // What the server sent since the last WINDOW_UPDATE of securl.
   recv_conn_used : i64,
   recv_stream_used : i64,
   // The server ended the stream.
   end_stream : bool,
   // The header lines of the trailers, as `name: value\r\n`.
   trailers : Vec<u8>,
-  // A frame of the response that arrived while curl-vx still sent the body.
+  // A frame of the response that arrived while securl still sent the body.
   has_pending : bool,
   pending : Frame,
 }
@@ -116,7 +116,7 @@ struct Frame {
   payload : Vec<u8>,
 }
 
-// The largest header block, with its CONTINUATION frames, that curl-vx reads. It is the limit
+// The largest header block, with its CONTINUATION frames, that securl reads. It is the limit
 // of the decoded fields in hpack.vx.
 const MAX_HEADER_BLOCK : i32 = 1048576;
 
@@ -182,7 +182,7 @@ fn read_frame(c : &mut Conn) -> Result<Frame, Failure> {
   });
 }
 
-/// Start the connection: the client preface, the SETTINGS of curl-vx, and a larger window on
+/// Start the connection: the client preface, the SETTINGS of securl, and a larger window on
 /// the connection.
 pub fn h2_start(h : &mut H2, c : &mut Conn) -> Result<i32, Failure> {
   let preface = lit("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
@@ -206,7 +206,7 @@ pub fn h2_start(h : &mut H2, c : &mut Conn) -> Result<i32, Failure> {
   return Result<i32, Failure>::Ok(0);
 }
 
-// HTTP/2 error codes that curl-vx sends.
+// HTTP/2 error codes that securl sends.
 const ERR_PROTOCOL : i64 = 1i64;
 const ERR_FLOW_CONTROL : i64 = 3i64;
 
@@ -215,7 +215,7 @@ const ERR_FLOW_CONTROL : i64 = 3i64;
 /// go out, the transfer fails the same.
 fn connection_error(c : &mut Conn, code : i64, message : *const i8) -> Failure {
   let mut payload = Vec<u8>::new();
-  // No stream of the server was processed: curl-vx takes no pushed streams.
+  // No stream of the server was processed: securl takes no pushed streams.
   push_u32(&mut payload, 0i64);
   push_u32(&mut payload, code);
   let _sent = write_frame(c, FRAME_GOAWAY, 0, 0, &payload);

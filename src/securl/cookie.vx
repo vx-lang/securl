@@ -8,8 +8,8 @@ import core::option;
 import std::time;
 import std::vec;
 import sys::text;
-import curlvx::bytes;
-import curlvx::date;
+import securl::bytes;
+import securl::date;
 
 // How `add_cookie` reads a line.
 // The line is the value of a `Set-Cookie` header, not a line of a cookie file.

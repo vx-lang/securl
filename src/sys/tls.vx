@@ -1,6 +1,6 @@
 // TLS through OpenSSL, and one stream type for plain TCP and TLS connections.
 //
-// TRUSTED CODE. Each OpenSSL call is an `extern` function. The rest of curl-vx sees only safe
+// TRUSTED CODE. Each OpenSSL call is an `extern` function. The rest of securl sees only safe
 // functions: `TlsConfig::new`, `NetStream::plain`, `start_tls`, `read` and `write_all`.
 //
 // Rights. `TlsConfig::new` reads the certificates of the certificate authorities from files,
@@ -16,7 +16,7 @@
 // `TcpStream` runs in `std::sync::wait::within`, so it gives `NetError::Cancelled` at the
 // deadline. `poll` does not know the deadline, so this file polls in short slices and checks
 // the clock between them. A wait that passes the deadline gives `CURLE_OPERATION_TIMEDOUT`.
-// (The calls of `within` are here and not in `curlvx` because of a bug of Vx: the compiler
+// (The calls of `within` are here and not in `securl` because of a bug of Vx: the compiler
 // takes each closure body for an `unsafe` block, which `--no-trusted-code` refuses.)
 import core::option;
 import core::ptr;
@@ -64,7 +64,7 @@ extern "C" {
   fn OpenSSL_version(kind : i32) -> *const i8;
 }
 
-/// The TLS library and its version, such as `OpenSSL/3.5.9`, for `curl-vx --version`.
+/// The TLS library and its version, such as `OpenSSL/3.5.9`, for `securl --version`.
 pub fn tls_library_version() -> Vec<u8> {
   // OpenSSL_version(0) gives text such as "OpenSSL 3.5.9 30 Sep 2025".
   let text = bytes_of_c_string(unsafe { OpenSSL_version(0) });
@@ -260,7 +260,7 @@ fn tcp_error(e : NetError, code : i32, message : *const i8) -> TlsError {
 }
 
 /// The settings of TLS that all connections of a run share: the certificate authorities that
-/// curl-vx trusts, and whether it checks the certificate of the server at all.
+/// securl trusts, and whether it checks the certificate of the server at all.
 struct TlsConfig {
   ctx : *mut i8,
   verify : bool,

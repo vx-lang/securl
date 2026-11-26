@@ -3,9 +3,9 @@
 import core::result;
 import std::vec;
 import sys::text;
-import curlvx::bytes;
-import curlvx::failure;
-import curlvx::hpack;
+import securl::bytes;
+import securl::failure;
+import securl::hpack;
 
 fn hex(s : *const i8) -> Vec<u8> {
   let t = lit(s);

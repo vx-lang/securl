@@ -15,8 +15,8 @@ import core::option;
 import std::vec;
 import sys::hash;
 import sys::text;
-import curlvx::bytes;
-import curlvx::encode;
+import securl::bytes;
+import securl::encode;
 
 // Authentication methods, as bits. The values are libcurl's CURLAUTH_ values.
 const AUTH_NONE : i32 = 0;
@@ -29,7 +29,7 @@ const AUTH_PICKNONE : i32 = 1073741824;
 
 // What `decode_challenge` found.
 const DIGEST_OK : i32 = 0;
-// The challenge asks for something that curl-vx cannot do. Ignore it.
+// The challenge asks for something that securl cannot do. Ignore it.
 const DIGEST_NOT_BUILT_IN : i32 = 1;
 // The challenge is wrong, or it says that the credentials were wrong.
 const DIGEST_BAD : i32 = 2;

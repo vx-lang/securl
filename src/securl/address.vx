@@ -4,7 +4,7 @@
 // checks against the addresses in the certificate, or a name.
 import core::option;
 import std::vec;
-import curlvx::bytes;
+import securl::bytes;
 
 /// The 4 bytes of the IPv4 address `text`, or None. As `inet_pton`, it takes only four decimal
 /// numbers from 0 to 255 split by dots, with no leading zero: `127.0.0.1`, but not `127.1`,

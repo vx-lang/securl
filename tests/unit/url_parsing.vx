@@ -1,10 +1,10 @@
-// Checks how curlvx::url parses URLs and resolves the Location of a redirect.
+// Checks how securl::url parses URLs and resolves the Location of a redirect.
 import core::result;
 import std::vec;
 import sys::text;
-import curlvx::bytes;
-import curlvx::failure;
-import curlvx::url;
+import securl::bytes;
+import securl::failure;
+import securl::url;
 
 fn parsed(s : *const i8) -> Url {
   match parse_url(&lit(s), false) {

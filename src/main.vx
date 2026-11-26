@@ -1,4 +1,4 @@
-// curl-vx: the curl command-line tool, written in Vx.
+// securl: the curl command-line tool, written in Vx.
 //
 // `main` is the only function that gets the rights of the program, in `root`, and it hands
 // them to `tool_main` in the package `cli`. This file is the one file outside a package, so it

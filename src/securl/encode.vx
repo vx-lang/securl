@@ -1,6 +1,6 @@
 // Base64 for Basic authentication, and the URL encoding of `--data-urlencode`.
 import std::vec;
-import curlvx::bytes;
+import securl::bytes;
 
 /// The Base64 digit for the 6-bit value `v`.
 fn base64_digit(v : u8) -> u8 {

@@ -6,9 +6,9 @@
 import core::option;
 import std::vec;
 import sys::text;
-import curlvx::bytes;
-import curlvx::encode;
-import curlvx::options;
+import securl::bytes;
+import securl::encode;
+import securl::options;
 
 /// The file that `part` reads, or None. `-` means standard input.
 pub fn data_file_name(part : &DataPart) -> Option<Vec<u8>> {

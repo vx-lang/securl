@@ -9,10 +9,10 @@ import core::option;
 import core::result;
 import std::vec;
 import sys::text;
-import curlvx::bytes;
-import curlvx::failure;
+import securl::bytes;
+import securl::failure;
 
-// The header table size that curl-vx allows the server (SETTINGS_HEADER_TABLE_SIZE).
+// The header table size that securl allows the server (SETTINGS_HEADER_TABLE_SIZE).
 const HPACK_TABLE_SIZE : i32 = 4096;
 // Header lists longer than this are refused, as a defense against a server that sends too much.
 const HPACK_MAX_LIST : i32 = 1048576;

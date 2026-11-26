@@ -1,5 +1,5 @@
 #!/bin/sh
-# The TLS and time-limit tests of curl-vx: each case runs build/curl-vx against the servers of
+# The TLS and time-limit tests of securl: each case runs build/securl against the servers of
 # servers.py and checks the exit code and the output. They need python3, and no network but
 # 127.0.0.1.
 #
@@ -7,7 +7,7 @@
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-curl=$root/build/curl-vx
+curl=$root/build/securl
 certs=$here/certs
 work=$root/build/tls-tests
 mkdir -p "$work"
@@ -94,7 +94,7 @@ fi
 check "a chunk size of 2^63" 56 "" \
   -sS "http://127.0.0.1:$http/huge-chunk"
 stderr_has "  with curl's message" "invalid chunk size: '8000000000000000'"
-# A peer that never ends a line must not make curl-vx read on: each line has a limit.
+# A peer that never ends a line must not make securl read on: each line has a limit.
 check "a status line with no end" 100 "" -sS "http://127.0.0.1:$http/endless-status"
 stderr_has "  with curl's message" "Too large response headers"
 check "a header line with no end" 100 "" -sS "http://127.0.0.1:$http/endless-header"

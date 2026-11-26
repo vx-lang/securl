@@ -1,14 +1,14 @@
-# Build curl-vx.
+# Build securl.
 #
-#   make            build build/curl-vx
+#   make            build build/securl
 #   make audit      list each use of trusted code (unsafe, extern) in the program
 #   make unit       run the unit tests in tests/unit
-#   make test       run curl's own test suite against build/curl-vx (see README.md)
-#   make test-supported   only the curl tests that use options curl-vx has
+#   make test       run curl's own test suite against build/securl (see README.md)
+#   make test-supported   only the curl tests that use options securl has
 #   make test-tls   the HTTPS tests against local servers (needs python3)
 #   make test-h2    the HTTP/2 tests against a local server (needs python3 and the h2 package)
 #
-# curl-vx needs a vxc built from Vx main. Put the settings of your machine in config.mk, which
+# securl needs a vxc built from Vx main. Put the settings of your machine in config.mk, which
 # git ignores. For example:
 #
 #   VXC       = /path/to/Vx/target/release/vxc
@@ -40,21 +40,21 @@ else
 endif
 
 # Only `sys` may hold trusted code. The compiler refuses any `unsafe`, `extern`, `mlir!`,
-# `extern impl` or `unsafe impl` in the other packages: `curlvx` (the protocol code), `cli`
+# `extern impl` or `unsafe impl` in the other packages: `securl` (the protocol code), `cli`
 # (the tool) and `disk` (its files). src/main.vx, outside any package, only calls `cli`.
-PKGS = --package sys=src/sys --package curlvx=src/curlvx --package disk=src/disk \
-  --package cli=src/cli --no-trusted-code curlvx --no-trusted-code disk --no-trusted-code cli
+PKGS = --package sys=src/sys --package securl=src/securl --package disk=src/disk \
+  --package cli=src/cli --no-trusted-code securl --no-trusted-code disk --no-trusted-code cli
 
-SRCS = $(wildcard src/*.vx src/sys/*.vx src/curlvx/*.vx src/disk/*.vx src/cli/*.vx)
+SRCS = $(wildcard src/*.vx src/sys/*.vx src/securl/*.vx src/disk/*.vx src/cli/*.vx)
 LIBS = -L $(VX_LIBDIR) -lvx_std_core -Wl,-rpath,$(VX_LIBDIR)
 
-all: build/curl-vx
+all: build/securl
 
-build/curl-vx: $(SRCS) $(TLS_DEPS)
+build/securl: $(SRCS) $(TLS_DEPS)
 	@mkdir -p build
 	tools/check-no-pointers.sh
-	PATH="$(LLVM_BIN):$$PATH" $(VXC) $(PKGS) -c src/main.vx -o build/curl-vx.o
-	cc build/curl-vx.o $(TLS_LIBS) $(LIBS) -o $@
+	PATH="$(LLVM_BIN):$$PATH" $(VXC) $(PKGS) -c src/main.vx -o build/securl.o
+	cc build/securl.o $(TLS_LIBS) $(LIBS) -o $@
 
 # The trusted code of the program, and the check that the code with no trusted code makes no
 # raw pointer (see tools/check-no-pointers.sh).
@@ -66,19 +66,19 @@ unit: $(TLS_DEPS)
 	VXC="$(VXC)" VX_LIBDIR="$(VX_LIBDIR)" LLVM_BIN="$(LLVM_BIN)" TLS_LIBS="$(TLS_LIBS)" \
 	  ./tests/unit/run.sh
 
-test: build/curl-vx
+test: build/securl
 	./tests/run-curl-tests.sh $(CURL_SRC) $(TESTS)
 
 # The TLS tests, against local servers with the test certificates in tests/tls/certs.
-test-tls: build/curl-vx
+test-tls: build/securl
 	./tests/tls/run.sh
 
 # The HTTP/2 tests, against a server built on the h2 package (made in build/h2-venv).
-test-h2: build/curl-vx
+test-h2: build/securl
 	./tests/h2/run.sh
 
-# The HTTP tests that use only options that curl-vx has (tests/scan-supported-tests.py).
-test-supported: build/curl-vx
+# The HTTP tests that use only options that securl has (tests/scan-supported-tests.py).
+test-supported: build/securl
 	./tests/run-curl-tests.sh $(CURL_SRC) $$(cat tests/supported-tests.txt)
 
 # OpenSSL builds once, out of its source tree, with only what a TLS client needs.
@@ -102,7 +102,7 @@ openssl-dev: $(OPENSSL_STAMP)
 
 # `clean` keeps the OpenSSL build, which takes minutes. `distclean` removes it too.
 clean:
-	rm -rf build/curl-vx build/curl-vx.o build/unit
+	rm -rf build/securl build/securl.o build/unit
 
 distclean:
 	rm -rf build

@@ -4,7 +4,7 @@
 import core::option;
 import std::vec;
 import sys::text;
-import curlvx::bytes;
+import securl::bytes;
 
 const NO_VALUE : i64 = -1i64;
 

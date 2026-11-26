@@ -1,4 +1,4 @@
-// The command line of curl: which options curl-vx knows, and the `Config` they make.
+// The command line of curl: which options securl knows, and the `Config` they make.
 //
 // This file needs no right at all: it reads only the argument bytes. Options that name a file,
 // such as `-d @file` or `-o file`, keep the name here. `main` opens the file, because only
@@ -7,9 +7,9 @@ import core::option;
 import core::result;
 import std::vec;
 import sys::text;
-import curlvx::auth;
-import curlvx::bytes;
-import curlvx::failure;
+import securl::auth;
+import securl::bytes;
+import securl::failure;
 
 // The kinds of request body option. `-d` and `--data-ascii` read a file after `@` and drop its
 // CR and LF bytes. `--data-raw` never reads a file. `--data-binary` and `--json` keep the
@@ -189,7 +189,7 @@ pub fn default_config() -> Config {
   };
 }
 
-// The options curl-vx knows. An option that is in curl but not here is "unknown".
+// The options securl knows. An option that is in curl but not here is "unknown".
 const OPT_UNKNOWN : i32 = 0;
 const OPT_USER_AGENT : i32 = 1;
 const OPT_COOKIE : i32 = 2;
@@ -755,7 +755,7 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
   }
   // OPT_DISABLE,
   // OPT_GLOBOFF, OPT_TRACE_TIME, OPT_PROGRESS_BAR, OPT_NO_PROGRESS_METER and OPT_NO_BUFFER
-  // change nothing that curl-vx does.
+  // change nothing that securl does.
   return Result<i32, Failure>::Ok(0);
 }
 

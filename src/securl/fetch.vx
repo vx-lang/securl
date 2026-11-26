@@ -11,17 +11,17 @@ import std::time;
 import std::vec;
 import sys::text;
 import sys::tls;
-import curlvx::address;
-import curlvx::auth;
-import curlvx::bytes;
-import curlvx::conn;
-import curlvx::cookie;
-import curlvx::failure;
-import curlvx::h2;
-import curlvx::http;
-import curlvx::options;
-import curlvx::output;
-import curlvx::url;
+import securl::address;
+import securl::auth;
+import securl::bytes;
+import securl::conn;
+import securl::cookie;
+import securl::failure;
+import securl::h2;
+import securl::http;
+import securl::options;
+import securl::output;
+import securl::url;
 
 /// What `-w` can print about a transfer.
 struct TransferInfo {
@@ -945,7 +945,7 @@ fn no_proxy_for(list : &Vec<u8>, host : &Vec<u8>) -> bool {
   return false;
 }
 
-/// The proxy for a request to `u`. curl-vx speaks only to HTTP proxies.
+/// The proxy for a request to `u`. securl speaks only to HTTP proxies.
 fn proxy_for(cfg : &Config, u : &Url) -> Result<Proxy, Failure> {
   let none = Proxy {
     used : false,
@@ -1108,7 +1108,7 @@ form_boundary : &Vec<u8>, jar : &mut CookieJar, sinks : &mut Sinks, info : &mut 
   let first = parse_url(url_text, cfg.path_as_is)?;
   let mut creds = credentials_of(cfg, &first);
   let mut auth = new_auth_context(cfg.auth_type, cfg.proxy_auth_type);
-  // A server that asks for new credentials again and again does not keep curl-vx forever.
+  // A server that asks for new credentials again and again does not keep securl forever.
   let mut auth_rounds = 0;
   let first_port = first.port;
   let first_scheme = clone_bytes(&first.scheme);

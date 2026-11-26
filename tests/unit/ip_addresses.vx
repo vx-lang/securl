@@ -1,14 +1,14 @@
-// Checks how curlvx::address reads IPv4 and IPv6 addresses, as the C library's `inet_pton`
+// Checks how securl::address reads IPv4 and IPv6 addresses, as the C library's `inet_pton`
 // does, and how it writes an IPv6 address in its short form, as `inet_ntop` does. Also checks
 // that the URL parser refuses a bad address in brackets, and keeps a zone out of the host.
 import core::option;
 import core::result;
 import std::vec;
 import sys::text;
-import curlvx::address;
-import curlvx::bytes;
-import curlvx::failure;
-import curlvx::url;
+import securl::address;
+import securl::bytes;
+import securl::failure;
+import securl::url;
 
 fn ipv4_ok(s : *const i8) -> bool {
   return parse_ipv4(&lit(s)).is_some();

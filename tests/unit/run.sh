@@ -15,8 +15,8 @@ export PATH="${LLVM_BIN:-/usr/lib/llvm-22/bin}:$PATH"
 fail=0
 for t in "$here"/*.vx; do
   name=$(basename "$t" .vx)
-  if ! "$VXC" --package sys="$root/src/sys" --package curlvx="$root/src/curlvx" \
-      --no-trusted-code curlvx -c "$t" -o "$out/$name.o" > "$out/$name.log" 2>&1; then
+  if ! "$VXC" --package sys="$root/src/sys" --package securl="$root/src/securl" \
+      --no-trusted-code securl -c "$t" -o "$out/$name.o" > "$out/$name.log" 2>&1; then
     echo "FAIL (compile) $name"; grep -v '^\[JIT\]' "$out/$name.log" | head -20; fail=1; continue
   fi
   # shellcheck disable=SC2086

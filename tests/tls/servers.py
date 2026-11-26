@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Servers for the TLS tests of curl-vx.
+"""Servers for the TLS tests of securl.
 
     python3 tests/tls/servers.py CERT_DIR PORT_FILE PROXY_LOG
 
@@ -74,7 +74,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"8000000000000000\r\nhello\r\n0\r\n\r\n")
         elif self.path in ENDLESS:
             # A response that never ends a line: 4 MiB with no newline, and then the server
-            # waits. curl-vx must give up at its limit, not read on and wait.
+            # waits. securl must give up at its limit, not read on and wait.
             try:
                 self.wfile.write(ENDLESS[self.path])
                 for _ in range(64):
@@ -82,7 +82,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 time.sleep(30)
             except ConnectionError:
-                # curl-vx hung up at its limit, as it should.
+                # securl hung up at its limit, as it should.
                 pass
         elif self.path in ("/close-notify", "/close-cut", "/close-reset"):
             # A body that ends when the connection closes: no Content-Length, not chunked. The

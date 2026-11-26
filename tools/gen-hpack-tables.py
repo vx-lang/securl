@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Write the HPACK tables of src/curlvx/hpack.vx from the text of RFC 7541.
+"""Write the HPACK tables of src/securl/hpack.vx from the text of RFC 7541.
 
     curl -sSo rfc7541.txt https://www.rfc-editor.org/rfc/rfc7541.txt
     python3 tools/gen-hpack-tables.py rfc7541.txt tables.vx
 
-The output is the end of src/curlvx/hpack.vx, from the line that starts with "// Generated".
+The output is the end of src/securl/hpack.vx, from the line that starts with "// Generated".
 It checks that the Huffman code of Appendix B is canonical, which the decoder relies on.
 """
 import re, sys

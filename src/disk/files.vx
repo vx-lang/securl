@@ -1,5 +1,5 @@
-// The files that curl-vx reads and writes. Each function takes the right to open files, a
-// `&Files`, which only `main` and `cli::tool` have. The `curlvx` package never gets it.
+// The files that securl reads and writes. Each function takes the right to open files, a
+// `&Files`, which only `main` and `cli::tool` have. The `securl` package never gets it.
 import core::option;
 import core::result;
 import std::fs;
@@ -7,8 +7,8 @@ import std::string;
 import std::vec;
 import sys::console;
 import sys::text;
-import curlvx::bytes;
-import curlvx::failure;
+import securl::bytes;
+import securl::failure;
 
 fn path_string(name : &Vec<u8>) -> Option<String> {
   return to_string(name);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HTTP/2 servers for the HTTP/2 tests of curl-vx, built on the h2 package (python-hyper).
+"""HTTP/2 servers for the HTTP/2 tests of securl, built on the h2 package (python-hyper).
 
     python3 tests/h2/server.py CERT_DIR PORT_FILE
 
@@ -7,7 +7,7 @@ It serves HTTP/2 over TLS (ALPN h2) and HTTP/2 over plain TCP (prior knowledge) 
 of 127.0.0.1, and writes them to PORT_FILE as "tls plain". The paths:
 
   /               "hello over h2"
-  /big            1 MiB in many DATA frames, so that curl-vx must send WINDOW_UPDATE
+  /big            1 MiB in many DATA frames, so that securl must send WINDOW_UPDATE
   /echo           the length and a checksum of the request body, read with flow control
   /early          a 413 before reading the request body
   /trailers       a body and then trailers
@@ -180,7 +180,7 @@ def serve(conn, sock, stream, head, body):
                 sock.sendall(raw_frame(9, 0, stream, b"\x00" * 16384))
             time.sleep(30)
         except OSError:
-            # curl-vx hung up at its limit, as it should.
+            # securl hung up at its limit, as it should.
             pass
         return
     elif path in BAD_WINDOWS:

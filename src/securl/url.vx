@@ -4,9 +4,9 @@ import core::option;
 import core::result;
 import std::vec;
 import sys::text;
-import curlvx::address;
-import curlvx::bytes;
-import curlvx::failure;
+import securl::address;
+import securl::bytes;
+import securl::failure;
 
 /// A parsed URL. `path` holds the path and the query, such as `/a/b?x=1`, and starts with `/`.
 /// The fragment is not part of it, because it never goes to the server.
@@ -19,7 +19,7 @@ struct Url {
   host : Vec<u8>,
   // The host is an IPv6 address. `host` holds it without the brackets, in its short form.
   ipv6 : bool,
-  // The zone of an IPv6 address, as in `[fe80::1%25eth0]`, or empty. curl-vx keeps it for
+  // The zone of an IPv6 address, as in `[fe80::1%25eth0]`, or empty. securl keeps it for
   // the URL that `-w` writes, but does not connect through the zone yet.
   zone : Vec<u8>,
   port : i32,
@@ -42,7 +42,7 @@ pub fn clone_url(u : &Url) -> Url {
   };
 }
 
-/// The port that a scheme uses when the URL gives none, or 0 for a scheme that curl-vx does
+/// The port that a scheme uses when the URL gives none, or 0 for a scheme that securl does
 /// not know.
 pub fn default_port(scheme : &Vec<u8>) -> i32 {
   if eq_lit(scheme, "http") {

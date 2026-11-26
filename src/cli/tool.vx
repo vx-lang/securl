@@ -16,18 +16,18 @@ import sys::env;
 import sys::hash;
 import sys::text;
 import sys::tls;
-import curlvx::body;
-import curlvx::encode;
-import curlvx::bytes;
-import curlvx::cookie;
-import curlvx::failure;
-import curlvx::form;
-import curlvx::http;
-import curlvx::options;
-import curlvx::output;
-import curlvx::fetch;
-import curlvx::url;
-import curlvx::writeout;
+import securl::body;
+import securl::encode;
+import securl::bytes;
+import securl::cookie;
+import securl::failure;
+import securl::form;
+import securl::http;
+import securl::options;
+import securl::output;
+import securl::fetch;
+import securl::url;
+import securl::writeout;
 import disk::files;
 
 /// The program, with the rights of `main`. It gives the exit code of curl.
@@ -64,9 +64,9 @@ fn report(cfg : &Config, f : &Failure) -> void {
 
 fn print_version() -> void {
   let mut m = lit("curl ");
-  append(&mut m, &curl_vx_version());
-  push_lit(&mut m, " (x86_64-pc-linux-gnu) libcurl-vx/");
-  append(&mut m, &curl_vx_version());
+  append(&mut m, &securl_version());
+  push_lit(&mut m, " (x86_64-pc-linux-gnu) libcurl/");
+  append(&mut m, &securl_version());
   push_lit(&mut m, " ");
   append(&mut m, &tls_library_version());
   push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: HTTP2 IPv6 Largefile SSL\n");
@@ -76,7 +76,7 @@ fn print_version() -> void {
 fn print_help() -> void {
   let mut m = Vec<u8>::new();
   push_lit(&mut m, "Usage: curl [options...] <url>\n");
-  push_lit(&mut m, "curl-vx: the curl tool for HTTP/1.1 and HTTPS, written in Vx. Options:\n");
+  push_lit(&mut m, "securl: the curl tool for HTTP/1.1 and HTTPS, written in Vx. Options:\n");
   push_lit(&mut m, " -d, --data <data>          HTTP POST data (--data-ascii, --data-raw, --data-binary)\n");
   push_lit(&mut m, "     --data-urlencode <data> HTTP POST data, URL-encoded\n");
   push_lit(&mut m, "     --json <data>          HTTP POST JSON\n");

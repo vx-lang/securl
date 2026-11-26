@@ -25,7 +25,7 @@ pub fn fail_lit(code : i32, message : *const i8) -> Failure {
   };
 }
 
-// The exit codes of curl that curl-vx uses. They are the CURLcode numbers of libcurl.
+// The exit codes of curl that securl uses. They are the CURLcode numbers of libcurl.
 const UNSUPPORTED_PROTOCOL : i32 = 1;
 const FAILED_INIT : i32 = 2;
 const URL_MALFORMAT : i32 = 3;

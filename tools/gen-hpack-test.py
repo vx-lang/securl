@@ -19,8 +19,8 @@ groups = [
 ]
 out = ["// Generated from RFC 7541 Appendix C by a script: each example is decoded with the decoder",
        "// of the group, and the fields and the size of the dynamic table must match the RFC.",
-       "import core::result;", "import std::vec;", "import sys::text;", "import curlvx::bytes;",
-       "import curlvx::failure;", "import curlvx::hpack;", "",
+       "import core::result;", "import std::vec;", "import sys::text;", "import securl::bytes;",
+       "import securl::failure;", "import securl::hpack;", "",
        "fn hex(s : *const i8) -> Vec<u8> {", "  let t = lit(s);", "  let mut out = Vec<u8>::new();",
        "  let mut i = 0;", "  while i + 1 < t.len() {",
        "    out.push((hex_value(t.get(i)) * 16 + hex_value(t.get(i + 1))) as u8);", "    i = i + 2;",

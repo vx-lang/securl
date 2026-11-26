@@ -1,7 +1,7 @@
-// Checks the byte-list helpers of curlvx::bytes.
+// Checks the byte-list helpers of securl::bytes.
 import std::vec;
 import sys::text;
-import curlvx::bytes;
+import securl::bytes;
 
 fn main() -> i32 {
   let line = lit("  Content-Length: 42 \r\n");

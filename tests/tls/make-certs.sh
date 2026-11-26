@@ -10,7 +10,7 @@ set -eu
 out=$1
 work=$(mktemp -d)
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/ca.key" -out "$out/ca.pem" \
-  -days 36500 -subj "/CN=curl-vx test CA" \
+  -days 36500 -subj "/CN=securl test CA" \
   -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
 openssl req -newkey rsa:2048 -nodes -keyout "$out/server.key" -out "$work/server.csr" \
   -subj "/CN=localhost"

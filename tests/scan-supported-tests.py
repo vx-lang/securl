@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List the curl HTTP tests that use only options curl-vx implements.
+"""List the curl HTTP tests that use only options securl implements.
 
     python3 tests/scan-supported-tests.py CURL_SRC/tests/data [tests/supported-tests.txt]
 
@@ -8,7 +8,7 @@ the plain HTTP test server and run the curl tool, and checks the options of thei
 It prints which missing options block the most tests. With a second argument, it writes the
 numbers of the tests that need no missing option to that file.
 
-Keep SUPPORTED_LONG and SUPPORTED_SHORT the same as the options in src/curlvx/options.vx.
+Keep SUPPORTED_LONG and SUPPORTED_SHORT the same as the options in src/securl/options.vx.
 """
 import collections
 import os
@@ -53,7 +53,7 @@ def http_tests(data):
 
 
 def missing_options(command):
-    """The options of a command line that curl-vx does not implement."""
+    """The options of a command line that securl does not implement."""
     try:
         words = shlex.split(command)
     except ValueError:
@@ -87,7 +87,7 @@ def main():
         if not missing:
             supported.append(int(name[4:]))
     print(f"HTTP tests that run curl on the HTTP server: {total}")
-    print(f"tests that use only options curl-vx implements: {len(supported)}")
+    print(f"tests that use only options securl implements: {len(supported)}")
     for option, n in counts.most_common(30):
         print(f"{n:5d} {option}")
     if len(sys.argv) > 2:

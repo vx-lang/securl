@@ -1,10 +1,10 @@
-// Checks how curlvx::options reads a command line.
+// Checks how securl::options reads a command line.
 import core::result;
 import std::vec;
 import sys::text;
-import curlvx::bytes;
-import curlvx::failure;
-import curlvx::options;
+import securl::bytes;
+import securl::failure;
+import securl::options;
 
 fn words(a : *const i8, b : *const i8, c : *const i8, d : *const i8, e : *const i8) -> Vec<Vec<u8>> {
   let mut v = Vec<Vec<u8>>::new();

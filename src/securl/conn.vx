@@ -8,8 +8,8 @@ import std::time;
 import std::vec;
 import sys::text;
 import sys::tls;
-import curlvx::bytes;
-import curlvx::failure;
+import securl::bytes;
+import securl::failure;
 
 const READ_BUFFER_SIZE : i32 = 16384;
 

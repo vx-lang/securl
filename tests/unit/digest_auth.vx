@@ -1,10 +1,10 @@
-// Checks the Digest messages of curlvx::auth against the examples of RFC 2617 and RFC 7616,
+// Checks the Digest messages of securl::auth against the examples of RFC 2617 and RFC 7616,
 // and how it reads challenges.
 import std::vec;
 import sys::console;
 import sys::text;
-import curlvx::auth;
-import curlvx::bytes;
+import securl::auth;
+import securl::bytes;
 
 /// A state after the challenge `params` (the text after `Digest `), with the client nonce
 /// `cnonce`, as in the examples.

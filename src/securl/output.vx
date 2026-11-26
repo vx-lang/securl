@@ -8,8 +8,8 @@ import std::fs;
 import std::vec;
 import sys::console;
 import sys::text;
-import curlvx::bytes;
-import curlvx::failure;
+import securl::bytes;
+import securl::failure;
 
 struct Output {
   to_stdout : bool,

@@ -1,5 +1,5 @@
 #!/bin/sh
-# The HTTP/2 tests of curl-vx: each case runs build/curl-vx against tests/h2/server.py, an
+# The HTTP/2 tests of securl: each case runs build/securl against tests/h2/server.py, an
 # HTTP/2 server built on the h2 package, and checks the exit code and the output. The first run
 # makes a Python virtualenv with h2 in build/h2-venv (it needs pip and PyPI).
 #
@@ -7,7 +7,7 @@
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-curl=$root/build/curl-vx
+curl=$root/build/securl
 certs=$root/tests/tls/certs
 work=$root/build/h2-tests
 venv=$root/build/h2-venv

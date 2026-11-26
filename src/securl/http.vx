@@ -6,14 +6,14 @@
 import core::option;
 import std::vec;
 import sys::text;
-import curlvx::bytes;
-import curlvx::encode;
-import curlvx::failure;
-import curlvx::url;
+import securl::bytes;
+import securl::encode;
+import securl::failure;
+import securl::url;
 
-/// The text that curl-vx gives as its version, and sends in `User-Agent`.
-pub fn curl_vx_version() -> Vec<u8> {
-  return lit("0.1.0-vx");
+/// The text that securl gives as its version, and sends in `User-Agent`.
+pub fn securl_version() -> Vec<u8> {
+  return lit("0.1.0-securl");
 }
 
 // The kinds of request: no body, a POST body, an upload with PUT, or HEAD.
@@ -249,7 +249,7 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
         add_line(&mut out, "User-Agent: ", &info.user_agent);
       }
     } else {
-      add_line(&mut out, "User-Agent: curl/", &curl_vx_version());
+      add_line(&mut out, "User-Agent: curl/", &securl_version());
     }
   }
 
@@ -363,7 +363,7 @@ password : &Vec<u8>, has_user_agent : bool, user_agent : &Vec<u8>) -> Vec<u8> {
       add_line(&mut out, "User-Agent: ", user_agent);
     }
   } else {
-    add_line(&mut out, "User-Agent: curl/", &curl_vx_version());
+    add_line(&mut out, "User-Agent: curl/", &securl_version());
   }
   push_lit(&mut out, "Proxy-Connection: Keep-Alive\r\n\r\n");
   return out;

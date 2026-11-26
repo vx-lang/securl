@@ -1,7 +1,7 @@
 // Hash functions and random bytes, from OpenSSL. Digest authentication needs MD5, SHA-256 and
 // SHA-512/256, and a random client nonce.
 //
-// TRUSTED CODE. Each OpenSSL call is an `extern` function. The rest of curl-vx sees only
+// TRUSTED CODE. Each OpenSSL call is an `extern` function. The rest of securl sees only
 // `hash_bytes` and `random_bytes`, which take and give byte lists.
 import core::ptr;
 import std::vec;

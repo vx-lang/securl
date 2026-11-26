@@ -1,8 +1,8 @@
-// Checks curlvx::date against the formats that libcurl's parsedate.c documents.
+// Checks securl::date against the formats that libcurl's parsedate.c documents.
 import core::option;
 import std::vec;
 import sys::text;
-import curlvx::date;
+import securl::date;
 
 fn parses_to(text : *const i8, want : i64) -> void {
   match parse_date(&lit(text)) {
