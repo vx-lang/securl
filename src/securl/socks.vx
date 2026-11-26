@@ -1,0 +1,361 @@
+// SOCKS4, SOCKS4a, SOCKS5 and SOCKS5h proxies, as libcurl's `lib/socks.c` speaks them: the
+// messages, the limits and the errors are libcurl's. Each failure of the proxy is exit code 97,
+// CURLE_PROXY.
+//
+// SOCKS4 and SOCKS5 send the address of the server, which the caller looks up. SOCKS4a and
+// SOCKS5h send the host name, and the proxy looks it up.
+//
+// SOCKS4:  https://www.openssh.com/txt/socks4.protocol
+// SOCKS4a: https://www.openssh.com/txt/socks4a.protocol
+// SOCKS5:  RFC 1928, and RFC 1929 for the user name and password.
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import securl::address;
+import securl::bytes;
+import securl::conn;
+import securl::failure;
+
+// The kinds of proxy. HTTP is libcurl's default.
+const PROXY_HTTP : i32 = 0;
+const PROXY_SOCKS4 : i32 = 4;
+const PROXY_SOCKS4A : i32 = 6;
+const PROXY_SOCKS5 : i32 = 5;
+const PROXY_SOCKS5H : i32 = 7;
+
+/// Whether a proxy of `kind` is a SOCKS proxy.
+pub fn is_socks(kind : i32) -> bool {
+  return kind != PROXY_HTTP;
+}
+
+/// Whether a proxy of `kind` needs the address of the server, which the caller looks up.
+pub fn socks_resolves_locally(kind : i32) -> bool {
+  return kind == PROXY_SOCKS4 || kind == PROXY_SOCKS5;
+}
+
+/// The kind of proxy of a proxy URL scheme such as `socks5h`, or -1 for one that securl does
+/// not speak.
+pub fn proxy_kind_of_scheme(scheme : &Vec<u8>) -> i32 {
+  if eq_lit_nocase(scheme, "http") { return PROXY_HTTP; }
+  if eq_lit_nocase(scheme, "socks4") { return PROXY_SOCKS4; }
+  if eq_lit_nocase(scheme, "socks4a") { return PROXY_SOCKS4A; }
+  if eq_lit_nocase(scheme, "socks5") { return PROXY_SOCKS5; }
+  if eq_lit_nocase(scheme, "socks5h") { return PROXY_SOCKS5H; }
+  return -1;
+}
+
+/// What a SOCKS handshake needs to know.
+struct SocksRequest {
+  kind : i32,
+  // The server, after `--connect-to`, as the URL names it.
+  host : Vec<u8>,
+  port : i32,
+  // For SOCKS4 and SOCKS5: the addresses of `host`, 4 or 16 bytes each, and whether the
+  // lookup worked at all. An address in brackets or an IPv4 address needs no lookup.
+  addresses : Vec<Vec<u8>>,
+  lookup_failed : bool,
+  // The user name and password of the proxy, from its URL or `--proxy-user`.
+  has_credentials : bool,
+  user : Vec<u8>,
+  password : Vec<u8>,
+}
+
+fn socks_fail(message : Vec<u8>) -> Failure {
+  return fail_with(PROXY_ERROR, message);
+}
+
+fn socks_fail_lit(message : *const i8) -> Failure {
+  return fail_lit(PROXY_ERROR, message);
+}
+
+/// Exactly `n` bytes from the proxy.
+fn read_exact(c : &mut Conn, n : i32) -> Result<Vec<u8>, Failure> {
+  let mut out = Vec<u8>::new();
+  while out.len() < n {
+    let got = c.read_some((n - out.len()) as i64)?;
+    if got.len() == 0 {
+      return Result<Vec<u8>, Failure>::Err(socks_fail_lit(
+        "Failed to receive SOCKS response, proxy closed connection"));
+    }
+    append(&mut out, &got);
+  }
+  return Result<Vec<u8>, Failure>::Ok(out);
+}
+
+/// Add the port `port` in network byte order.
+fn push_port(out : &mut Vec<u8>, port : i32) -> void {
+  out.push(((port / 256) % 256) as u8);
+  out.push((port % 256) as u8);
+}
+
+/// The text `host:port` of the server, for a message.
+fn dest_text(req : &SocksRequest) -> Vec<u8> {
+  let mut m = clone_bytes(&req.host);
+  push_lit(&mut m, ":");
+  push_u64(&mut m, req.port as u64);
+  return m;
+}
+
+/// The message of a lookup of the server that failed. 6 is CURLE_COULDNT_RESOLVE_HOST.
+fn lookup_failure(req : &SocksRequest) -> Failure {
+  let mut m = lit("error 6 resolving SOCKS destination ");
+  append(&mut m, &dest_text(req));
+  return socks_fail(m);
+}
+
+/// Ask the SOCKS proxy at the other end of `c` for a connection to the server of `req`. When
+/// it gives Ok, `c` reaches the server.
+pub fn socks_connect(c : &mut Conn, req : &SocksRequest) -> Result<i32, Failure> {
+  if req.kind == PROXY_SOCKS4 || req.kind == PROXY_SOCKS4A {
+    return socks4_connect(c, req);
+  }
+  return socks5_connect(c, req);
+}
+
+fn socks4_connect(c : &mut Conn, req : &SocksRequest) -> Result<i32, Failure> {
+  let mut out = Vec<u8>::new();
+  out.push(4u8);
+  out.push(1u8);
+  push_port(&mut out, req.port);
+  let mut user = Vec<u8>::new();
+  if req.has_credentials {
+    // The protocol has no limit, but libcurl has the limit of SOCKS5.
+    if req.user.len() > 255 {
+      return Result<i32, Failure>::Err(socks_fail_lit("Too long SOCKS proxy username"));
+    }
+    user = clone_bytes(&req.user);
+  }
+  if req.kind == PROXY_SOCKS4A {
+    // The address 0.0.0.1 says that the host name follows the user.
+    if req.host.len() + 1 > 255 {
+      return Result<i32, Failure>::Err(socks_fail_lit("SOCKS4: too long hostname"));
+    }
+    out.push(0u8);
+    out.push(0u8);
+    out.push(0u8);
+    out.push(1u8);
+    append(&mut out, &user);
+    out.push(0u8);
+    append(&mut out, &req.host);
+    out.push(0u8);
+  } else {
+    if req.lookup_failed {
+      return Result<i32, Failure>::Err(lookup_failure(req));
+    }
+    // SOCKS4 has only IPv4.
+    let mut found = false;
+    for a in req.addresses.iter() {
+      if !found && a.len() == 4 {
+        append(&mut out, a);
+        found = true;
+      }
+    }
+    if !found {
+      let mut m = lit("SOCKS4 connection to ");
+      append(&mut m, &req.host);
+      push_lit(&mut m, " not supported");
+      return Result<i32, Failure>::Err(socks_fail(m));
+    }
+    append(&mut out, &user);
+    out.push(0u8);
+  }
+  let _sent = c.send(&out)?;
+  let reply = read_exact(c, 8)?;
+  if reply.get(0) != 0u8 {
+    return Result<i32, Failure>::Err(socks_fail_lit(
+      "SOCKS4 reply has wrong version, version should be 0."));
+  }
+  let code = reply.get(1);
+  if code == 90u8 {
+    return Result<i32, Failure>::Ok(0);
+  }
+  let mut m = lit("[SOCKS] cannot complete SOCKS4 connection to ");
+  push_u64(&mut m, reply.get(4) as u64);
+  push_lit(&mut m, ".");
+  push_u64(&mut m, reply.get(5) as u64);
+  push_lit(&mut m, ".");
+  push_u64(&mut m, reply.get(6) as u64);
+  push_lit(&mut m, ".");
+  push_u64(&mut m, reply.get(7) as u64);
+  push_lit(&mut m, ":");
+  push_u64(&mut m, (reply.get(2) as u64) * 256u64 + (reply.get(3) as u64));
+  push_lit(&mut m, ". (");
+  push_u64(&mut m, code as u64);
+  push_lit(&mut m, ")");
+  if code == 91u8 {
+    push_lit(&mut m, ", request rejected or failed.");
+  } else {
+    if code == 92u8 {
+      push_lit(&mut m, ", request rejected because SOCKS server cannot connect to identd on the client.");
+    } else {
+      if code == 93u8 {
+        push_lit(&mut m, ", request rejected because the client program and identd report different user-ids.");
+      } else {
+        push_lit(&mut m, ", Unknown.");
+      }
+    }
+  }
+  return Result<i32, Failure>::Err(socks_fail(m));
+}
+
+fn socks5_connect(c : &mut Conn, req : &SocksRequest) -> Result<i32, Failure> {
+  let remote = req.kind == PROXY_SOCKS5H;
+  // RFC 1928 gives a host name at most 255 bytes.
+  if remote && req.host.len() > 255 {
+    return Result<i32, Failure>::Err(socks_fail_lit(
+      "SOCKS5: the destination hostname is too long to be resolved remotely by the proxy."));
+  }
+  // The methods: no authentication, and the user name and password when there are some.
+  let mut hello = Vec<u8>::new();
+  hello.push(5u8);
+  if req.has_credentials {
+    hello.push(2u8);
+    hello.push(0u8);
+    hello.push(2u8);
+  } else {
+    hello.push(1u8);
+    hello.push(0u8);
+  }
+  let _hello = c.send(&hello)?;
+  let chosen = read_exact(c, 2)?;
+  if chosen.get(0) != 5u8 {
+    return Result<i32, Failure>::Err(socks_fail_lit(
+      "Received invalid version in initial SOCKS5 response."));
+  }
+  let method = chosen.get(1);
+  if method == 1u8 {
+    return Result<i32, Failure>::Err(socks_fail_lit(
+      "SOCKS5 GSSAPI per-message authentication is not enabled."));
+  }
+  if method == 255u8 {
+    return Result<i32, Failure>::Err(socks_fail_lit("No authentication method was acceptable."));
+  }
+  if method != 0u8 && method != 2u8 {
+    return Result<i32, Failure>::Err(socks_fail_lit(
+      "Unknown SOCKS5 mode attempted to be used by server."));
+  }
+  if method == 2u8 {
+    let _auth = socks5_login(c, req)?;
+  }
+  let mut out = Vec<u8>::new();
+  out.push(5u8);
+  out.push(1u8);
+  out.push(0u8);
+  if remote {
+    // An address goes as an address, and anything else as a host name.
+    if find_byte(&req.host, 58u8, 0) >= 0 {
+      match parse_ipv6(&req.host) {
+        Option<Vec<u8>>::Some(a) => {
+          out.push(4u8);
+          append(&mut out, &a);
+        },
+        Option<Vec<u8>>::None() => {
+          // libcurl gives CURLPX_BAD_ADDRESS_TYPE with no message, so curl shows the text of
+          // CURLE_PROXY.
+          return Result<i32, Failure>::Err(socks_fail_lit("Proxy handshake error"));
+        }
+      }
+    } else {
+      match parse_ipv4(&req.host) {
+        Option<Vec<u8>>::Some(a) => {
+          out.push(1u8);
+          append(&mut out, &a);
+        },
+        Option<Vec<u8>>::None() => {
+          out.push(3u8);
+          out.push(req.host.len() as u8);
+          append(&mut out, &req.host);
+        }
+      }
+    }
+  } else {
+    if req.lookup_failed {
+      return Result<i32, Failure>::Err(lookup_failure(req));
+    }
+    // libcurl takes an IPv6 address first.
+    let mut chosen_address = Vec<u8>::new();
+    for a in req.addresses.iter() {
+      if chosen_address.len() == 0 && a.len() == 16 {
+        chosen_address = clone_bytes(a);
+      }
+    }
+    for a in req.addresses.iter() {
+      if chosen_address.len() == 0 && a.len() == 4 {
+        chosen_address = clone_bytes(a);
+      }
+    }
+    if chosen_address.len() == 0 {
+      let mut m = lit("Failed to resolve \"");
+      append(&mut m, &req.host);
+      push_lit(&mut m, "\" for SOCKS5 connect.");
+      return Result<i32, Failure>::Err(socks_fail(m));
+    }
+    if chosen_address.len() == 4 {
+      out.push(1u8);
+    } else {
+      out.push(4u8);
+    }
+    append(&mut out, &chosen_address);
+  }
+  push_port(&mut out, req.port);
+  let _sent = c.send(&out)?;
+  // The reply: VER REP RSV ATYP, then an address of 4, 16, or 1 + n bytes, then the port.
+  let head = read_exact(c, 5)?;
+  if head.get(0) != 5u8 {
+    return Result<i32, Failure>::Err(socks_fail_lit(
+      "SOCKS5 reply has wrong version, version should be 5."));
+  }
+  if head.get(1) != 0u8 {
+    let mut m = lit("cannot complete SOCKS5 connection to ");
+    append(&mut m, &req.host);
+    push_lit(&mut m, ". (");
+    push_u64(&mut m, head.get(1) as u64);
+    push_lit(&mut m, ")");
+    return Result<i32, Failure>::Err(socks_fail(m));
+  }
+  let mut rest = 0;
+  let atyp = head.get(3);
+  if atyp == 1u8 {
+    rest = 4 - 1 + 2;
+  } else {
+    if atyp == 3u8 {
+      rest = (head.get(4) as i32) + 2;
+    } else {
+      if atyp == 4u8 {
+        rest = 16 - 1 + 2;
+      } else {
+        return Result<i32, Failure>::Err(socks_fail_lit("SOCKS5 reply has wrong address type."));
+      }
+    }
+  }
+  let _bound = read_exact(c, rest)?;
+  return Result<i32, Failure>::Ok(0);
+}
+
+/// The user name and password of RFC 1929.
+fn socks5_login(c : &mut Conn, req : &SocksRequest) -> Result<i32, Failure> {
+  if req.user.len() > 255 {
+    return Result<i32, Failure>::Err(socks_fail_lit("Excessive username length for proxy auth"));
+  }
+  if req.password.len() > 255 {
+    return Result<i32, Failure>::Err(socks_fail_lit("Excessive password length for proxy auth"));
+  }
+  let mut out = Vec<u8>::new();
+  out.push(1u8);
+  out.push(req.user.len() as u8);
+  append(&mut out, &req.user);
+  out.push(req.password.len() as u8);
+  append(&mut out, &req.password);
+  let _sent = c.send(&out)?;
+  let status = read_exact(c, 2)?;
+  if status.get(1) != 0u8 {
+    let mut m = lit("User was rejected by the SOCKS5 server (");
+    push_u64(&mut m, status.get(0) as u64);
+    push_lit(&mut m, " ");
+    push_u64(&mut m, status.get(1) as u64);
+    push_lit(&mut m, ").");
+    return Result<i32, Failure>::Err(socks_fail(m));
+  }
+  return Result<i32, Failure>::Ok(0);
+}

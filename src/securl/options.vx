@@ -10,6 +10,7 @@ import sys::text;
 import securl::auth;
 import securl::bytes;
 import securl::failure;
+import securl::socks;
 
 // The kinds of request body option. `-d` and `--data-ascii` read a file after `@` and drop its
 // CR and LF bytes. `--data-raw` never reads a file. `--data-binary` and `--json` keep the
@@ -134,6 +135,9 @@ struct Config {
   proxytunnel : bool,
   // `-x` was given, perhaps with an empty value, which turns the proxy variables off.
   proxy_set : bool,
+  // The kind of proxy when its URL has no scheme: PROXY_HTTP for `-x`, or a kind of SOCKS
+  // proxy for `--socks4`, `--socks4a`, `--socks5` and `--socks5-hostname` (securl::socks).
+  proxy_kind : i32,
   // `--noproxy` was given, perhaps with an empty value, which turns `no_proxy` off.
   has_noproxy : bool,
   // The proxy variables of the environment that are set, such as `https_proxy`. The tool
@@ -217,6 +221,7 @@ pub fn default_config() -> Config {
     keepalive_cnt : 0i64,
     proxytunnel : false,
     proxy_set : false,
+    proxy_kind : PROXY_HTTP,
     has_noproxy : false,
     proxy_env : Vec<EnvVar>::new()
   };
@@ -297,6 +302,10 @@ const OPT_KEEPALIVE : i32 = 72;
 const OPT_KEEPALIVE_TIME : i32 = 73;
 const OPT_KEEPALIVE_CNT : i32 = 74;
 const OPT_PROXYTUNNEL : i32 = 75;
+const OPT_SOCKS4 : i32 = 76;
+const OPT_SOCKS4A : i32 = 77;
+const OPT_SOCKS5 : i32 = 78;
+const OPT_SOCKS5_HOSTNAME : i32 = 79;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -379,6 +388,10 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "keepalive-time") { return OPT_KEEPALIVE_TIME; }
   if eq_lit(name, "keepalive-cnt") { return OPT_KEEPALIVE_CNT; }
   if eq_lit(name, "proxytunnel") { return OPT_PROXYTUNNEL; }
+  if eq_lit(name, "socks4") { return OPT_SOCKS4; }
+  if eq_lit(name, "socks4a") { return OPT_SOCKS4A; }
+  if eq_lit(name, "socks5") { return OPT_SOCKS5; }
+  if eq_lit(name, "socks5-hostname") { return OPT_SOCKS5_HOSTNAME; }
   return OPT_UNKNOWN;
 }
 
@@ -427,7 +440,8 @@ fn short_option(letter : u8) -> i32 {
 fn takes_value(id : i32) -> bool {
   return (id >= OPT_USER_AGENT && id <= OPT_OUTPUT_DIR) || id == OPT_CACERT || id == OPT_CAPATH
     || id == OPT_FORM || id == OPT_FORM_STRING || id == OPT_COOKIE_JAR
-    || id == OPT_KEEPALIVE_TIME || id == OPT_KEEPALIVE_CNT;
+    || id == OPT_KEEPALIVE_TIME || id == OPT_KEEPALIVE_CNT
+    || (id >= OPT_SOCKS4 && id <= OPT_SOCKS5_HOSTNAME);
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -669,8 +683,30 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     cfg.trace = clone_bytes(value);
     return done();
   }
+  if id >= OPT_SOCKS4 && id <= OPT_SOCKS5_HOSTNAME {
+    // As `-x`, with the kind of proxy for a value with no scheme. The value may not be empty.
+    if value.len() == 0 {
+      return Result<i32, Failure>::Err(option_error(shown,
+        "blank argument where content is expected"));
+    }
+    cfg.proxy_set = true;
+    cfg.has_proxy = true;
+    cfg.proxy = clone_bytes(value);
+    cfg.proxy_kind = PROXY_SOCKS5H;
+    if id == OPT_SOCKS4 {
+      cfg.proxy_kind = PROXY_SOCKS4;
+    }
+    if id == OPT_SOCKS4A {
+      cfg.proxy_kind = PROXY_SOCKS4A;
+    }
+    if id == OPT_SOCKS5 {
+      cfg.proxy_kind = PROXY_SOCKS5;
+    }
+    return done();
+  }
   if id == OPT_PROXY {
     cfg.proxy_set = true;
+    cfg.proxy_kind = PROXY_HTTP;
     cfg.has_proxy = value.len() > 0;
     cfg.proxy = clone_bytes(value);
     return done();

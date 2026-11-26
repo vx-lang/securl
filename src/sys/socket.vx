@@ -1,14 +1,18 @@
-// Options of a TCP socket.
+// Options of a TCP socket, and the lookup of a host name.
 //
 // TRUSTED CODE. `std::net::TcpStream` sets no socket options, so this file calls `setsockopt`
 // of the C library on the file descriptor of the stream. The numbers of the options are the
-// ones of Linux.
+// ones of Linux. `std` looks up a host name only inside `TcpStream::connect`, but a SOCKS4 or
+// SOCKS5 proxy needs the address of the server, so this file calls `getaddrinfo` too.
 import core::ptr;
 import std::net;
 import std::vec;
 
 extern "C" {
   fn setsockopt(fd : i32, level : i32, name : i32, value : *const i32, len : u32) -> i32;
+  // `hints` and the list in `*res` are `struct addrinfo` values, read here as 8-byte words.
+  fn getaddrinfo(node : *const i8, service : *const i8, hints : *const u64, res : *mut u64) -> i32;
+  fn freeaddrinfo(res : *mut u64) -> void;
 }
 
 const SOL_SOCKET : i32 = 1;
@@ -46,4 +50,71 @@ pub fn set_keepalive(tcp : &TcpStream, idle : i32, interval : i32, count : i32) 
   let _idle = set_option(fd, IPPROTO_TCP, TCP_KEEPIDLE, idle);
   let _interval = set_option(fd, IPPROTO_TCP, TCP_KEEPINTVL, interval);
   let _count = set_option(fd, IPPROTO_TCP, TCP_KEEPCNT, count);
+}
+
+const AF_INET : i64 = 2i64;
+const AF_INET6 : i64 = 10i64;
+
+/// The addresses of the host name `host`, as `getaddrinfo` gives them: 4 bytes for IPv4 and
+/// 16 for IPv6, in its order. Gives the error code of `getaddrinfo` when the lookup fails, and
+/// -1 for a name with a NUL byte. A lookup sends the name to the network, so it needs the
+/// network right.
+pub fn lookup_host(_network : &Network, host : &Vec<u8>) -> Result<Vec<Vec<u8>>, i32> {
+  let mut name = Vec<i8>::new();
+  for b in host.iter() {
+    if *b == 0u8 {
+      return Result<Vec<Vec<u8>>, i32>::Err(-1);
+    }
+    name.push(*b as i8);
+  }
+  name.push(0i8);
+  // `struct addrinfo` on Linux x86_64 and arm64 is 48 bytes: ai_flags and ai_family, then
+  // ai_socktype and ai_protocol, then ai_addrlen, then the pointers ai_addr, ai_canonname and
+  // ai_next. The hints ask for SOCK_STREAM (1), so each address comes once.
+  let mut hints = Vec<u64>::new();
+  hints.push(0u64);
+  hints.push(1u64);
+  hints.push(0u64);
+  hints.push(0u64);
+  hints.push(0u64);
+  hints.push(0u64);
+  let mut res = Vec<u64>::new();
+  res.push(0u64);
+  let code = unsafe {
+    getaddrinfo(name.as_mut_ptr() as *const i8, 0 as *const i8, hints.as_mut_ptr() as *const u64,
+      res.as_mut_ptr())
+  };
+  if code != 0 {
+    return Result<Vec<Vec<u8>>, i32>::Err(code);
+  }
+  let mut out = Vec<Vec<u8>>::new();
+  let mut node = res.get(0);
+  while node != 0u64 {
+    let ai = unsafe { node as *const u64 };
+    let family = (unsafe { ai[0] } >> 32u64) as i64 & 4294967295i64;
+    let sa = unsafe { ai[3] as *const u8 };
+    // sockaddr_in has the address at byte 4, and sockaddr_in6 at byte 8.
+    let mut start = -1;
+    let mut len = 0;
+    if family == AF_INET {
+      start = 4;
+      len = 4;
+    }
+    if family == AF_INET6 {
+      start = 8;
+      len = 16;
+    }
+    if start >= 0 {
+      let mut a = Vec<u8>::new();
+      let mut i = 0;
+      while i < len {
+        a.push(unsafe { sa[start + i] });
+        i = i + 1;
+      }
+      out.push(a);
+    }
+    node = unsafe { ai[5] };
+  }
+  unsafe { freeaddrinfo(res.get(0) as *mut u64); }
+  return Result<Vec<Vec<u8>>, i32>::Ok(out);
 }

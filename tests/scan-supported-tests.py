@@ -25,6 +25,7 @@ show-error verbose version help globoff path-as-is trace-time progress-bar no-pr
 buffer raw compressed proxy proxy-user noproxy output-dir digest basic anyauth proxy-digest
 proxy-basic proxy-anyauth form form-string form-escape cookie-jar junk-session-cookies cacert capath
 http2 http2-prior-knowledge tcp-nodelay keepalive keepalive-time keepalive-cnt proxytunnel
+socks4 socks4a socks5 socks5-hostname
 """.split())
 SUPPORTED_SHORT = set("AbcdDeFHjmorTuwXxU0fGiIkLOqsSvVhg#Np")
 # The short options that take a value: the rest of the word is that value.

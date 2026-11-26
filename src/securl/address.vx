@@ -4,6 +4,7 @@
 // checks against the addresses in the certificate, or a name.
 import core::option;
 import std::vec;
+import sys::text;
 import securl::bytes;
 
 /// The 4 bytes of the IPv4 address `text`, or None. As `inet_pton`, it takes only four decimal
@@ -225,4 +226,42 @@ fn push_hex_group(out : &mut Vec<u8>, w : i32) -> void {
 /// in brackets, which the URL parser allows only for an IPv6 address.
 pub fn host_is_address(host : &Vec<u8>, in_brackets : bool) -> bool {
   return in_brackets || parse_ipv4(host).is_some();
+}
+
+/// Whether `host` is `localhost`, or a name in it such as `app.localhost`, with or without a
+/// dot at the end. curl gives such a name the addresses ::1 and 127.0.0.1 and asks no resolver
+/// (RFC 6761).
+pub fn is_localhost_name(host : &Vec<u8>) -> bool {
+  let mut name = clone_bytes(host);
+  if name.len() > 0 && name.get(name.len() - 1) == 46u8 {
+    name = range_of(host, 0, host.len() - 1);
+  }
+  if eq_lit_nocase(&name, "localhost") {
+    return true;
+  }
+  let suffix = lit(".localhost");
+  if name.len() < suffix.len() {
+    return false;
+  }
+  return eq_nocase(&rest_from(&name, name.len() - suffix.len()), &suffix);
+}
+
+/// The addresses that curl gives a `localhost` name: ::1 first, then 127.0.0.1.
+pub fn localhost_addresses() -> Vec<Vec<u8>> {
+  let mut out = Vec<Vec<u8>>::new();
+  let mut v6 = Vec<u8>::new();
+  let mut i = 0;
+  while i < 15 {
+    v6.push(0u8);
+    i = i + 1;
+  }
+  v6.push(1u8);
+  out.push(v6);
+  let mut v4 = Vec<u8>::new();
+  v4.push(127u8);
+  v4.push(0u8);
+  v4.push(0u8);
+  v4.push(1u8);
+  out.push(v4);
+  return out;
 }

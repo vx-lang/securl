@@ -25,7 +25,7 @@ while [ ! -s "$work/ports" ] && [ $tries -lt 50 ]; do
   sleep 0.1
   tries=$((tries + 1))
 done
-read -r https http proxy mute < "$work/ports"
+read -r https http proxy mute socks < "$work/ports"
 
 fail=0
 # check NAME EXPECTED_EXIT EXPECTED_STDOUT CURL_ARGUMENTS...
@@ -206,6 +206,57 @@ curl_env="https_proxy=$p"
 check "-v names the variable" 0 "hello over tls" -sS -v --cacert "$certs/ca.pem" \
   "https://localhost:$https/"
 stderr_has "  with curl's message" "Uses proxy env variable https_proxy == '$p'"
+curl_env=
+
+# logged NAME TEXT: the log of the proxies has TEXT.
+logged() {
+  if grep -qF -- "$2" "$work/proxy.log"; then
+    echo "ok   $1"
+  else
+    echo "FAIL $1: no '$2' in the log of the proxies:"
+    sed 's/^/     /' "$work/proxy.log" | tail -5
+    fail=1
+  fi
+}
+
+# SOCKS proxies. SOCKS4 and SOCKS5 get the address of the server, which curl looks up; SOCKS4a
+# and SOCKS5h get its name. The proxy of servers.py logs what it got.
+s=127.0.0.1:$socks
+check "SOCKS4 looks up the name" 0 "hello over tls" -sS -x "socks4://$s" "http://localhost:$http/"
+logged "  and sends the address" "SOCKS4 127.0.0.1:$http user="
+check "SOCKS4a sends the name" 0 "hello over tls" -sS --socks4a "$s" "http://localhost:$http/"
+logged "  to the proxy" "SOCKS4a localhost:$http user="
+check "SOCKS5 with --resolve" 0 "hello over tls" -sS --socks5 "$s" \
+  --resolve "name.test:$http:127.0.0.1" "http://name.test:$http/"
+logged "  sends that address" "SOCKS5 atyp=1 127.0.0.1:$http user="
+# The proxy cannot reach ::1, where nothing listens, and says so with code 5.
+check "SOCKS5 takes the IPv6 address of a name first" 97 "" -sS -x "socks5://$s" \
+  "http://localhost:$http/"
+logged "  and sends it" "SOCKS5 atyp=4 ::1:$http user="
+stderr_has "  with curl's message" "cannot complete SOCKS5 connection to localhost. (5)"
+check "SOCKS5h sends the name" 0 "hello over tls" -sS -x "socks5h://$s" "http://localhost:$http/"
+logged "  to the proxy" "SOCKS5 atyp=3 localhost:$http user="
+check "  and so does --socks5-hostname" 0 "hello over tls" -sS --socks5-hostname "$s" \
+  "http://localhost:$http/"
+check "HTTPS through SOCKS5h" 0 "hello over tls" -sS --cacert "$certs/ca.pem" \
+  -x "socks5h://$s" "https://localhost:$https/"
+check "a SOCKS5 user and password" 0 "hello over tls" -sS -x "socks5h://user:secret@$s" \
+  "http://localhost:$http/"
+logged "  reach the proxy" "SOCKS5 atyp=3 localhost:$http user=user"
+check "  and -U too" 0 "hello over tls" -sS -x "socks5h://$s" -U user:secret \
+  "http://localhost:$http/"
+check "a SOCKS5 password that the proxy refuses" 97 "" -sS -x "socks5h://user:wrong@$s" \
+  "http://localhost:$http/"
+stderr_has "  with curl's message" "User was rejected by the SOCKS5 server (1 1)."
+check "a SOCKS4 proxy that refuses" 97 "" -sS --socks4 "$s" "http://127.0.0.1:1/"
+stderr_has "  with curl's message" \
+  "[SOCKS] cannot complete SOCKS4 connection to 127.0.0.1:1. (91), request rejected or failed."
+check "a SOCKS5 proxy that refuses" 97 "" -sS --socks5 "$s" "http://127.0.0.1:1/"
+stderr_has "  with curl's message" "cannot complete SOCKS5 connection to 127.0.0.1. (2)"
+check "a SOCKS proxy that does not listen" 7 "" -sS --socks5 127.0.0.1:1 "http://127.0.0.1:$http/"
+check "a blank --socks5" 2 "" -sS --socks5 '' "http://127.0.0.1:$http/"
+curl_env="all_proxy=socks5h://$s"
+check "all_proxy with a SOCKS URL" 0 "hello over tls" -sS "http://localhost:$http/"
 curl_env=
 
 # The TCP options of libcurl, in its order: TCP_NODELAY, then keepalive after 60 seconds, every

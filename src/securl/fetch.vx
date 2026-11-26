@@ -9,6 +9,7 @@ import std::net;
 import std::sync::wait;
 import std::time;
 import std::vec;
+import sys::socket;
 import sys::text;
 import sys::tls;
 import securl::address;
@@ -21,6 +22,7 @@ import securl::h2;
 import securl::http;
 import securl::options;
 import securl::output;
+import securl::socks;
 import securl::url;
 
 /// What `-w` can print about a transfer.
@@ -182,6 +184,19 @@ fn port_matches(field : &Vec<u8>, port : i32) -> bool {
 /// The address to connect to for `u`, after `--connect-to` and `--resolve`. A rule with a
 /// port that is not a number is an error, as in curl.
 fn connect_address(cfg : &Config, u : &Url) -> Result<Vec<u8>, Failure> {
+  let target = connect_target(cfg, u)?;
+  let host = resolve_rule(cfg, &target.host, target.port)?;
+  return Result<Vec<u8>, Failure>::Ok(address_of(&host, target.port));
+}
+
+/// A host and a port to connect to.
+struct Target {
+  host : Vec<u8>,
+  port : i32,
+}
+
+/// The host and port of `u`, or the ones that `--connect-to` gives for them.
+fn connect_target(cfg : &Config, u : &Url) -> Result<Target, Failure> {
   let mut host = clone_bytes(&u.host);
   let mut port = u.port;
   // `--connect-to HOST1:PORT1:HOST2:PORT2`. An empty field matches any host or port, or keeps
@@ -206,7 +221,7 @@ fn connect_address(cfg : &Config, u : &Url) -> Result<Vec<u8>, Failure> {
               let mut m = lit("No valid port number in '");
               append(&mut m, rule);
               push_lit(&mut m, "'");
-              return Result<Vec<u8>, Failure>::Err(fail_with(SETOPT_OPTION_SYNTAX, m));
+              return Result<Target, Failure>::Err(fail_with(SETOPT_OPTION_SYNTAX, m));
             }
           }
         }
@@ -214,7 +229,16 @@ fn connect_address(cfg : &Config, u : &Url) -> Result<Vec<u8>, Failure> {
       }
     }
   }
-  // `--resolve HOST:PORT:ADDRESS[,ADDRESS]` gives the address of a host name.
+  return Result<Target, Failure>::Ok(Target {
+    host : host,
+    port : port
+  });
+}
+
+/// The address that `--resolve HOST:PORT:ADDRESS[,ADDRESS]` gives for `name` and `port`, or
+/// `name` itself.
+fn resolve_rule(cfg : &Config, name : &Vec<u8>, port : i32) -> Result<Vec<u8>, Failure> {
+  let mut host = clone_bytes(name);
   for rule in cfg.resolve.iter() {
     let mut text = clone_bytes(rule);
     if text.len() > 0 && (text.get(0) == 43u8 || text.get(0) == 45u8) {
@@ -243,7 +267,56 @@ fn connect_address(cfg : &Config, u : &Url) -> Result<Vec<u8>, Failure> {
       break;
     }
   }
-  return Result<Vec<u8>, Failure>::Ok(address_of(&host, port));
+  return Result<Vec<u8>, Failure>::Ok(host);
+}
+
+/// What the SOCKS proxy `proxy` needs to connect to the server of `u`. SOCKS4 and SOCKS5 send
+/// the address of the server, so this looks it up: with `--resolve`, or as an address, or else
+/// with the network right.
+fn socks_request(network : &Network, cfg : &Config, u : &Url, proxy : &Proxy)
+-> Result<SocksRequest, Failure> {
+  let target = connect_target(cfg, u)?;
+  let mut addresses = Vec<Vec<u8>>::new();
+  let mut lookup_failed = false;
+  if socks_resolves_locally(proxy.kind) {
+    let name = resolve_rule(cfg, &target.host, target.port)?;
+    match parse_ipv4(&name) {
+      Option<Vec<u8>>::Some(a) => {
+        addresses.push(a);
+      },
+      Option<Vec<u8>>::None() => {
+        match parse_ipv6(&name) {
+          Option<Vec<u8>>::Some(a) => {
+            addresses.push(a);
+          },
+          Option<Vec<u8>>::None() => {
+            if is_localhost_name(&name) {
+              addresses = localhost_addresses();
+            } else {
+              match lookup_host(network, &name) {
+                Result<Vec<Vec<u8>>, i32>::Ok(found) => {
+                  addresses = found;
+                },
+                Result<Vec<Vec<u8>>, i32>::Err(_code) => {
+                  lookup_failed = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return Result<SocksRequest, Failure>::Ok(SocksRequest {
+    kind : proxy.kind,
+    host : target.host,
+    port : target.port,
+    addresses : addresses,
+    lookup_failed : lookup_failed,
+    has_credentials : proxy.has_credentials,
+    user : clone_bytes(&proxy.user),
+    password : clone_bytes(&proxy.password)
+  });
 }
 
 // The limits of libcurl for response headers: one header line, all headers of one response,
@@ -487,7 +560,7 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
     &creds.password, has_custom(headers, "Authorization"), &method, &u.path, &origin_of(u));
   // The credentials of an HTTP proxy go with each request that goes through it. The CONNECT of
   // a tunnel sends its own.
-  let via_proxy = proxy.used && !secure && !cfg.proxytunnel;
+  let via_proxy = proxy.used && proxy.kind == PROXY_HTTP && !secure && !cfg.proxytunnel;
   let proxy_allowed = via_proxy && proxy.has_credentials;
   let proxy_header = output_auth(&mut auth.proxy, &mut auth.proxy_digest, proxy_allowed,
     &proxy.user, &proxy.password, has_custom(headers, "Proxy-Authorization"), &method, &u.path,
@@ -876,8 +949,13 @@ address : &Vec<u8>, secure : bool, deadline : Instant, info : &mut TransferInfo)
     push_u64(&mut m, u.port as u64);
     verbose_info(&m);
   }
-  // HTTPS through a proxy goes through a CONNECT tunnel, and so does HTTP with `-p`.
-  if proxy.used && (secure || cfg.proxytunnel) {
+  // A SOCKS proxy connects to the server. HTTPS through an HTTP proxy goes through a CONNECT
+  // tunnel, and so does HTTP with `-p`.
+  if proxy.used && is_socks(proxy.kind) {
+    let request = socks_request(network, cfg, u, proxy)?;
+    let _socks = socks_connect(&mut c, &request)?;
+  }
+  if proxy.used && !is_socks(proxy.kind) && (secure || cfg.proxytunnel) {
     open_tunnel(&mut c, cfg, u, proxy, info)?;
   }
   if secure {
@@ -953,6 +1031,8 @@ fn http_error(status : i32) -> Failure {
 /// The HTTP proxy of a request, from `-x`.
 struct Proxy {
   used : bool,
+  // PROXY_HTTP, or a kind of SOCKS proxy (securl::socks).
+  kind : i32,
   // The proxy as a URL: its host and port are where curl connects.
   url : Url,
   has_credentials : bool,
@@ -1022,6 +1102,7 @@ fn proxy_env_value(cfg : &Config, a : *const i8, b : *const i8) -> Vec<u8> {
 fn proxy_for(cfg : &Config, u : &Url) -> Result<Proxy, Failure> {
   let none = Proxy {
     used : false,
+    kind : PROXY_HTTP,
     url : clone_url(u),
     has_credentials : false,
     user : Vec<u8>::new(),
@@ -1049,15 +1130,23 @@ fn proxy_for(cfg : &Config, u : &Url) -> Result<Proxy, Failure> {
     return Result<Proxy, Failure>::Ok(none);
   }
   let mut text = clone_bytes(&given);
+  // The kind of proxy comes from the scheme of its URL, or else from `--socks5` and the other
+  // options that name a SOCKS proxy. A proxy from the environment is HTTP by default.
+  let mut kind = PROXY_HTTP;
+  if cfg.proxy_set {
+    kind = cfg.proxy_kind;
+  }
   let sep = find_seq(&text, &lit("://"), 0);
   if sep >= 0 {
-    let scheme = to_lower(&range_of(&text, 0, sep));
-    if !eq_lit(&scheme, "http") {
+    kind = proxy_kind_of_scheme(&range_of(&text, 0, sep));
+    if kind < 0 {
       let mut m = lit("Unsupported proxy scheme for '");
       append(&mut m, &given);
       push_lit(&mut m, "'");
       return Result<Proxy, Failure>::Err(fail_with(COULDNT_CONNECT, m));
     }
+    // The URL parser takes only http and https.
+    text = lit_then("http", &rest_from(&text, sep));
   } else {
     text = lit_then("http://", &text);
   }
@@ -1081,6 +1170,7 @@ fn proxy_for(cfg : &Config, u : &Url) -> Result<Proxy, Failure> {
   }
   return Result<Proxy, Failure>::Ok(Proxy {
     used : true,
+    kind : kind,
     url : url,
     has_credentials : has_credentials,
     user : user,

@@ -60,9 +60,9 @@ Vx main 860f9f31a.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 376 of 720 (52%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 353 of 429 (82%) |
-| TLS, proxy, socket-option and limit tests against local servers (`tests/tls`) | 59 of 59 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 394 of 720 (54%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 356 of 432 (82%) |
+| TLS, proxy, socket-option and limit tests against local servers (`tests/tls`) | 84 of 84 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 7 of 7 |
 
@@ -87,12 +87,12 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 8,821 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 649 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 9,361 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 689 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` to `cli`) | 11 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
-| `src/sys/` (OpenSSL calls, socket options and time limits, shims for what `std` lacks) | 963 | 38 `extern` functions, 58 `unsafe` blocks |
+| `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,034 | 40 `extern` functions, 65 `unsafe` blocks |
 
-Of the trusted code in `src/sys/`, 80 of the 96 items are the OpenSSL bindings: TLS (with the
+Of the trusted code in `src/sys/`, 80 of the 105 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
 `hash.vx`.
 Two safe functions of `sys` read through a raw pointer with no check, `lit` and `push_lit`,
@@ -228,7 +228,7 @@ missing options that block the most tests.
 `name;` forms) `-I` `-i` `-k` `--cacert` `--capath` `-L` `--location-trusted` `--max-redirs`
 `-o` `-O` `--remote-name-all` `--output-dir` `-r` `-s` `-S` `-T` `-u` `--digest` `--basic`
 `--anyauth` `-v` `-w` (most variables, `%header{}`, `%{header_json}`, `%output{}`, `%{stderr}`)
-`-X` `-x` `-U` `-p` `--proxytunnel`
+`-X` `-x` `-U` `-p` `--proxytunnel` `--socks4` `--socks4a` `--socks5` `--socks5-hostname`
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
 `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
 `--connect-timeout` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay` `-h`
@@ -246,6 +246,14 @@ does, securl does not read `HTTP_PROXY` in upper case, which a CGI program gets 
 `Proxy:` header of any request. `--noproxy`, or else `no_proxy` or `NO_PROXY`, lists the hosts
 that go direct, and `-x ""` turns the variables off. `-v` says which variable it used.
 
+A proxy URL with the scheme `socks4`, `socks4a`, `socks5` or `socks5h`, or the options
+`--socks4`, `--socks4a`, `--socks5` and `--socks5-hostname`, name a SOCKS proxy.
+`src/securl/socks.vx` speaks the protocols as libcurl does, with its messages and exit code 97,
+and the user name and password of RFC 1929 for SOCKS5. SOCKS4a and SOCKS5h send the host name to
+the proxy. SOCKS4 and SOCKS5 send its address, so securl looks the name up: with `--resolve`, or
+as libcurl does for `localhost` (::1 first, then 127.0.0.1), or else with `getaddrinfo` in
+`src/sys/socket.vx`, which takes the network right. `std` has no lookup of its own yet.
+
 The 2025 curl user survey asked for each user's favourite option. securl accepts 19 of the top
 20 answers. It does not have `--libcurl`. `-vv` and `-vvv` work as `-v`, and `-w` has no
 time variables yet.
@@ -258,7 +266,8 @@ In order of how much users need them:
    `Upgrade: h2c` of `--http2` on plain HTTP, and HTTP/2 through an HTTP proxy.
 1. URL globbing (`{a,b}` and `[1-9]`), `--next`, `-J`, `-C` resume, `-K` config files,
    `--netrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
-   encoders, SOCKS proxies, HTTPS proxies, and Digest with the proxy of a CONNECT tunnel.
+   encoders, `--preproxy`, SOCKS5 with GSS-API, HTTPS proxies, and Digest with the proxy of a
+   CONNECT tunnel.
 1. HTTP/3.
 
 ## Vx issues found while writing securl

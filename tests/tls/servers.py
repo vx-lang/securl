@@ -3,14 +3,18 @@
 
     python3 tests/tls/servers.py CERT_DIR PORT_FILE PROXY_LOG
 
-It starts four servers on free ports of 127.0.0.1 and writes their ports to PORT_FILE as
-"https http proxy mute":
+It starts five servers on free ports of 127.0.0.1 and writes their ports to PORT_FILE as
+"https http proxy mute socks":
 
 - an HTTPS server with the certificate in CERT_DIR. `/` answers "hello over tls", and `/big`
   answers 1 MiB in chunks, so that TLS reads have to wait for more data.
 - a plain HTTP server whose `/to-https` redirects to the HTTPS server.
 - an HTTP proxy that only does CONNECT. It writes the first line of each request to PROXY_LOG.
 - a server that accepts connections and never sends a byte, for the time limits of TLS.
+- a SOCKS4, SOCKS4a, SOCKS5 and SOCKS5h proxy. It writes what each client asked for to
+  PROXY_LOG, such as "SOCKS5 atyp=3 localhost:443 user=". For SOCKS5 it asks for a user name
+  and a password when the client offers them, and takes only "user" and "secret". It refuses
+  port 1 with the error code of the protocol.
 
 On both HTTP servers, `/stall` sends 10 of the 100 bytes of its body and then waits, for the
 time limits of reads, and `/huge-chunk` sends a chunk size too large for 64 bits. The paths of
@@ -170,6 +174,112 @@ class ProxyHandler(socketserver.BaseRequestHandler):
         t.join()
 
 
+def recv_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        more = sock.recv(n - len(data))
+        if not more:
+            raise ConnectionError("closed")
+        data += more
+    return data
+
+
+def recv_until_nul(sock):
+    data = b""
+    while True:
+        b = recv_exact(sock, 1)
+        if b == b"\0":
+            return data
+        data += b
+
+
+class SocksHandler(socketserver.BaseRequestHandler):
+    def log(self, text):
+        with open(PROXY_LOG, "a") as log:
+            log.write(text + "\n")
+
+    def handle(self):
+        try:
+            version = recv_exact(self.request, 1)[0]
+            if version == 4:
+                self.socks4()
+            elif version == 5:
+                self.socks5()
+        except (ConnectionError, OSError):
+            pass
+
+    def connect_and_pipe(self, host, port):
+        upstream = socket.create_connection((host, port), timeout=5)
+        upstream.settimeout(None)
+        t = threading.Thread(target=pipe, args=(upstream, self.request), daemon=True)
+        t.start()
+        pipe(self.request, upstream)
+        t.join()
+
+    def socks4(self):
+        command, port = struct.unpack("!BH", recv_exact(self.request, 3))
+        ip = recv_exact(self.request, 4)
+        user = recv_until_nul(self.request).decode()
+        if ip[:3] == b"\0\0\0" and ip[3] != 0:
+            host = recv_until_nul(self.request).decode()
+            self.log(f"SOCKS4a {host}:{port} user={user}")
+        else:
+            host = socket.inet_ntoa(ip)
+            self.log(f"SOCKS4 {host}:{port} user={user}")
+        reply = struct.pack("!BBH", 0, 91 if port == 1 else 90, port) + ip
+        if port == 1:
+            self.request.sendall(reply)
+            return
+        try:
+            upstream_ok = socket.create_connection((host, port), timeout=5)
+            upstream_ok.close()
+        except OSError:
+            self.request.sendall(struct.pack("!BBH", 0, 91, port) + ip)
+            return
+        self.request.sendall(reply)
+        self.connect_and_pipe(host, port)
+
+    def socks5(self):
+        count = recv_exact(self.request, 1)[0]
+        methods = recv_exact(self.request, count)
+        user = ""
+        if 2 in methods:
+            self.request.sendall(b"\x05\x02")
+            recv_exact(self.request, 1)
+            user = recv_exact(self.request, recv_exact(self.request, 1)[0]).decode()
+            password = recv_exact(self.request, recv_exact(self.request, 1)[0]).decode()
+            if (user, password) != ("user", "secret"):
+                self.log(f"SOCKS5 rejected user={user}")
+                self.request.sendall(b"\x01\x01")
+                return
+            self.request.sendall(b"\x01\x00")
+        else:
+            self.request.sendall(b"\x05\x00")
+        _ver, _cmd, _rsv, atyp = recv_exact(self.request, 4)
+        if atyp == 1:
+            host = socket.inet_ntoa(recv_exact(self.request, 4))
+        elif atyp == 4:
+            host = socket.inet_ntop(socket.AF_INET6, recv_exact(self.request, 16))
+        else:
+            host = recv_exact(self.request, recv_exact(self.request, 1)[0]).decode()
+        port = struct.unpack("!H", recv_exact(self.request, 2))[0]
+        self.log(f"SOCKS5 atyp={atyp} {host}:{port} user={user}")
+        bound = b"\x01\x7f\x00\x00\x01\x00\x00"
+        if port == 1:
+            # 2: connection not allowed by ruleset.
+            self.request.sendall(b"\x05\x02\x00" + bound)
+            return
+        try:
+            upstream_ok = socket.create_connection((host, port), timeout=5)
+            upstream_ok.close()
+        except OSError:
+            # 5: connection refused.
+            self.request.sendall(b"\x05\x05\x00" + bound)
+            return
+        self.request.sendall(b"\x05\x00\x00" + bound)
+        self.connect_and_pipe(host, port)
+
+
 class Proxy(socketserver.ThreadingTCPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -190,11 +300,12 @@ def main():
     plain.https_port = https.server_address[1]
     proxy = Proxy(("127.0.0.1", 0), ProxyHandler)
     mute = Proxy(("127.0.0.1", 0), MuteHandler)
-    for server in (https, plain, proxy, mute):
+    socks = Proxy(("127.0.0.1", 0), SocksHandler)
+    for server in (https, plain, proxy, mute, socks):
         threading.Thread(target=server.serve_forever, daemon=True).start()
     with open(PORT_FILE + ".tmp", "w") as f:
         f.write(f"{https.server_address[1]} {plain.server_address[1]} {proxy.server_address[1]} "
-                f"{mute.server_address[1]}\n")
+                f"{mute.server_address[1]} {socks.server_address[1]}\n")
     os.replace(PORT_FILE + ".tmp", PORT_FILE)
     threading.Event().wait()
 
