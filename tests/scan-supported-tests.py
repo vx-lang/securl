@@ -26,7 +26,7 @@ buffer raw compressed proxy proxy-user noproxy output-dir digest basic anyauth p
 proxy-basic proxy-anyauth form form-string form-escape cookie-jar junk-session-cookies cacert capath
 http2 http2-prior-knowledge tcp-nodelay keepalive keepalive-time keepalive-cnt proxytunnel
 socks4 socks4a socks5 socks5-hostname cert cert-type key key-type pass compressed tr-encoding hsts
-suppress-connect-headers proxy-insecure proxy-cacert proxy-capath
+suppress-connect-headers proxy-insecure proxy-cacert proxy-capath remove-on-error limit-rate
 """.split())
 SUPPORTED_SHORT = set("AbcdDeFHjmorTuwXxU0fGiIkLOqsSvVhg#NpE")
 # The short options that take a value: the rest of the word is that value.

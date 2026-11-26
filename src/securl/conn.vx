@@ -2,6 +2,7 @@
 // connection is plain TCP, or TLS after `start_tls`.
 import core::option;
 import core::result;
+import core::time;
 import std::net;
 import std::string;
 import std::sync::wait;
@@ -24,6 +25,51 @@ struct Conn {
   end : i32,
   // The peer closed the connection.
   closed : bool,
+  // Each wait gives up at this time.
+  deadline : Instant,
+  // `--limit-rate`, for the bytes that arrive and for those that go.
+  recv_limit : RateLimit,
+  send_limit : RateLimit,
+}
+
+/// A limit of bytes per second for one direction of a connection.
+struct RateLimit {
+  // Bytes per second, or 0 for no limit.
+  rate : i64,
+  // When the limit started, and how many bytes went since.
+  started : Instant,
+  count : i64,
+}
+
+fn no_limit() -> RateLimit {
+  return RateLimit {
+    rate : 0i64,
+    started : Instant::now(),
+    count : 0i64
+  };
+}
+
+/// Count `n` more bytes of `limit`, and wait until its rate allows them, but not past
+/// `deadline`. Over the whole transfer, the bytes then go no faster than the rate.
+fn pace(limit : &mut RateLimit, n : i64, deadline : Instant) -> void {
+  if limit.rate <= 0i64 {
+    return;
+  }
+  limit.count = limit.count + n;
+  let due_ms = limit.count / limit.rate * 1000i64 + (limit.count % limit.rate) * 1000i64 / limit.rate;
+  match limit.started.checked_add(&Duration::from_millis(due_ms as u64)) {
+    Option<Instant>::Some(due) => {
+      let mut until = due;
+      if deadline < until {
+        until = deadline;
+      }
+      if Instant::now() < until {
+        let _slept = sleep_until(until);
+      }
+      return;
+    },
+    Option<Instant>::None() => {}
+  }
 }
 
 /// The options that curl sets on each socket, in the order that libcurl sets them.
@@ -93,7 +139,10 @@ deadline : Instant, options : &SocketOptions) -> Result<Conn, Failure> {
         buffer : buffer,
         start : 0,
         end : 0,
-        closed : false
+        closed : false,
+        deadline : deadline,
+        recv_limit : no_limit(),
+        send_limit : no_limit()
       });
     },
     Result<TcpStream, NetError>::Err(e) => {
@@ -128,14 +177,64 @@ impl Conn {
 
   /// Make each wait of the connection from now on give up at `at`.
   pub fn set_deadline(self : &mut Conn, at : Instant) -> void {
+    self.deadline = at;
     self.stream.set_deadline(at);
   }
 
-  /// Send all of `bytes`.
+  /// Limit the bytes that arrive and those that go to `rate` bytes per second from now on, as
+  /// curl's `--limit-rate` does after the connect. A slow rate reads less at a time, as curl
+  /// does. The read buffer must be empty.
+  pub fn limit_rate(self : &mut Conn, rate : i64) -> void {
+    assert(self.start == self.end, "limit_rate with bytes in the read buffer");
+    self.recv_limit = RateLimit {
+      rate : rate,
+      started : Instant::now(),
+      count : 0i64
+    };
+    self.send_limit = RateLimit {
+      rate : rate,
+      started : Instant::now(),
+      count : 0i64
+    };
+    if rate < (self.buffer.len() as i64) {
+      let mut smaller = Vec<u8>::new();
+      let mut i = 0i64;
+      while i < rate || i == 0i64 {
+        smaller.push(0u8);
+        i = i + 1i64;
+      }
+      self.buffer = smaller;
+      self.start = 0;
+      self.end = 0;
+    }
+  }
+
+  /// Send all of `bytes`. Under `--limit-rate`, in pieces of at most one second's worth.
   pub fn send(self : &mut Conn, bytes : &Vec<u8>) -> Result<i32, Failure> {
     if bytes.len() == 0 {
       return Result<i32, Failure>::Ok(0);
     }
+    if self.send_limit.rate > 0i64 {
+      let mut piece = READ_BUFFER_SIZE as i64;
+      if self.send_limit.rate < piece {
+        piece = self.send_limit.rate;
+      }
+      let mut at = 0;
+      while at < bytes.len() {
+        let mut end = at + (piece as i32);
+        if end > bytes.len() {
+          end = bytes.len();
+        }
+        let _sent = self.send_all(&range_of(bytes, at, end))?;
+        pace(&mut self.send_limit, (end - at) as i64, self.deadline);
+        at = end;
+      }
+      return Result<i32, Failure>::Ok(0);
+    }
+    return self.send_all(bytes);
+  }
+
+  fn send_all(self : &mut Conn, bytes : &Vec<u8>) -> Result<i32, Failure> {
     match self.stream.write_all(bytes) {
       Result<u64, TlsError>::Ok(_n) => {
         return Result<i32, Failure>::Ok(0);
@@ -174,6 +273,7 @@ impl Conn {
         }
         self.start = 0;
         self.end = n as i32;
+        pace(&mut self.recv_limit, n as i64, self.deadline);
         return Result<bool, Failure>::Ok(true);
       },
       Result<u64, TlsError>::Err(e) => {

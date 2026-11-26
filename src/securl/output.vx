@@ -245,6 +245,38 @@ impl Output {
   }
 }
 
+/// `text` as curl's warnings and notes print it: each line starts with `prefix`, and text
+/// longer than the terminal is cut at its last blank, which stays at the end of the line, or
+/// at the width when it has none. `columns` is the width of the terminal.
+pub fn message_lines(prefix : *const i8, text : &Vec<u8>, columns : i32) -> Vec<u8> {
+  let pre = lit(prefix);
+  let mut width = 2147483647;
+  if columns > pre.len() {
+    width = columns - pre.len();
+  }
+  let mut out = Vec<u8>::new();
+  let mut at = 0;
+  while at < text.len() {
+    append(&mut out, &pre);
+    if text.len() - at > width {
+      let mut cut = width - 1;
+      while cut > 0 && !is_blank(text.get(at + cut)) {
+        cut = cut - 1;
+      }
+      if cut == 0 {
+        cut = width - 1;
+      }
+      append_range(&mut out, text, at, at + cut + 1);
+      at = at + cut + 1;
+    } else {
+      append_range(&mut out, text, at, text.len());
+      at = text.len();
+    }
+    out.push(10u8);
+  }
+  return out;
+}
+
 /// Write `bytes` to standard error. A closed standard error is not an error for curl.
 pub fn to_stderr(bytes : &Vec<u8>) -> void {
   let _ok = write_stderr(bytes);

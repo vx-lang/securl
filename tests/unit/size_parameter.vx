@@ -1,0 +1,105 @@
+// Checks how securl::options reads a size for --limit-rate, with the table of curl's unit test
+// tool1623 (GetSizeParameter). Made by tools/gen-size-test.py.
+import core::result;
+import std::vec;
+import sys::text;
+import securl::bytes;
+import securl::failure;
+import securl::options;
+
+fn args_of(value : *const i8) -> Vec<Vec<u8>> {
+  let mut v = Vec<Vec<u8>>::new();
+  v.push(lit("--limit-rate"));
+  v.push(lit(value));
+  v.push(lit("http://h/"));
+  return v;
+}
+
+/// Whether `--limit-rate value` gives `want` bytes per second.
+fn reads_as(value : *const i8, want : i64) -> bool {
+  match parse_args(&args_of(value)) {
+    Result<Config, Failure>::Ok(c) => {
+      return c.limit_rate == want;
+    },
+    Result<Config, Failure>::Err(_f) => {
+      return false;
+    }
+  }
+}
+
+/// Whether `--limit-rate value` fails with exit code 2 and `message`.
+fn refused(value : *const i8, message : *const i8) -> bool {
+  match parse_args(&args_of(value)) {
+    Result<Config, Failure>::Ok(_c) => {
+      return false;
+    },
+    Result<Config, Failure>::Err(f) => {
+      let mut want = lit("option --limit-rate: ");
+      push_lit(&mut want, message);
+      return f.code == FAILED_INIT && same_bytes(&f.message, &want);
+    }
+  }
+}
+
+fn main() -> i32 {
+  assert(reads_as("0", 0i64), "0");
+  assert(reads_as("00", 0i64), "00");
+  assert(reads_as("000", 0i64), "000");
+  assert(reads_as("1", 1i64), "1");
+  assert(reads_as("1b", 1i64), "1b");
+  assert(reads_as("99B", 99i64), "99B");
+  assert(reads_as("2", 2i64), "2");
+  assert(reads_as("3", 3i64), "3");
+  assert(reads_as("4", 4i64), "4");
+  assert(reads_as("5", 5i64), "5");
+  assert(reads_as("6", 6i64), "6");
+  assert(reads_as("7", 7i64), "7");
+  assert(reads_as("77", 77i64), "77");
+  assert(reads_as("8", 8i64), "8");
+  assert(reads_as("9", 9i64), "9");
+  assert(reads_as("10", 10i64), "10");
+  assert(reads_as("010", 10i64), "010");
+  assert(reads_as("000000000000000000000000000000000010", 10i64), "000000000000000000000000000000000010");
+  assert(reads_as("1k", 1024i64), "1k");
+  assert(reads_as("2K", 2048i64), "2K");
+  assert(reads_as("3k", 3072i64), "3k");
+  assert(reads_as("4K", 4096i64), "4K");
+  assert(reads_as("5k", 5120i64), "5k");
+  assert(reads_as("6K", 6144i64), "6K");
+  assert(reads_as("7k", 7168i64), "7k");
+  assert(reads_as("8K", 8192i64), "8K");
+  assert(reads_as("9k", 9216i64), "9k");
+  assert(reads_as("10K", 10240i64), "10K");
+  assert(reads_as("20M", 20971520i64), "20M");
+  assert(reads_as("30G", 32212254720i64), "30G");
+  assert(reads_as("40T", 43980465111040i64), "40T");
+  assert(reads_as("50P", 56294995342131200i64), "50P");
+  assert(reads_as("1.1k", 1126i64), "1.1k");
+  assert(reads_as("1.01k", 1034i64), "1.01k");
+  assert(reads_as("1.001k", 1025i64), "1.001k");
+  assert(reads_as("1.0001k", 1024i64), "1.0001k");
+  assert(reads_as("22.1m", 23173529i64), "22.1m");
+  assert(reads_as("22.01m", 23079157i64), "22.01m");
+  assert(reads_as("22.001m", 23069720i64), "22.001m");
+  assert(reads_as("22.0001m", 23068776i64), "22.0001m");
+  assert(reads_as("22.00001m", 23068682i64), "22.00001m");
+  assert(reads_as("22.000001m", 23068673i64), "22.000001m");
+  assert(reads_as("22.0000001m", 23068672i64), "22.0000001m");
+  assert(reads_as("22.000000001m", 23068672i64), "22.000000001m");
+  assert(refused("3.4", "is badly used here"), "3.4");
+  assert(refused("3.14b", "is badly used here"), "3.14b");
+  assert(reads_as("5000.9P", 5630512844129278361i64), "5000.9P");
+  assert(reads_as("5000.99P", 5630614175120894197i64), "5000.99P");
+  assert(reads_as("5000.999P", 5630624308220055781i64), "5000.999P");
+  assert(reads_as("5000.9999P", 5630625321529969316i64), "5000.9999P");
+  assert(reads_as("8191P", 9222246136947933184i64), "8191P");
+  assert(reads_as("8191.9999999P", 9223372036735343194i64), "8191.9999999P");
+  assert(refused("8192P", "too large number"), "8192P");
+  assert(reads_as("9223372036854775807", 9223372036854775807i64), "9223372036854775807");
+  assert(refused("9223372036854775808", "too large number"), "9223372036854775808");
+  assert(refused("a", "expected a proper numerical parameter"), "a");
+  assert(refused("-2", "expected a proper numerical parameter"), "-2");
+  assert(refused("+2", "expected a proper numerical parameter"), "+2");
+  assert(refused("2,2k", "is badly used here"), "2,2k");
+  return 0;
+}

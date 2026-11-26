@@ -60,11 +60,11 @@ Vx main 860f9f31a.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 434 of 750 (57%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 388 of 457 (84%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 154 of 154 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 437 of 750 (58%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 390 of 459 (84%) |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 168 of 168 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
-| Unit tests (`tests/unit`) | 9 of 9 |
+| Unit tests (`tests/unit`) | 10 of 10 |
 
 `CURL=/path/to/curl tests/tls/run.sh` runs the checks of `tests/tls` against another curl, and
 `tests/h2/run.sh` takes `CURL` too. curl 8.23.1-DEV, built from the same curl commit, passes all
@@ -88,12 +88,12 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 11,277 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 806 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 11,558 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 888 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` to `cli`) | 11 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
-| `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,501 | 52 `extern` functions, 105 `unsafe` blocks |
+| `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,576 | 54 `extern` functions, 108 `unsafe` blocks |
 
-Of the trusted code in `src/sys/`, 132 of the 157 items are the OpenSSL bindings: TLS (with the
+Of the trusted code in `src/sys/`, 132 of the 162 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
 `hash.vx`.
 Two safe functions of `sys` read through a raw pointer with no check, `lit` and `push_lit`,
@@ -274,7 +274,8 @@ missing options that block the most tests.
 `--proxy-cacert` `--proxy-capath` `--socks4` `--socks4a` `--socks5` `--socks5-hostname` `--hsts`
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
 `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
-`--connect-timeout` `--compressed` `--tr-encoding` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay` `-h`
+`--connect-timeout` `--compressed` `--tr-encoding` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay`
+`--limit-rate` `--remove-on-error` `-h`
 `-V`, and the options that runtests.pl adds: `-q` `--trace-ascii` `--trace-time`.
 
 As libcurl does, each connection sets TCP_NODELAY and TCP keepalive: the first probe after 60
@@ -297,6 +298,19 @@ the proxy. SOCKS4 and SOCKS5 send its address, so securl looks the name up: with
 as libcurl does for `localhost` (::1 first, then 127.0.0.1), or else with `getaddrinfo` in
 `src/sys/socket.vx`, which takes the network right. `std` has no lookup of its own yet.
 
+`--limit-rate` takes curl's sizes, such as `500`, `2k` or `1.5M`, and holds each direction of
+the transfer to that many bytes per second after the connect, as curl does: a read waits until
+the rate allows the bytes so far, and a slow rate reads less at a time. `-m` still ends it.
+
+curl makes an `-o` file when the first byte of the body arrives. The transfer code of securl
+cannot open files, so the tool opens the file before the transfer. When a transfer fails before
+a byte arrives, the tool removes the empty file that it made, so a failed connect leaves no
+file, as in curl. An existing file is emptied, though, where curl leaves it alone; Vx #4132 asks
+for the right to open one file later, which the tool could give the transfer.
+`--remove-on-error` removes the file of a failed transfer, only when it is a regular file, with
+curl's note and warnings. `std::fs` cannot remove a file or tell a regular file yet, so
+`src/sys/files.vx` calls `unlink` and `statx`.
+
 The 2025 curl user survey asked for each user's favourite option. securl accepts 19 of the top
 20 answers. It does not have `--libcurl`. `-vv` and `-vvv` work as `-v`, and `-w` has no
 time variables yet.
@@ -306,7 +320,7 @@ time variables yet.
 In order of how much users need them:
 
 1. Connection reuse (and with it, HTTP/2 multiplexing), brotli and zstd for `--compressed`,
-   the
+   `--unix-socket`, the
    `Upgrade: h2c` of `--http2` on plain HTTP, and HTTP/2 through an HTTP proxy.
 1. URL globbing (`{a,b}` and `[1-9]`), `--next`, `-J`, `-C` resume, `-K` config files,
    `--netrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
@@ -340,6 +354,10 @@ The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #
   is not UTF-8, so securl cannot either.
 - [#4120](https://github.com/vx-lang/Vx/issues/4120) `std::net` has no name lookup, so
   `src/sys/socket.vx` calls `getaddrinfo` for SOCKS4 and SOCKS5.
+- [#4131](https://github.com/vx-lang/Vx/issues/4131) `std::net` has no Unix-domain socket, so
+  securl has no `--unix-socket` yet.
+- [#4132](https://github.com/vx-lang/Vx/issues/4132) `std::fs` cannot remove a file, tell its
+  kind, or give the right to open one file later.
 
 ## License
 

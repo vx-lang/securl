@@ -160,6 +160,12 @@ struct Config {
   has_hsts : bool,
   // `--suppress-connect-headers`: `-i` and `-D` leave out the reply of a CONNECT proxy.
   suppress_connect_headers : bool,
+  // `--remove-on-error`: remove the output file of a transfer that fails.
+  remove_on_error : bool,
+  // The width of the terminal for warnings, from `COLUMNS`, which the tool reads, or 79.
+  columns : i32,
+  // `--limit-rate`: bytes per second for each direction of a transfer, or 0.
+  limit_rate : i64,
   hsts : Vec<u8>,
   // The proxy variables of the environment that are set, such as `https_proxy`. The tool
   // reads them. This package gets their values, and not the right to read the environment.
@@ -257,6 +263,9 @@ pub fn default_config() -> Config {
     pass : Vec<u8>::new(),
     has_hsts : false,
     suppress_connect_headers : false,
+    remove_on_error : false,
+    columns : 79,
+    limit_rate : 0i64,
     hsts : Vec<u8>::new(),
     proxy_env : Vec<EnvVar>::new()
   };
@@ -352,6 +361,8 @@ const OPT_SUPPRESS_CONNECT_HEADERS : i32 = 87;
 const OPT_PROXY_INSECURE : i32 = 88;
 const OPT_PROXY_CACERT : i32 = 89;
 const OPT_PROXY_CAPATH : i32 = 90;
+const OPT_REMOVE_ON_ERROR : i32 = 91;
+const OPT_LIMIT_RATE : i32 = 92;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -449,6 +460,8 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "proxy-insecure") { return OPT_PROXY_INSECURE; }
   if eq_lit(name, "proxy-cacert") { return OPT_PROXY_CACERT; }
   if eq_lit(name, "proxy-capath") { return OPT_PROXY_CAPATH; }
+  if eq_lit(name, "remove-on-error") { return OPT_REMOVE_ON_ERROR; }
+  if eq_lit(name, "limit-rate") { return OPT_LIMIT_RATE; }
   return OPT_UNKNOWN;
 }
 
@@ -500,7 +513,7 @@ fn takes_value(id : i32) -> bool {
     || id == OPT_FORM || id == OPT_FORM_STRING || id == OPT_COOKIE_JAR
     || id == OPT_KEEPALIVE_TIME || id == OPT_KEEPALIVE_CNT
     || (id >= OPT_SOCKS4 && id <= OPT_PASS) || id == OPT_HSTS || id == OPT_PROXY_CACERT
-    || id == OPT_PROXY_CAPATH;
+    || id == OPT_PROXY_CAPATH || id == OPT_LIMIT_RATE;
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -573,6 +586,119 @@ fn unsigned_arg(value : &Vec<u8>, shown : &Vec<u8>) -> Result<i64, Failure> {
     return Result<i64, Failure>::Err(option_error(shown, "expected a positive numerical parameter"));
   }
   return Result<i64, Failure>::Ok(n);
+}
+
+const I64_MAX : i64 = 9223372036854775807i64;
+
+/// The decimal number at `at` of `s`, as curl's `curlx_str_number` reads it: digits only. Gives
+/// the index after it and puts the number in `out`, or -1 for no digits and -2 for a number
+/// above the largest 64-bit one.
+fn number_at(s : &Vec<u8>, at : i32, out : &mut i64) -> i32 {
+  let mut i = at;
+  let mut n = 0i64;
+  while i < s.len() && is_digit(s.get(i)) {
+    let d = (s.get(i) - 48u8) as i64;
+    if n > (I64_MAX - d) / 10i64 {
+      return -2;
+    }
+    n = n * 10i64 + d;
+    i = i + 1;
+  }
+  if i == at {
+    return -1;
+  }
+  *out = n;
+  return i;
+}
+
+/// The multiplier of a size unit letter (K, M, G, T or P, in any case), and how many digits
+/// it has, or 0.
+fn size_unit(b : u8, digits : &mut i32) -> i64 {
+  let u = ascii_lower(b);
+  if u == 107u8 {
+    *digits = 4;
+    return 1024i64;
+  }
+  if u == 109u8 {
+    *digits = 7;
+    return 1048576i64;
+  }
+  if u == 103u8 {
+    *digits = 10;
+    return 1073741824i64;
+  }
+  if u == 116u8 {
+    *digits = 13;
+    return 1099511627776i64;
+  }
+  if u == 112u8 {
+    *digits = 16;
+    return 1125899906842624i64;
+  }
+  return 0i64;
+}
+
+/// A size such as `100`, `2k` or `1.5M`, as curl's `GetSizeParameter` reads it for
+/// `--limit-rate`: a number of bytes, with a fraction only before a unit letter.
+fn size_arg(value : &Vec<u8>, shown : &Vec<u8>) -> Result<i64, Failure> {
+  let mut number = 0i64;
+  let mut at = number_at(value, 0, &mut number);
+  if at == -2 {
+    return Result<i64, Failure>::Err(option_error(shown, "too large number"));
+  }
+  if at < 0 {
+    return Result<i64, Failure>::Err(option_error(shown, "expected a proper numerical parameter"));
+  }
+  let mut prec = 0i64;
+  let mut plen = 0;
+  if at < value.len() && value.get(at) == 46u8 {
+    let after = number_at(value, at + 1, &mut prec);
+    if after < 0 {
+      return Result<i64, Failure>::Err(option_error(shown,
+        "expected a proper numerical parameter"));
+    }
+    plen = after - at - 1;
+    at = after;
+  }
+  let rest = value.len() - at;
+  if rest > 1 {
+    return Result<i64, Failure>::Err(option_error(shown, "is badly used here"));
+  }
+  let mut mul = 1i64;
+  let mut add = 0i64;
+  if rest == 0 || ascii_lower(value.get(at)) == 98u8 {
+    if plen > 0 {
+      // No part of a byte.
+      return Result<i64, Failure>::Err(option_error(shown, "is badly used here"));
+    }
+  } else {
+    let mut unit_digits = 0;
+    mul = size_unit(value.get(at), &mut unit_digits);
+    if mul == 0i64 {
+      return Result<i64, Failure>::Err(option_error(shown, "is badly used here"));
+    }
+    if prec > 0i64 {
+      // More digits of the fraction than the unit has are cut.
+      while unit_digits <= plen {
+        prec = prec / 10i64;
+        plen = plen - 1;
+      }
+      let mut frac = 1i64;
+      while plen > 0 {
+        frac = frac * 10i64;
+        plen = plen - 1;
+      }
+      if I64_MAX / mul > prec {
+        add = mul * prec / frac;
+      } else {
+        add = (mul / frac) * prec;
+      }
+    }
+  }
+  if number > (I64_MAX - add) / mul {
+    return Result<i64, Failure>::Err(option_error(shown, "too large number"));
+  }
+  return Result<i64, Failure>::Ok(number * mul + add);
 }
 
 /// The value of `--cert`, split into the file name and the password after it.
@@ -938,6 +1064,10 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     cfg.keepalive_time = unsigned_arg(value, shown)?;
     return done();
   }
+  if id == OPT_LIMIT_RATE {
+    cfg.limit_rate = size_arg(value, shown)?;
+    return done();
+  }
   if id == OPT_KEEPALIVE_CNT {
     cfg.keepalive_cnt = unsigned_arg(value, shown)?;
     return done();
@@ -1045,6 +1175,10 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
   }
   if id == OPT_SUPPRESS_CONNECT_HEADERS {
     cfg.suppress_connect_headers = enable;
+    return done();
+  }
+  if id == OPT_REMOVE_ON_ERROR {
+    cfg.remove_on_error = enable;
     return done();
   }
   // OPT_DISABLE,

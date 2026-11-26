@@ -32,6 +32,7 @@ import securl::fetch;
 import securl::url;
 import securl::writeout;
 import disk::files;
+import sys::files;
 
 /// Add the environment variable `name` to `out` when it has a value.
 fn add_env(out : &mut Vec<EnvVar>, env : &Environment, name : *const i8) -> void {
@@ -42,6 +43,20 @@ fn add_env(out : &mut Vec<EnvVar>, env : &Environment, name : *const i8) -> void
       value : value
     });
   }
+}
+
+/// The width of the terminal for warnings, as curl takes it: `COLUMNS` when it is a number
+/// from 21 to 10000, and else 79. curl asks the terminal too, which securl does not yet.
+fn columns_of(env : &Environment) -> i32 {
+  match parse_u64(&env_var(env, "COLUMNS")) {
+    Option<u64>::Some(n) => {
+      if n > 20u64 && n <= 10000u64 {
+        return n as i32;
+      }
+    },
+    Option<u64>::None() => {}
+  }
+  return 79;
 }
 
 /// The proxy variables of the environment that libcurl reads for HTTP and HTTPS. Only the
@@ -67,6 +82,7 @@ pub fn tool_main(root : Root) -> i32 {
     Result<Config, Failure>::Ok(parsed) => {
       let mut cfg = parsed;
       cfg.proxy_env = proxy_env(&root.env);
+      cfg.columns = columns_of(&root.env);
       // As curl does while it reads the command line: a `--cacert` or `--proxy-cacert` file
       // must exist.
       if !file_given_exists(&root.files, &cfg.cacert, "cacert")
@@ -176,14 +192,14 @@ fn print_help() -> void {
 }
 
 /// Open the output of transfer number `index`: a `-o` file, a `-O` file, or standard output.
-fn open_output(files : &Files, cfg : &Config, index : i32, url_text : &Vec<u8>)
--> Result<Output, Failure> {
+fn open_output(files : &Files, cfg : &Config, index : i32, url_text : &Vec<u8>,
+state : &mut OutputState) -> Result<Output, Failure> {
   if index < cfg.outputs.len() {
     let name = cfg.outputs.get_ref(index);
     if eq_lit(name, "-") {
       return Result<Output, Failure>::Ok(stdout_output());
     }
-    let file = create_file(files, &in_output_dir(cfg, name))?;
+    let file = create_output_file(files, &in_output_dir(cfg, name), state)?;
     return Result<Output, Failure>::Ok(file_output(file));
   }
   if cfg.remote_name_all || index - cfg.outputs.len() < cfg.remote_names {
@@ -193,11 +209,68 @@ fn open_output(files : &Files, cfg : &Config, index : i32, url_text : &Vec<u8>)
       return Result<Output, Failure>::Err(fail_lit(WRITE_ERROR,
         "Remote filename has no length"));
     }
-    let file = create_file(files, &in_output_dir(cfg, &name))?;
+    let file = create_output_file(files, &in_output_dir(cfg, &name), state)?;
     return Result<Output, Failure>::Ok(file_output(file));
   }
   return Result<Output, Failure>::Ok(stdout_output());
 }
+
+/// What the tool knows about the output file of a transfer, to clean up after one that failed.
+struct OutputState {
+  // The file, or empty for standard output.
+  path : Vec<u8>,
+  // securl made the file: it was not there before.
+  created : bool,
+  // A byte went to the file.
+  written : bool,
+}
+
+/// Create the output file `path`, and note it in `state`.
+fn create_output_file(files : &Files, path : &Vec<u8>, state : &mut OutputState)
+-> Result<File, Failure> {
+  state.created = !file_exists(files, path);
+  let file = create_file(files, path)?;
+  state.path = clone_bytes(path);
+  return Result<File, Failure>::Ok(file);
+}
+
+/// Clean up the output file of a transfer that failed. curl opens its output file only when the
+/// first byte arrives, and securl opened it before the transfer. So an empty file that securl
+/// made goes away again. With `--remove-on-error`, a file with bytes goes too, when it is a
+/// regular file, with curl's messages.
+fn clean_failed_output(files : &Files, cfg : &Config, state : &OutputState) -> void {
+  if state.path.len() == 0 {
+    return;
+  }
+  if !state.written {
+    if state.created && is_regular_file(files, &state.path) {
+      let _gone = remove_file(files, &state.path);
+    }
+    return;
+  }
+  if !cfg.remove_on_error {
+    return;
+  }
+  let quiet = cfg.silent;
+  if !is_regular_file(files, &state.path) {
+    if !quiet {
+      to_stderr(&message_lines("Warning: ",
+        &lit_then("Skipping removal; not a regular file: ", &state.path), cfg.columns));
+    }
+    return;
+  }
+  let removed = remove_file(files, &state.path);
+  if removed && (cfg.verbose || cfg.has_trace) && !quiet {
+    to_stderr(&message_lines("Note: ", &lit_then("Removed output file: ", &state.path),
+      cfg.columns));
+  }
+  if !removed && !quiet {
+    to_stderr(&message_lines("Warning: ", &lit_then("Failed removing: ", &state.path),
+      cfg.columns));
+  }
+  return;
+}
+
 
 /// The path of an output file: inside `--output-dir` when the name is not absolute.
 fn in_output_dir(cfg : &Config, name : &Vec<u8>) -> Vec<u8> {
@@ -278,10 +351,10 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
             contents.push(bytes);
           },
           Result<Vec<u8>, Failure>::Err(_f) => {
-            let mut m = lit("Warning: Couldn't read data from file \"");
+            let mut m = lit("Couldn't read data from file \"");
             append(&mut m, &name);
-            push_lit(&mut m, "\", this makes an empty POST.\n");
-            to_stderr(&m);
+            push_lit(&mut m, "\", this makes an empty POST.");
+            to_stderr(&message_lines("Warning: ", &m, cfg.columns));
             contents.push(Vec<u8>::new());
           }
         }
@@ -348,8 +421,8 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
     }
   }
 
-  if cfg.outputs.len() > cfg.urls.len() {
-    to_stderr(&lit("Warning: Got more output options than URLs\n"));
+  if cfg.outputs.len() > cfg.urls.len() && !cfg.silent {
+    to_stderr(&message_lines("Warning: ", &lit("Got more output options than URLs"), cfg.columns));
   }
   if cfg.has_upload && cfg.http10 && eq_lit(&cfg.upload, "-") && !has_custom(&headers, "Content-Length") {
     let f = fail_lit(UPLOAD_FAILED, "Chunky upload is not supported by HTTP 1.0");
@@ -570,6 +643,11 @@ other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first :
     }
 
     let mut info = new_info();
+    let mut state = OutputState {
+      path : Vec<u8>::new(),
+      created : false,
+      written : false
+    };
     let mut code = 0;
     let mut message = Vec<u8>::new();
     let mut result = Result<i32, Failure>::Ok(0);
@@ -579,10 +657,10 @@ other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first :
         "A value or data field grew larger than allowed"));
     } else if this_kind == REQ_PUT {
       result = transfer_one(network, files, tls, cfg, headers, &url_text, upload_body, this_kind,
-        form_boundary, session, i, &mut info);
+        form_boundary, session, i, &mut info, &mut state);
     } else {
       result = transfer_one(network, files, tls, cfg, headers, &url_text, request_body, this_kind,
-        form_boundary, session, i, &mut info);
+        form_boundary, session, i, &mut info, &mut state);
     }
     match result {
       Result<i32, Failure>::Ok(_v) => {},
@@ -590,6 +668,7 @@ other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first :
         report(cfg, &f);
         code = f.code;
         message = f.message;
+        clean_failed_output(files, cfg, &state);
       }
     }
     if cfg.has_write_out {
@@ -642,14 +721,17 @@ fn write_pieces(files : &Files, pieces : &Vec<WriteOutPiece>) -> void {
 fn transfer_one(network : &Network, files : &Files, tls : &TlsSettings, cfg : &Config,
 headers : &Vec<Vec<u8>>,
 url_text : &Vec<u8>, request_body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>,
-session : &mut Session, index : i32, info : &mut TransferInfo) -> Result<i32, Failure> {
-  let body_output = open_output(files, cfg, index, url_text)?;
+session : &mut Session, index : i32, info : &mut TransferInfo, state : &mut OutputState)
+-> Result<i32, Failure> {
+  let body_output = open_output(files, cfg, index, url_text, state)?;
   let header_output = open_header_output(files, cfg)?;
   let mut sinks = Sinks {
     body : body_output,
     headers : header_output,
     has_headers : cfg.has_dump_header
   };
-  return run_transfer(network, tls, cfg, headers, url_text, request_body, kind, form_boundary,
-    session, &mut sinks, info);
+  let result = run_transfer(network, tls, cfg, headers, url_text, request_body, kind,
+    form_boundary, session, &mut sinks, info);
+  state.written = sinks.body.written > 0i64;
+  return result;
 }

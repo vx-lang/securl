@@ -206,10 +206,12 @@ check "  unless --proxy-insecure" 0 "hello over tls" -sS --proxy-insecure \
 check "  1 MiB in chunks, TLS inside TLS" 0 "200 1048576" -s $pcert \
   -x "https://localhost:$tlsproxy" --cacert "$certs/ca.pem" -o /dev/null \
   -w '%{http_code} %{size_download}' "https://localhost:$https/big"
+# The server sends its alert and closes. When the reset of that close reaches the proxy first,
+# the alert is lost on the way, and the error is "unexpected eof while reading". So only the
+# exit code is checked here.
 # shellcheck disable=SC2086
 check "  a server that refuses inside the tunnel" 56 "" -sS $pcert \
   -x "https://localhost:$tlsproxy" -k "https://localhost:$mtls/whoami"
-stderr_has "  with curl's message" "tlsv13 alert certificate required"
 # shellcheck disable=SC2086
 check "  a tunnel that it refuses" 7 "" -sS $pcert -x "https://localhost:$tlsproxy" \
   "https://localhost:1/"
@@ -443,6 +445,60 @@ hsts_is "  stays, and an expired one goes" "$hsts" 'localhost "unlimited"|'
 python3 -c 'print("a.example \"20391001 04:47:41\"\n" + "x" * 4094)' > "$hsts"
 check "a line of 4095 bytes in the HSTS file" 100 "" -s --hsts "$hsts" "http://127.0.0.1:$http/"
 hsts_is "  ends the file there" "$hsts" 'a.example "DATE"|'
+
+# The output file of a transfer that fails. curl makes the file at the first byte, so a failed
+# connect leaves none. --remove-on-error removes a file that got bytes, but only a regular one.
+rm -f "$work/out1" "$work/out2" "$work/out3"
+check "a failed connect makes no output file" 7 "" -s -o "$work/out1" "http://127.0.0.1:1/"
+if [ -e "$work/out1" ]; then
+  echo "FAIL   and yet there is one"
+  fail=1
+else
+  echo "ok     there is none"
+fi
+check "--remove-on-error after a cut body" 61 "" -s --compressed --remove-on-error \
+  -o "$work/out2" "http://127.0.0.1:$http/gzip-cut"
+if [ -e "$work/out2" ]; then
+  echo "FAIL   removes the file: it is still there"
+  fail=1
+else
+  echo "ok     removes the file"
+fi
+check "  and -v says so" 61 "" -v --compressed --remove-on-error -o "$work/out2" \
+  "http://127.0.0.1:$http/gzip-cut"
+stderr_has "  with curl's note" "Note: Removed output file: "
+check "without it, the cut body stays" 61 "" -s --compressed -o "$work/out3" \
+  "http://127.0.0.1:$http/gzip-cut"
+if [ -s "$work/out3" ]; then
+  echo "ok     in its file"
+else
+  echo "FAIL   in its file: the file is missing or empty"
+  fail=1
+fi
+check "--remove-on-error leaves what is no regular file" 61 "" --compressed --remove-on-error \
+  -o /dev/null "http://127.0.0.1:$http/gzip-cut"
+stderr_has "  with curl's warning" "Warning: Skipping removal; not a regular file: /dev/null"
+
+# --limit-rate: 1 MiB at 512 KiB per second takes 2 seconds, as in curl.
+started=$(date +%s%N)
+check "--limit-rate 512k" 0 "1048576" -s --limit-rate 512k -o /dev/null -w '%{size_download}' \
+  "http://127.0.0.1:$http/big"
+took=$((($(date +%s%N) - started) / 1000000))
+if [ "$took" -ge 1900 ]; then
+  echo "ok     takes 2 seconds or more ($took ms)"
+else
+  echo "FAIL   takes 2 seconds or more: $took ms"
+  fail=1
+fi
+check "  and -m still stops it" 28 "" -s --limit-rate 512k -m 1 -o /dev/null \
+  "http://127.0.0.1:$http/big"
+
+# %{size_upload}: the body of the last request, chunks with their framing.
+check "%{size_upload}" 0 "6" -s -d abcdef -o /dev/null -w '%{size_upload}' \
+  "http://127.0.0.1:$http/"
+printf 'hello world' > "$work/upload.txt"
+check "  of a chunked upload" 0 "21" -s -T "$work/upload.txt" -H 'Transfer-Encoding: chunked' \
+  -o /dev/null -w '%{size_upload}' "http://127.0.0.1:$http/"
 
 # The TCP options of libcurl, in its order: TCP_NODELAY, then keepalive after 60 seconds, every
 # 60 seconds, 9 times.

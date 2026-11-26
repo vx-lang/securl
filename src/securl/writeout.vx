@@ -224,6 +224,10 @@ fn variable(name : &Vec<u8>, info : &TransferInfo, ctx : &WriteOutContext, out :
     push_i64(out, info.size_request);
     return true;
   }
+  if eq_lit(name, "size_upload") {
+    push_i64(out, info.size_upload);
+    return true;
+  }
   if eq_lit(name, "num_redirects") {
     push_i64(out, info.num_redirects as i64);
     return true;
