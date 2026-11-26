@@ -170,7 +170,7 @@ fn print_version(console : &mut Console) -> void {
   append(&mut m, &securl_version());
   push_lit(&mut m, " ");
   append(&mut m, &tls_library_version());
-  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: HSTS HTTP2 HTTPS-proxy IPv6 Largefile libz SSL zstd\n");
+  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: brotli HSTS HTTP2 HTTPS-proxy IPv6 Largefile libz SSL zstd\n");
   let _ok = console.to_stdout(&m);
 }
 

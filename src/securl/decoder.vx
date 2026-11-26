@@ -1,9 +1,10 @@
 // One decoder of `--compressed` or `--tr-encoding`, for any coding that securl knows: gzip and
-// deflate (`inflate.vx`) and zstd (`zstd.vx`). It gives the failures with libcurl's codes and
-// texts.
+// deflate (`inflate.vx`), br (`brotli.vx`) and zstd (`zstd.vx`). It gives the failures with
+// libcurl's codes and texts.
 import core::result;
 import std::vec;
 import sys::text;
+import securl::brotli;
 import securl::bytes;
 import securl::failure;
 import securl::inflate;
@@ -12,12 +13,14 @@ import securl::zstd;
 const CODING_GZIP : i32 = 1;
 const CODING_DEFLATE : i32 = 2;
 const CODING_ZSTD : i32 = 3;
+const CODING_BR : i32 = 4;
 
-/// A decoder of one coding. Only the decoder of `coding` holds data; the other one is idle.
+/// A decoder of one coding. Only the decoder of `coding` holds data; the others are idle.
 struct Decoder {
   coding : i32,
   inflate : Inflate,
   zstd : Zstd,
+  brotli : Brotli,
 }
 
 /// The coding of the name `name` of a Content-Encoding or Transfer-Encoding, or 0 when securl
@@ -32,6 +35,9 @@ pub fn coding_of(name : &Vec<u8>) -> i32 {
   if eq_lit_nocase(name, "zstd") {
     return CODING_ZSTD;
   }
+  if eq_lit_nocase(name, "br") {
+    return CODING_BR;
+  }
   return 0;
 }
 
@@ -41,7 +47,16 @@ pub fn new_decoder(coding : i32) -> Decoder {
     return Decoder {
       coding : coding,
       inflate : idle_inflate(),
-      zstd : new_zstd()
+      zstd : new_zstd(),
+      brotli : idle_brotli()
+    };
+  }
+  if coding == CODING_BR {
+    return Decoder {
+      coding : coding,
+      inflate : idle_inflate(),
+      zstd : idle_zstd(),
+      brotli : new_brotli()
     };
   }
   let mut wrap = WRAP_GZIP;
@@ -51,7 +66,8 @@ pub fn new_decoder(coding : i32) -> Decoder {
   return Decoder {
     coding : coding,
     inflate : new_inflate(wrap),
-    zstd : idle_zstd()
+    zstd : idle_zstd(),
+    brotli : idle_brotli()
   };
 }
 
@@ -65,6 +81,23 @@ impl Decoder {
         },
         Result<Vec<u8>, i32>::Err(_e) => {
           // libcurl gives no text of its own for a zstd error, so curl shows the one of the code.
+          return Result<Vec<u8>, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
+            "Unrecognized or bad HTTP Content or Transfer-Encoding"));
+        }
+      }
+    }
+    if self.coding == CODING_BR {
+      match self.brotli.feed(piece) {
+        Result<Vec<u8>, i32>::Ok(out) => {
+          return Result<Vec<u8>, Failure>::Ok(out);
+        },
+        Result<Vec<u8>, i32>::Err(code) => {
+          // libcurl gives no text of its own for a brotli error either. An error that it does
+          // not list, and bytes after the end of the stream, give its write error.
+          if code == WRITE_ERROR {
+            return Result<Vec<u8>, Failure>::Err(fail_lit(WRITE_ERROR,
+              "Failed writing received data to disk/application"));
+          }
           return Result<Vec<u8>, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
             "Unrecognized or bad HTTP Content or Transfer-Encoding"));
         }
@@ -88,6 +121,13 @@ impl Decoder {
 
   /// The body ended. A body that ended inside its compressed data fails, as in libcurl.
   pub fn finish(self : &Decoder) -> Result<i32, Failure> {
+    if self.coding == CODING_BR {
+      if !self.brotli.complete() {
+        return Result<i32, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
+          "Brotli stream ended before completion"));
+      }
+      return Result<i32, Failure>::Ok(0);
+    }
     if self.coding == CODING_ZSTD {
       if !self.zstd.complete() {
         return Result<i32, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,

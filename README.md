@@ -63,11 +63,11 @@ Vx main 973d80f9b.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 438 of 752 (58%) |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 443 of 757 (59%) |
 | The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 392 of 461 (85%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 176 of 176 |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 183 of 183 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
-| Unit tests (`tests/unit`) | 11 of 11 |
+| Unit tests (`tests/unit`) | 12 of 12 |
 
 `CURL=/path/to/curl tests/tls/run.sh` runs the checks of `tests/tls` against another curl, and
 `tests/h2/run.sh` takes `CURL` too. curl 8.23.1-DEV, built from the same curl commit, passes all
@@ -82,7 +82,7 @@ program of the curl build, linked with curl's own libcurl, so they never run sec
 the counts above included them by mistake: 152 of them passed, and the table said 522 of 874.
 Test 1070 depends on timing: the test server closes the connection while securl sends the
 body. It passes in some runs, between one in four and one in twelve, with and without recent
-changes.
+changes. It passed in the run of the table above.
 
 The C build of the test suite has OpenSSL, so that runtests.pl runs the Digest tests (see "Run
 curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tests too.
@@ -91,7 +91,7 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 13,090 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 14,841 | none, and `--no-trusted-code` enforces this |
 | `src/cli/` (the tool) and `src/disk/` (its files) | 964 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 13 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,451 | 52 `extern` functions, 100 `unsafe` blocks |
@@ -196,10 +196,10 @@ page.
 
 ## Compression
 
-`--compressed` asks for `deflate, gzip, zstd` and decodes them as the body arrives.
-`src/securl/inflate.vx` is a DEFLATE decoder in Vx with the gzip and zlib wrappers, and
-`src/securl/zstd.vx` a zstd decoder (RFC 8878) in Vx, so this needs no zlib, no libzstd and no
-trusted code. It follows libcurl and zlib: the CRC-32 and Adler-32 checks,
+`--compressed` asks for `deflate, gzip, br, zstd` and decodes them as the body arrives.
+`src/securl/inflate.vx` is a DEFLATE decoder in Vx with the gzip and zlib wrappers,
+`src/securl/brotli.vx` a brotli decoder (RFC 7932) and `src/securl/zstd.vx` a zstd decoder
+(RFC 8878), so this needs no zlib, no libbrotli, no libzstd and no trusted code. It follows libcurl and zlib: the CRC-32 and Adler-32 checks,
 zlib's error texts after "Error while processing content unencoding: ", raw DEFLATE for a
 `deflate` body that has no zlib header, a chain of up to five encodings, and exit 61 for a body
 that ends inside the compressed data. `-w %{size_delivered}` gives the decoded size.
@@ -220,6 +220,27 @@ frames that must fail; it feeds each whole, a byte at a time, and in pieces of 7
 Python 3.14, which has `compression.zstd`, `tests/tls` checks zstd bodies too. 5,600 frames of
 those cases with random changes gave the same result with securl as with libzstd, and none
 stopped securl.
+
+The brotli decoder reads in small units: a step of a meta-block header, one prefix code, the
+start of a command, one literal, one distance. A unit reads all of its bits or goes back to its
+start and waits for more of the body, and it writes output only after its bits are read. The
+static dictionary and its 121 transforms are in `src/securl/brotli_tables.vx`, which
+`tools/gen-brotli-tables.py` makes from the brotli library and checks against the SHA-256 of
+the dictionary of RFC 7932. The exit codes follow how libcurl maps libbrotli's errors: 61 with
+"Unrecognized or bad HTTP Content or Transfer-Encoding" for most bad data, 23 with "Failed
+writing received data to disk/application" for a reserved bit, a distance out of range and
+bytes after the end of the stream, and 61 with "Brotli stream ended before completion" for a
+body that ends inside the stream. `tests/unit/brotli_decode.vx` (made by
+`tools/gen-brotli-test.py`) holds streams that libbrotli made at qualities 0 to 11, with a 1 KiB
+window, English that uses the dictionary and its upper-case transforms, and streams that must
+fail; it feeds each whole, a byte at a time, and in pieces of 7 bytes. Of 157 streams from
+libbrotli, 86 use the dictionary, and all decode to the same bytes in pieces of 1, 9 and 16384
+bytes. 6,500 streams of those cases with random changes gave the same exit code as libcurl
+with libbrotli, the same output, and no crash. With libbrotlienc, `tests/tls` checks brotli
+bodies too.
+
+curl 8.18 does not check that a brotli or zstd stream ended, and exits with 0 for a cut one.
+curl 8.23 does, with tests 4271 and 4272, and securl does as 8.23.
 
 As in libcurl, `%{size_download}` counts a piece of the body only once the decoders and the
 output took it, so a piece that does not decode does not count. Test 4272 checks a cut gzip
@@ -340,7 +361,7 @@ time variables yet.
 
 In order of how much users need them:
 
-1. Connection reuse (and with it, HTTP/2 multiplexing), brotli for `--compressed`,
+1. Connection reuse (and with it, HTTP/2 multiplexing),
    `--unix-socket`, the
    `Upgrade: h2c` of `--http2` on plain HTTP, and HTTP/2 through an HTTP proxy.
 1. URL globbing (`{a,b}` and `[1-9]`), `--next`, `-J`, `-C` resume, `-K` config files,
@@ -395,6 +416,8 @@ A securl binary also holds code under other licenses:
 - OpenSSL, under the Apache License 2.0 (`third_party/openssl/LICENSE.txt`). By default the
   Makefile links it statically, so a copy of the binary must come with that license.
 - The Vx runtime `libvx_std_core`, under the Apache License 2.0 with LLVM Exceptions.
+- The static dictionary and the transforms of brotli in `src/securl/brotli_tables.vx`, from
+  Google's brotli, under the MIT license. They are also in RFC 7932.
 
 ## Layout
 
@@ -413,6 +436,7 @@ src/securl/          the protocol code; no trusted code
   conn.vx              a connection with a read buffer; needs `&Network`
   body.vx encode.vx    request bodies, Base64, URL encoding
   output.vx            standard output or a file that main opened
+  decoder.vx           the decoders of --compressed: inflate.vx, brotli.vx, zstd.vx
   writeout.vx          -w
 third_party/openssl  OpenSSL 3.5.9 (LTS), a shallow git submodule
 LICENSE              curl's license, with the copyright of securl and of curl

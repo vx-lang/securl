@@ -265,7 +265,7 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
     push_lit(&mut out, "TE: gzip\r\n");
   }
   if info.accept_encoding && !has_custom(&info.headers, "Accept-Encoding") {
-    push_lit(&mut out, "Accept-Encoding: deflate, gzip, zstd\r\n");
+    push_lit(&mut out, "Accept-Encoding: deflate, gzip, br, zstd\r\n");
   }
 
   if info.has_referer && !has_custom(&info.headers, "Referer") {

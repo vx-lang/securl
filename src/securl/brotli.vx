@@ -1,0 +1,1423 @@
+// The decoder of `Content-Encoding: br` (brotli, RFC 7932), as libcurl decodes it with
+// libbrotli.
+//
+// A decoder takes the body in pieces as it arrives and gives the bytes that it could decode.
+// It reads in small units: one step of a meta-block header, one prefix code, the start of a
+// command, one literal, one distance. A unit reads all of its bits or none: when a piece ends
+// inside one, the decoder goes back to its start and waits for the next piece. A unit writes
+// its output only after its bits are read, so going back never takes output back.
+//
+// The errors give libcurl's exit codes: 61 for bad data, and 23 where libbrotli's error is one
+// that libcurl does not list (a reserved bit, a distance out of range) and for bytes after the
+// end of the stream.
+import core::num;
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import securl::brotli_tables;
+import securl::bytes;
+
+// Results of a unit besides a value: more input is needed, or the data is bad, with the exit
+// code 61 or 23 of libcurl.
+const BR_NEED_MORE : i32 = -1;
+const BR_BAD : i32 = -2;
+const BR_BAD_23 : i32 = -3;
+
+// The states of the decoder.
+const S_STREAM : i32 = 0;
+const S_HEADER : i32 = 1;
+const S_TABLES : i32 = 2;
+const S_UNCOMPRESSED : i32 = 3;
+const S_METADATA : i32 = 4;
+const S_COMMAND : i32 = 5;
+const S_LITERALS : i32 = 6;
+const S_DISTANCE : i32 = 7;
+const S_BLOCK_DONE : i32 = 8;
+const S_DONE : i32 = 9;
+const S_FAILED : i32 = 10;
+
+// The steps of the header of a compressed meta-block.
+const T_LITERAL_BLOCKS : i32 = 0;
+const T_COMMAND_BLOCKS : i32 = 1;
+const T_DISTANCE_BLOCKS : i32 = 2;
+const T_DISTANCE_PARAMS : i32 = 3;
+const T_LITERAL_MAP : i32 = 4;
+const T_DISTANCE_MAP : i32 = 5;
+const T_CODES : i32 = 6;
+
+// The largest distance that libbrotli takes; a larger one is an error.
+const MAX_DISTANCE : i64 = 2147483644i64;
+
+/// A canonical prefix code: how many codes each length from 0 to 15 has, and the symbols in
+/// the order of their codes. A code with one symbol (`single`) takes no bits.
+struct PrefixCode {
+  counts : Vec<i32>,
+  symbols : Vec<i32>,
+  single : i32,
+}
+
+/// Where the next bit is: byte `pos` of the input, bit `bit` of that byte.
+struct BitPos {
+  pos : i32,
+  bit : i32,
+}
+
+/// The block types of one category (literals, commands or distances) in a meta-block.
+struct Blocks {
+  types : i32,
+  type_code : PrefixCode,
+  count_code : PrefixCode,
+  current : i32,
+  previous : i32,
+  count : i64,
+}
+
+/// A decoder of `br`.
+struct Brotli {
+  input : Vec<u8>,
+  br : BitPos,
+  state : i32,
+  step : i32,
+  code_index : i32,
+  // The largest backward distance: the window size less 16.
+  window : i64,
+  // The meta-block: whether it is the last one, whether it is stored as it is, and how many
+  // bytes of it are left.
+  is_last : bool,
+  is_uncompressed : bool,
+  left : i64,
+  lit : Blocks,
+  cmd : Blocks,
+  dst : Blocks,
+  npostfix : i32,
+  ndirect : i32,
+  context_modes : Vec<i32>,
+  lit_map : Vec<i32>,
+  dist_map : Vec<i32>,
+  ntrees_lit : i32,
+  ntrees_dist : i32,
+  lit_codes : Vec<PrefixCode>,
+  cmd_codes : Vec<PrefixCode>,
+  dist_codes : Vec<PrefixCode>,
+  // The command being decoded.
+  insert_left : i64,
+  copy_len : i64,
+  implicit_distance : bool,
+  // The last four distances, and where the next one goes.
+  dist_rb : Vec<i64>,
+  dist_idx : i32,
+  // The output: the last part of it for the copies, how much in all, and its last two bytes.
+  hist : Vec<u8>,
+  total : i64,
+  p1 : i32,
+  p2 : i32,
+  lookup : Vec<u8>,
+  dictionary : Vec<u8>,
+  // Some input came, so the end of the body must also be the end of the stream.
+  started : bool,
+  error_code : i32,
+}
+
+fn empty_prefix_code() -> PrefixCode {
+  return PrefixCode {
+    counts : Vec<i32>::new(),
+    symbols : Vec<i32>::new(),
+    single : -1
+  };
+}
+
+fn one_type() -> Blocks {
+  return Blocks {
+    types : 1,
+    type_code : empty_prefix_code(),
+    count_code : empty_prefix_code(),
+    current : 0,
+    previous : 1,
+    count : 16777216i64
+  };
+}
+
+/// A decoder that holds nothing, for a coding that is not br. `new_brotli` makes one that
+/// decodes.
+pub fn idle_brotli() -> Brotli {
+  let mut rb = Vec<i64>::new();
+  rb.push(16i64);
+  rb.push(15i64);
+  rb.push(11i64);
+  rb.push(4i64);
+  return Brotli {
+    input : Vec<u8>::new(),
+    br : BitPos {
+      pos : 0,
+      bit : 0
+    },
+    state : S_STREAM,
+    step : 0,
+    code_index : 0,
+    window : 0i64,
+    is_last : false,
+    is_uncompressed : false,
+    left : 0i64,
+    lit : one_type(),
+    cmd : one_type(),
+    dst : one_type(),
+    npostfix : 0,
+    ndirect : 0,
+    context_modes : Vec<i32>::new(),
+    lit_map : Vec<i32>::new(),
+    dist_map : Vec<i32>::new(),
+    ntrees_lit : 1,
+    ntrees_dist : 1,
+    lit_codes : Vec<PrefixCode>::new(),
+    cmd_codes : Vec<PrefixCode>::new(),
+    dist_codes : Vec<PrefixCode>::new(),
+    insert_left : 0i64,
+    copy_len : 0i64,
+    implicit_distance : false,
+    dist_rb : rb,
+    dist_idx : 0,
+    hist : Vec<u8>::new(),
+    total : 0i64,
+    p1 : 0,
+    p2 : 0,
+    lookup : Vec<u8>::new(),
+    dictionary : Vec<u8>::new(),
+    started : false,
+    error_code : 0
+  };
+}
+
+/// A decoder of `br`.
+pub fn new_brotli() -> Brotli {
+  let mut b = idle_brotli();
+  b.lookup = context_lookup();
+  return b;
+}
+
+/// `n` bits (at most 24), the first one in the lowest place, or BR_NEED_MORE.
+fn read_bits(input : &Vec<u8>, b : &mut BitPos, n : i32) -> i32 {
+  if n == 0 {
+    return 0;
+  }
+  let have = ((input.len() - b.pos) as i64) * 8i64 - (b.bit as i64);
+  if have < (n as i64) {
+    return BR_NEED_MORE;
+  }
+  let mut value = 0;
+  let mut got = 0;
+  while got < n {
+    let mut take = 8 - b.bit;
+    if take > n - got {
+      take = n - got;
+    }
+    let chunk = ((input.get(b.pos) as i32) >> b.bit) & ((1 << take) - 1);
+    value = value | (chunk << got);
+    got = got + take;
+    b.bit = b.bit + take;
+    if b.bit == 8 {
+      b.bit = 0;
+      b.pos = b.pos + 1;
+    }
+  }
+  return value;
+}
+
+/// The next symbol of the code `h`, or BR_NEED_MORE, or BR_BAD for a code it does not have.
+fn read_symbol(input : &Vec<u8>, b : &mut BitPos, h : &PrefixCode) -> i32 {
+  if h.single >= 0 {
+    return h.single;
+  }
+  let mut code = 0;
+  let mut first = 0;
+  let mut index = 0;
+  let mut len = 1;
+  while len < 16 {
+    let bit = read_bits(input, b, 1);
+    if bit < 0 {
+      return BR_NEED_MORE;
+    }
+    code = code | bit;
+    let count = h.counts.get(len);
+    if code - count < first {
+      return h.symbols.get(index + (code - first));
+    }
+    index = index + count;
+    first = (first + count) << 1;
+    code = code << 1;
+    len = len + 1;
+  }
+  return BR_BAD;
+}
+
+/// A number of 0 to 255 in the variable-length form of RFC 7932 (VarLenUint8), or BR_NEED_MORE.
+fn read_varlen8(input : &Vec<u8>, b : &mut BitPos) -> i32 {
+  let flag = read_bits(input, b, 1);
+  if flag <= 0 {
+    return flag;
+  }
+  let n = read_bits(input, b, 3);
+  if n < 0 {
+    return BR_NEED_MORE;
+  }
+  if n == 0 {
+    return 1;
+  }
+  let v = read_bits(input, b, n);
+  if v < 0 {
+    return BR_NEED_MORE;
+  }
+  return (1 << n) + v;
+}
+
+/// Build the canonical code of the code lengths `lengths`, one for each symbol.
+fn build_code(lengths : &Vec<i32>, h : &mut PrefixCode) -> void {
+  let mut counts = Vec<i32>::new();
+  let mut i = 0;
+  while i < 16 {
+    counts.push(0);
+    i = i + 1;
+  }
+  let mut nonzero = 0;
+  let mut last = 0;
+  let mut s = 0;
+  while s < lengths.len() {
+    let l = lengths.get(s);
+    counts.set(l, counts.get(l) + 1);
+    if l > 0 {
+      nonzero = nonzero + 1;
+      last = s;
+    }
+    s = s + 1;
+  }
+  let mut offsets = Vec<i32>::new();
+  offsets.push(0);
+  offsets.push(0);
+  let mut len = 1;
+  while len < 15 {
+    offsets.push(offsets.get(len) + counts.get(len));
+    len = len + 1;
+  }
+  let mut symbols = Vec<i32>::new();
+  i = 0;
+  while i < nonzero {
+    symbols.push(0);
+    i = i + 1;
+  }
+  s = 0;
+  while s < lengths.len() {
+    let l = lengths.get(s);
+    if l > 0 {
+      symbols.set(offsets.get(l), s);
+      offsets.set(l, offsets.get(l) + 1);
+    }
+    s = s + 1;
+  }
+  h.counts = counts;
+  h.symbols = symbols;
+  h.single = -1;
+  if nonzero == 1 {
+    h.single = last;
+  }
+}
+
+/// The bits of a symbol of an alphabet of `size` symbols in a simple prefix code.
+fn alphabet_bits(size : i32) -> i32 {
+  let mut bits = 0;
+  while (1 << bits) < size {
+    bits = bits + 1;
+  }
+  return bits;
+}
+
+/// Read a prefix code for an alphabet of `size` symbols (RFC 7932, section 3.4 and 3.5) into
+/// `h`. Gives 0, BR_NEED_MORE or BR_BAD.
+fn read_code(input : &Vec<u8>, b : &mut BitPos, size : i32, h : &mut PrefixCode) -> i32 {
+  let hskip = read_bits(input, b, 2);
+  if hskip < 0 {
+    return BR_NEED_MORE;
+  }
+  let mut lengths = Vec<i32>::new();
+  let mut i = 0;
+  while i < size {
+    lengths.push(0);
+    i = i + 1;
+  }
+  if hskip == 1 {
+    // A simple prefix code of one to four symbols.
+    let nsym_bits = read_bits(input, b, 2);
+    if nsym_bits < 0 {
+      return BR_NEED_MORE;
+    }
+    let nsym = nsym_bits + 1;
+    let bits = alphabet_bits(size);
+    let mut syms = Vec<i32>::new();
+    i = 0;
+    while i < nsym {
+      let s = read_bits(input, b, bits);
+      if s < 0 {
+        return BR_NEED_MORE;
+      }
+      if s >= size {
+        return BR_BAD;
+      }
+      syms.push(s);
+      i = i + 1;
+    }
+    i = 0;
+    while i < nsym {
+      let mut k = i + 1;
+      while k < nsym {
+        if syms.get(i) == syms.get(k) {
+          return BR_BAD;
+        }
+        k = k + 1;
+      }
+      i = i + 1;
+    }
+    if nsym == 1 {
+      h.counts = Vec<i32>::new();
+      h.symbols = Vec<i32>::new();
+      h.single = syms.get(0);
+      return 0;
+    }
+    if nsym == 2 {
+      lengths.set(syms.get(0), 1);
+      lengths.set(syms.get(1), 1);
+    }
+    if nsym == 3 {
+      lengths.set(syms.get(0), 1);
+      lengths.set(syms.get(1), 2);
+      lengths.set(syms.get(2), 2);
+    }
+    if nsym == 4 {
+      let tree_select = read_bits(input, b, 1);
+      if tree_select < 0 {
+        return BR_NEED_MORE;
+      }
+      if tree_select == 0 {
+        i = 0;
+        while i < 4 {
+          lengths.set(syms.get(i), 2);
+          i = i + 1;
+        }
+      } else {
+        lengths.set(syms.get(0), 1);
+        lengths.set(syms.get(1), 2);
+        lengths.set(syms.get(2), 3);
+        lengths.set(syms.get(3), 3);
+      }
+    }
+    build_code(&lengths, h);
+    return 0;
+  }
+  // A complex prefix code: first the code lengths of the code of the code lengths, in the
+  // order of RFC 7932, each in a fixed variable-length code.
+  let order = [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+  let mut cl = Vec<i32>::new();
+  i = 0;
+  while i < 18 {
+    cl.push(0);
+    i = i + 1;
+  }
+  let mut space = 32;
+  let mut num_codes = 0;
+  i = hskip;
+  while i < 18 {
+    let a = read_bits(input, b, 2);
+    if a < 0 {
+      return BR_NEED_MORE;
+    }
+    let mut v = 0;
+    if a == 1 {
+      v = 4;
+    }
+    if a == 2 {
+      v = 3;
+    }
+    if a == 3 {
+      let c = read_bits(input, b, 1);
+      if c < 0 {
+        return BR_NEED_MORE;
+      }
+      if c == 0 {
+        v = 2;
+      } else {
+        let d = read_bits(input, b, 1);
+        if d < 0 {
+          return BR_NEED_MORE;
+        }
+        if d == 0 {
+          v = 1;
+        } else {
+          v = 5;
+        }
+      }
+    }
+    cl.set(order[i], v);
+    if v != 0 {
+      space = space - (32 >> v);
+      num_codes = num_codes + 1;
+      if space <= 0 {
+        break;
+      }
+    }
+    i = i + 1;
+  }
+  if !(num_codes == 1 || space == 0) {
+    return BR_BAD;
+  }
+  let mut cl_code = empty_prefix_code();
+  build_code(&cl, &mut cl_code);
+  // Then the code lengths of the symbols, with 16 to repeat the last length and 17 to repeat
+  // a zero length.
+  let mut symbol = 0;
+  let mut prev_len = 8;
+  let mut repeat = 0;
+  let mut repeat_len = 0;
+  let mut code_space = 32768;
+  while symbol < size && code_space > 0 {
+    let c = read_symbol(input, b, &cl_code);
+    if c < 0 {
+      return c;
+    }
+    if c < 16 {
+      repeat = 0;
+      lengths.set(symbol, c);
+      if c != 0 {
+        prev_len = c;
+        code_space = code_space - (32768 >> c);
+      }
+      symbol = symbol + 1;
+    } else {
+      let mut extra = 3;
+      let mut new_len = 0;
+      if c == 16 {
+        extra = 2;
+        new_len = prev_len;
+      }
+      if repeat_len != new_len {
+        repeat = 0;
+        repeat_len = new_len;
+      }
+      let old_repeat = repeat;
+      if repeat > 0 {
+        repeat = (repeat - 2) << extra;
+      }
+      let e = read_bits(input, b, extra);
+      if e < 0 {
+        return BR_NEED_MORE;
+      }
+      repeat = repeat + e + 3;
+      let delta = repeat - old_repeat;
+      if symbol + delta > size {
+        return BR_BAD;
+      }
+      let mut k = 0;
+      while k < delta {
+        lengths.set(symbol + k, repeat_len);
+        k = k + 1;
+      }
+      if repeat_len != 0 {
+        code_space = code_space - (delta << (15 - repeat_len));
+      }
+      symbol = symbol + delta;
+    }
+  }
+  if code_space != 0 {
+    return BR_BAD;
+  }
+  build_code(&lengths, h);
+  return 0;
+}
+
+/// A block length: a symbol of `code` and its extra bits, or BR_NEED_MORE or BR_BAD.
+fn read_block_length(input : &Vec<u8>, b : &mut BitPos, code : &PrefixCode) -> i64 {
+  let s = read_symbol(input, b, code);
+  if s < 0 {
+    return s as i64;
+  }
+  let extra = read_bits(input, b, block_length_bits(s));
+  if extra < 0 {
+    return BR_NEED_MORE as i64;
+  }
+  return (block_length_base(s) + extra) as i64;
+}
+
+/// Read the block types of one category of a meta-block into `blk`. Gives 0, BR_NEED_MORE or BR_BAD.
+fn read_blocks(input : &Vec<u8>, b : &mut BitPos, blk : &mut Blocks) -> i32 {
+  let n = read_varlen8(input, b);
+  if n < 0 {
+    return BR_NEED_MORE;
+  }
+  blk.types = n + 1;
+  blk.current = 0;
+  blk.previous = 1;
+  blk.count = 16777216i64;
+  if blk.types < 2 {
+    return 0;
+  }
+  let r1 = read_code(input, b, blk.types + 2, &mut blk.type_code);
+  if r1 < 0 {
+    return r1;
+  }
+  let r2 = read_code(input, b, 26, &mut blk.count_code);
+  if r2 < 0 {
+    return r2;
+  }
+  let count = read_block_length(input, b, &blk.count_code);
+  if count < 0i64 {
+    return count as i32;
+  }
+  blk.count = count;
+  return 0;
+}
+
+/// Switch `blk` to its next block: a block type symbol and a block length. Gives 0, BR_NEED_MORE or
+/// BR_BAD. The caller goes back on BR_NEED_MORE.
+fn switch_block(input : &Vec<u8>, b : &mut BitPos, blk : &mut Blocks) -> i32 {
+  if blk.types < 2 {
+    return BR_BAD;
+  }
+  let s = read_symbol(input, b, &blk.type_code);
+  if s < 0 {
+    return s;
+  }
+  let count = read_block_length(input, b, &blk.count_code);
+  if count < 0i64 {
+    return count as i32;
+  }
+  let mut t = s - 2;
+  if s == 0 {
+    t = blk.previous;
+  }
+  if s == 1 {
+    t = blk.current + 1;
+  }
+  if t >= blk.types {
+    t = t - blk.types;
+  }
+  blk.previous = blk.current;
+  blk.current = t;
+  blk.count = count;
+  return 0;
+}
+
+/// Read a context map of `size` entries for `ntrees` prefix codes into `map`. Gives 0,
+/// BR_NEED_MORE or BR_BAD.
+fn read_context_map(input : &Vec<u8>, b : &mut BitPos, size : i32, ntrees : i32,
+map : &mut Vec<i32>) -> i32 {
+  let mut out = Vec<i32>::with_capacity(size);
+  let flag = read_bits(input, b, 1);
+  if flag < 0 {
+    return BR_NEED_MORE;
+  }
+  let mut rlemax = 0;
+  if flag == 1 {
+    let r = read_bits(input, b, 4);
+    if r < 0 {
+      return BR_NEED_MORE;
+    }
+    rlemax = r + 1;
+  }
+  let mut code = empty_prefix_code();
+  let rc = read_code(input, b, ntrees + rlemax, &mut code);
+  if rc < 0 {
+    return rc;
+  }
+  while out.len() < size {
+    let s = read_symbol(input, b, &code);
+    if s < 0 {
+      return s;
+    }
+    if s == 0 {
+      out.push(0);
+    } else {
+      if s <= rlemax {
+        let e = read_bits(input, b, s);
+        if e < 0 {
+          return BR_NEED_MORE;
+        }
+        let reps = (1 << s) + e;
+        if out.len() + reps > size {
+          return BR_BAD;
+        }
+        let mut k = 0;
+        while k < reps {
+          out.push(0);
+          k = k + 1;
+        }
+      } else {
+        out.push(s - rlemax);
+      }
+    }
+  }
+  let imtf = read_bits(input, b, 1);
+  if imtf < 0 {
+    return BR_NEED_MORE;
+  }
+  if imtf == 1 {
+    // The inverse move-to-front transform.
+    let mut mtf = Vec<i32>::new();
+    let mut i = 0;
+    while i < 256 {
+      mtf.push(i);
+      i = i + 1;
+    }
+    i = 0;
+    while i < out.len() {
+      let idx = out.get(i);
+      let value = mtf.get(idx);
+      out.set(i, value);
+      let mut k = idx;
+      while k > 0 {
+        mtf.set(k, mtf.get(k - 1));
+        k = k - 1;
+      }
+      mtf.set(0, value);
+      i = i + 1;
+    }
+  }
+  *map = out;
+  return 0;
+}
+
+/// The base and the extra bits of insert length code `c` and copy length code `c`.
+fn insert_base(c : i32) -> i64 {
+  let bases = [0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26, 34, 50, 66, 98, 130, 194, 322, 578, 1090,
+    2114, 6210, 22594];
+  return bases[c] as i64;
+}
+
+fn insert_bits(c : i32) -> i32 {
+  let bits = [0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 12, 14, 24];
+  return bits[c];
+}
+
+fn copy_base(c : i32) -> i64 {
+  let bases = [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 18, 22, 30, 38, 54, 70, 102, 134, 198, 326, 582,
+    1094, 2118];
+  return bases[c] as i64;
+}
+
+fn copy_bits(c : i32) -> i32 {
+  let bits = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 24];
+  return bits[c];
+}
+
+impl Brotli {
+  fn fail(self : &mut Brotli, code : i32) -> Result<Vec<u8>, i32> {
+    self.state = S_FAILED;
+    self.error_code = 61;
+    if code == BR_BAD_23 {
+      self.error_code = 23;
+    }
+    return Result<Vec<u8>, i32>::Err(self.error_code);
+  }
+
+  /// Add the byte `b` to the output.
+  fn emit(self : &mut Brotli, b : u8) -> void {
+    self.hist.push(b);
+    self.total = self.total + 1i64;
+    self.p2 = self.p1;
+    self.p1 = b as i32;
+  }
+
+  /// The window size of the stream header (RFC 7932, section 9.1). Gives 0 or BR_NEED_MORE or BR_BAD.
+  fn stream_header(self : &mut Brotli) -> i32 {
+    let first = read_bits(&self.input, &mut self.br, 1);
+    if first < 0 {
+      return BR_NEED_MORE;
+    }
+    let mut wbits = 16;
+    if first == 1 {
+      let n = read_bits(&self.input, &mut self.br, 3);
+      if n < 0 {
+        return BR_NEED_MORE;
+      }
+      if n > 0 {
+        wbits = 17 + n;
+      } else {
+        let m = read_bits(&self.input, &mut self.br, 3);
+        if m < 0 {
+          return BR_NEED_MORE;
+        }
+        if m == 1 {
+          // The large window of a later brotli, which libcurl does not ask for.
+          return BR_BAD;
+        }
+        if m > 0 {
+          wbits = 8 + m;
+        } else {
+          wbits = 17;
+        }
+      }
+    }
+    self.window = (1i64 << (wbits as i64)) - 16i64;
+    return 0;
+  }
+
+  /// The header of a meta-block up to its compressed part (RFC 7932, section 9.2). Gives 0,
+  /// BR_NEED_MORE, BR_BAD or BR_BAD_23, and sets the next state.
+  fn block_header(self : &mut Brotli) -> i32 {
+    let last = read_bits(&self.input, &mut self.br, 1);
+    if last < 0 {
+      return BR_NEED_MORE;
+    }
+    self.is_last = last == 1;
+    self.is_uncompressed = false;
+    self.left = 0i64;
+    if self.is_last {
+      let empty = read_bits(&self.input, &mut self.br, 1);
+      if empty < 0 {
+        return BR_NEED_MORE;
+      }
+      if empty == 1 {
+        self.state = S_BLOCK_DONE;
+        return 0;
+      }
+    }
+    let nibbles_code = read_bits(&self.input, &mut self.br, 2);
+    if nibbles_code < 0 {
+      return BR_NEED_MORE;
+    }
+    if nibbles_code == 3 {
+      // Metadata, which the decoder skips.
+      let reserved = read_bits(&self.input, &mut self.br, 1);
+      if reserved < 0 {
+        return BR_NEED_MORE;
+      }
+      if reserved != 0 {
+        return BR_BAD_23;
+      }
+      let nbytes = read_bits(&self.input, &mut self.br, 2);
+      if nbytes < 0 {
+        return BR_NEED_MORE;
+      }
+      let mut skip : i64 = 0i64;
+      let mut i = 0;
+      while i < nbytes {
+        let v = read_bits(&self.input, &mut self.br, 8);
+        if v < 0 {
+          return BR_NEED_MORE;
+        }
+        if i + 1 == nbytes && nbytes > 1 && v == 0 {
+          return BR_BAD;
+        }
+        skip = skip | ((v as i64) << ((8 * i) as i64));
+        i = i + 1;
+      }
+      if nbytes > 0 {
+        skip = skip + 1i64;
+      }
+      if !self.to_byte() {
+        return BR_BAD;
+      }
+      self.left = skip;
+      self.state = S_METADATA;
+      return 0;
+    }
+    let nibbles = nibbles_code + 4;
+    let mut mlen : i64 = 0i64;
+    let mut i = 0;
+    while i < nibbles {
+      let v = read_bits(&self.input, &mut self.br, 4);
+      if v < 0 {
+        return BR_NEED_MORE;
+      }
+      if i + 1 == nibbles && nibbles > 4 && v == 0 {
+        return BR_BAD;
+      }
+      mlen = mlen | ((v as i64) << ((4 * i) as i64));
+      i = i + 1;
+    }
+    self.left = mlen + 1i64;
+    if !self.is_last {
+      let u = read_bits(&self.input, &mut self.br, 1);
+      if u < 0 {
+        return BR_NEED_MORE;
+      }
+      self.is_uncompressed = u == 1;
+    }
+    if self.is_uncompressed {
+      if !self.to_byte() {
+        return BR_BAD;
+      }
+      self.state = S_UNCOMPRESSED;
+      return 0;
+    }
+    self.state = S_TABLES;
+    self.step = T_LITERAL_BLOCKS;
+    self.code_index = 0;
+    return 0;
+  }
+
+  /// Skip to the next byte. False when a skipped bit is not 0.
+  fn to_byte(self : &mut Brotli) -> bool {
+    if self.br.bit == 0 {
+      return true;
+    }
+    let rest = (self.input.get(self.br.pos) as i32) >> self.br.bit;
+    self.br.bit = 0;
+    self.br.pos = self.br.pos + 1;
+    return rest == 0;
+  }
+
+  /// One step of the header of a compressed meta-block. Gives 0, BR_NEED_MORE or BR_BAD.
+  fn table_step(self : &mut Brotli) -> i32 {
+    if self.step == T_LITERAL_BLOCKS {
+      return read_blocks(&self.input, &mut self.br, &mut self.lit);
+    }
+    if self.step == T_COMMAND_BLOCKS {
+      return read_blocks(&self.input, &mut self.br, &mut self.cmd);
+    }
+    if self.step == T_DISTANCE_BLOCKS {
+      return read_blocks(&self.input, &mut self.br, &mut self.dst);
+    }
+    if self.step == T_DISTANCE_PARAMS {
+      let p = read_bits(&self.input, &mut self.br, 2);
+      if p < 0 {
+        return BR_NEED_MORE;
+      }
+      let d = read_bits(&self.input, &mut self.br, 4);
+      if d < 0 {
+        return BR_NEED_MORE;
+      }
+      let mut modes = Vec<i32>::new();
+      let mut i = 0;
+      while i < self.lit.types {
+        let m = read_bits(&self.input, &mut self.br, 2);
+        if m < 0 {
+          return BR_NEED_MORE;
+        }
+        modes.push(m);
+        i = i + 1;
+      }
+      self.npostfix = p;
+      self.ndirect = d << p;
+      self.context_modes = modes;
+      return 0;
+    }
+    if self.step == T_LITERAL_MAP {
+      let n = read_varlen8(&self.input, &mut self.br);
+      if n < 0 {
+        return BR_NEED_MORE;
+      }
+      self.ntrees_lit = n + 1;
+      let size = 64 * self.lit.types;
+      if self.ntrees_lit < 2 {
+        self.lit_map = zeros(size);
+        return 0;
+      }
+      return read_context_map(&self.input, &mut self.br, size, self.ntrees_lit, &mut self.lit_map);
+    }
+    if self.step == T_DISTANCE_MAP {
+      let n = read_varlen8(&self.input, &mut self.br);
+      if n < 0 {
+        return BR_NEED_MORE;
+      }
+      self.ntrees_dist = n + 1;
+      let size = 4 * self.dst.types;
+      if self.ntrees_dist < 2 {
+        self.dist_map = zeros(size);
+        return 0;
+      }
+      return read_context_map(&self.input, &mut self.br, size, self.ntrees_dist,
+        &mut self.dist_map);
+    }
+    // T_CODES: one prefix code: the literal codes, then the command codes, then the distance
+    // codes.
+    let mut h = empty_prefix_code();
+    let mut i = self.code_index;
+    if i < self.ntrees_lit {
+      let r = read_code(&self.input, &mut self.br, 256, &mut h);
+      if r < 0 {
+        return r;
+      }
+      self.lit_codes.push(h);
+      return 0;
+    }
+    i = i - self.ntrees_lit;
+    if i < self.cmd.types {
+      let r = read_code(&self.input, &mut self.br, 704, &mut h);
+      if r < 0 {
+        return r;
+      }
+      self.cmd_codes.push(h);
+      return 0;
+    }
+    let size = 16 + self.ndirect + (48 << self.npostfix);
+    let r = read_code(&self.input, &mut self.br, size, &mut h);
+    if r < 0 {
+      return r;
+    }
+    self.dist_codes.push(h);
+    return 0;
+  }
+
+  /// Move on after a step of the header that worked.
+  fn next_step(self : &mut Brotli) -> void {
+    if self.step < T_CODES {
+      self.step = self.step + 1;
+      if self.step == T_CODES {
+        self.lit_codes = Vec<PrefixCode>::new();
+        self.cmd_codes = Vec<PrefixCode>::new();
+        self.dist_codes = Vec<PrefixCode>::new();
+        self.code_index = 0;
+      }
+      return;
+    }
+    self.code_index = self.code_index + 1;
+    if self.code_index == self.ntrees_lit + self.cmd.types + self.ntrees_dist {
+      self.state = S_COMMAND;
+    }
+  }
+
+  /// The start of a command: its insert and copy lengths. Gives 0, BR_NEED_MORE or BR_BAD.
+  fn command(self : &mut Brotli) -> i32 {
+    if self.cmd.count == 0i64 {
+      let r = switch_block(&self.input, &mut self.br, &mut self.cmd);
+      if r < 0 {
+        return r;
+      }
+    }
+    let sym = read_symbol(&self.input, &mut self.br, self.cmd_codes.get_ref(self.cmd.current));
+    if sym < 0 {
+      return sym;
+    }
+    let cell = sym >> 6;
+    let insert_codes = [0, 0, 0, 0, 8, 8, 0, 16, 8, 16, 16];
+    let copy_codes = [0, 8, 0, 8, 0, 8, 16, 0, 16, 8, 16];
+    let ic = insert_codes[cell] + ((sym >> 3) & 7);
+    let cc = copy_codes[cell] + (sym & 7);
+    let ie = read_bits(&self.input, &mut self.br, insert_bits(ic));
+    if ie < 0 {
+      return BR_NEED_MORE;
+    }
+    let ce = read_bits(&self.input, &mut self.br, copy_bits(cc));
+    if ce < 0 {
+      return BR_NEED_MORE;
+    }
+    self.cmd.count = self.cmd.count - 1i64;
+    self.insert_left = insert_base(ic) + (ie as i64);
+    self.copy_len = copy_base(cc) + (ce as i64);
+    self.implicit_distance = sym < 128;
+    return 0;
+  }
+
+  /// One literal. Gives 0, BR_NEED_MORE or BR_BAD.
+  fn literal(self : &mut Brotli) -> i32 {
+    if self.lit.count == 0i64 {
+      let r = switch_block(&self.input, &mut self.br, &mut self.lit);
+      if r < 0 {
+        return r;
+      }
+    }
+    let mode = self.context_modes.get(self.lit.current);
+    let context = (self.lookup.get(512 * mode + self.p1) as i32)
+      | (self.lookup.get(512 * mode + 256 + self.p2) as i32);
+    let tree = self.lit_map.get(64 * self.lit.current + context);
+    let s = read_symbol(&self.input, &mut self.br, self.lit_codes.get_ref(tree));
+    if s < 0 {
+      return s;
+    }
+    self.lit.count = self.lit.count - 1i64;
+    self.emit(s as u8);
+    return 0;
+  }
+
+  /// The distance of the command, and its copy. Gives 0, BR_NEED_MORE, BR_BAD or BR_BAD_23.
+  fn distance(self : &mut Brotli) -> i32 {
+    let mut code = 0;
+    let mut distance : i64 = 0i64;
+    if self.implicit_distance {
+      distance = self.dist_rb.get((self.dist_idx + 3) & 3);
+    } else {
+      if self.dst.count == 0i64 {
+        let r = switch_block(&self.input, &mut self.br, &mut self.dst);
+        if r < 0 {
+          return r;
+        }
+      }
+      let mut cid = 3;
+      if self.copy_len <= 4i64 {
+        cid = (self.copy_len as i32) - 2;
+      }
+      let tree = self.dist_map.get(4 * self.dst.current + cid);
+      code = read_symbol(&self.input, &mut self.br, self.dist_codes.get_ref(tree));
+      if code < 0 {
+        return code;
+      }
+      if code < 16 {
+        distance = self.recent_distance(code);
+      } else {
+        if code < 16 + self.ndirect {
+          distance = (code - 15) as i64;
+        } else {
+          let d = code - self.ndirect - 16;
+          let ndistbits = 1 + (d >> (self.npostfix + 1));
+          let hcode = d >> self.npostfix;
+          let lcode = d & ((1 << self.npostfix) - 1);
+          let offset = ((2i64 + ((hcode & 1) as i64)) << (ndistbits as i64)) - 4i64;
+          let extra = read_bits(&self.input, &mut self.br, ndistbits);
+          if extra < 0 {
+            return BR_NEED_MORE;
+          }
+          distance = ((offset + (extra as i64)) << (self.npostfix as i64)) + (lcode as i64)
+            + (self.ndirect as i64) + 1i64;
+        }
+      }
+      self.dst.count = self.dst.count - 1i64;
+    }
+    let mut max_distance = self.window;
+    if self.total < max_distance {
+      max_distance = self.total;
+    }
+    if distance > max_distance {
+      if distance > MAX_DISTANCE {
+        return BR_BAD_23;
+      }
+      return self.dictionary_word(distance - max_distance - 1i64);
+    }
+    // A copy from the output. Distance code 0 keeps the last distances as they are.
+    if !self.implicit_distance && code != 0 {
+      self.dist_rb.set(self.dist_idx & 3, distance);
+      self.dist_idx = self.dist_idx + 1;
+    }
+    let back = distance as i32;
+    let n = self.copy_len as i32;
+    let mut k = 0;
+    while k < n {
+      let b = self.hist.get(self.hist.len() - back);
+      self.emit(b);
+      k = k + 1;
+    }
+    self.left = self.left - self.copy_len;
+    return 0;
+  }
+
+  /// The distance of distance code `code` (0 to 15): one of the last four, maybe changed by up
+  /// to 3. One that is not more than 0 gives a distance that libbrotli refuses.
+  fn recent_distance(self : &Brotli, code : i32) -> i64 {
+    let last = self.dist_rb.get((self.dist_idx + 3) & 3);
+    let second = self.dist_rb.get((self.dist_idx + 2) & 3);
+    if code == 0 {
+      return last;
+    }
+    if code == 1 {
+      return second;
+    }
+    if code == 2 {
+      return self.dist_rb.get((self.dist_idx + 1) & 3);
+    }
+    if code == 3 {
+      return self.dist_rb.get(self.dist_idx & 3);
+    }
+    let deltas = [-1, 1, -2, 2, -3, 3];
+    let mut d : i64 = 0i64;
+    if code < 10 {
+      d = last + (deltas[code - 4] as i64);
+    } else {
+      d = second + (deltas[code - 10] as i64);
+    }
+    if d <= 0i64 {
+      return 2147483647i64;
+    }
+    return d;
+  }
+
+  /// A word of the static dictionary, with a transform, for the distance beyond the output
+  /// `address` (RFC 7932, section 8). Gives 0 or BR_BAD.
+  fn dictionary_word(self : &mut Brotli, address : i64) -> i32 {
+    let len = self.copy_len as i32;
+    if self.copy_len < 4i64 || self.copy_len > 24i64 {
+      return BR_BAD;
+    }
+    let shift = dictionary_size_bits(len);
+    let word_idx = (address & ((1i64 << (shift as i64)) - 1i64)) as i32;
+    let transform = address >> (shift as i64);
+    if transform >= 121i64 {
+      return BR_BAD;
+    }
+    if self.dictionary.len() == 0 {
+      self.dictionary = brotli_dictionary();
+    }
+    let t = transform as i32;
+    let start = dictionary_offset(len) + word_idx * len;
+    let word = range_of(&self.dictionary, start, start + len);
+    let kind = transform_kind(t);
+    let mut out = transform_text(transform_prefix(t));
+    let mut from = 0;
+    let mut wlen = len;
+    if kind >= 1 && kind <= 9 {
+      wlen = len - kind;
+    }
+    if kind >= 12 && kind <= 20 {
+      from = kind - 11;
+      wlen = len - from;
+    }
+    if wlen < 0 {
+      wlen = 0;
+    }
+    let mut part = range_of(&word, from, from + wlen);
+    if kind == 10 {
+      upper_case(&mut part, 0);
+    }
+    if kind == 11 {
+      let mut at = 0;
+      while at < part.len() {
+        at = at + upper_case(&mut part, at);
+      }
+    }
+    append(&mut out, &part);
+    append(&mut out, &transform_text(transform_suffix(t)));
+    for b in out.iter() {
+      self.emit(*b);
+    }
+    self.left = self.left - (out.len() as i64);
+    return 0;
+  }
+
+  /// Decode `piece`, the next part of the body. Gives the bytes that it could decode, or
+  /// Err with the exit code of libcurl, 61 or 23.
+  pub fn feed(self : &mut Brotli, piece : &Vec<u8>) -> Result<Vec<u8>, i32> {
+    if piece.len() == 0 {
+      return Result<Vec<u8>, i32>::Ok(Vec<u8>::new());
+    }
+    if self.state == S_DONE || self.state == S_FAILED {
+      // libcurl takes no byte after the end of the stream.
+      self.error_code = 23;
+      return Result<Vec<u8>, i32>::Err(23);
+    }
+    self.started = true;
+    if self.br.pos > 0 {
+      self.input = rest_from(&self.input, self.br.pos);
+      self.br.pos = 0;
+    }
+    append(&mut self.input, piece);
+    let out_from = self.hist.len();
+    loop {
+      let saved = BitPos {
+        pos : self.br.pos,
+        bit : self.br.bit
+      };
+      let mut r = 0;
+      if self.state == S_STREAM {
+        r = self.stream_header();
+        if r == 0 {
+          self.state = S_HEADER;
+        }
+      } else {
+        if self.state == S_HEADER {
+          r = self.block_header();
+        } else {
+          if self.state == S_TABLES {
+            r = self.table_step();
+            if r == 0 {
+              self.next_step();
+            }
+          } else {
+            if self.state == S_UNCOMPRESSED || self.state == S_METADATA {
+              // Bytes as they are, or bytes to skip, as many as there are.
+              while self.left > 0i64 && self.br.pos < self.input.len() {
+                if self.state == S_UNCOMPRESSED {
+                  let b = self.input.get(self.br.pos);
+                  self.emit(b);
+                }
+                self.br.pos = self.br.pos + 1;
+                self.left = self.left - 1i64;
+              }
+              if self.left > 0i64 {
+                // The bytes so far are used: no going back.
+                return self.output_from(out_from);
+              }
+              self.state = S_BLOCK_DONE;
+            } else {
+              if self.state == S_COMMAND {
+                if self.left <= 0i64 {
+                  self.state = S_BLOCK_DONE;
+                  continue;
+                }
+                let saved_cmd = self.saved_blocks(1);
+                r = self.command();
+                if r == 0 {
+                  if self.insert_left > self.left {
+                    r = BR_BAD;
+                  } else {
+                    self.state = S_LITERALS;
+                  }
+                } else {
+                  self.restore_blocks(1, &saved_cmd);
+                }
+              } else {
+                if self.state == S_LITERALS {
+                  while self.insert_left > 0i64 && r == 0 {
+                    let unit = BitPos {
+                      pos : self.br.pos,
+                      bit : self.br.bit
+                    };
+                    let saved_lit = self.saved_blocks(0);
+                    r = self.literal();
+                    if r == 0 {
+                      self.insert_left = self.insert_left - 1i64;
+                      self.left = self.left - 1i64;
+                    } else {
+                      self.restore_blocks(0, &saved_lit);
+                      self.br.pos = unit.pos;
+                      self.br.bit = unit.bit;
+                    }
+                  }
+                  if r == 0 {
+                    if self.left <= 0i64 {
+                      // The meta-block ends after the literals, and the copy does not count.
+                      self.state = S_BLOCK_DONE;
+                    } else {
+                      self.state = S_DISTANCE;
+                    }
+                  }
+                  if r == BR_NEED_MORE {
+                    return self.output_from(out_from);
+                  }
+                } else {
+                  if self.state == S_DISTANCE {
+                    let saved_dist = self.saved_blocks(2);
+                    r = self.distance();
+                    if r == 0 {
+                      if self.left < 0i64 {
+                        r = BR_BAD;
+                      } else {
+                        self.state = S_COMMAND;
+                      }
+                    } else {
+                      self.restore_blocks(2, &saved_dist);
+                    }
+                  } else {
+                    if self.state == S_BLOCK_DONE {
+                      if self.left < 0i64 {
+                        r = BR_BAD;
+                      } else {
+                        if !self.is_last {
+                          self.state = S_HEADER;
+                        } else {
+                          if !self.to_byte() {
+                            r = BR_BAD;
+                          } else {
+                            self.state = S_DONE;
+                          }
+                        }
+                      }
+                    } else {
+                      // S_DONE: libcurl takes no byte after the end of the stream.
+                      if self.br.pos < self.input.len() {
+                        r = BR_BAD_23;
+                      } else {
+                        return self.output_from(out_from);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      if r == BR_NEED_MORE {
+        self.br.pos = saved.pos;
+        self.br.bit = saved.bit;
+        return self.output_from(out_from);
+      }
+      if r < 0 {
+        return self.fail(r);
+      }
+    }
+  }
+
+  /// The block state of category `which` (0 literals, 1 commands, 2 distances), to go back to.
+  fn saved_blocks(self : &Brotli, which : i32) -> Vec<i64> {
+    let mut v = Vec<i64>::new();
+    if which == 0 {
+      v.push(self.lit.current as i64);
+      v.push(self.lit.previous as i64);
+      v.push(self.lit.count);
+    }
+    if which == 1 {
+      v.push(self.cmd.current as i64);
+      v.push(self.cmd.previous as i64);
+      v.push(self.cmd.count);
+    }
+    if which == 2 {
+      v.push(self.dst.current as i64);
+      v.push(self.dst.previous as i64);
+      v.push(self.dst.count);
+    }
+    return v;
+  }
+
+  fn restore_blocks(self : &mut Brotli, which : i32, v : &Vec<i64>) -> void {
+    if which == 0 {
+      self.lit.current = v.get(0) as i32;
+      self.lit.previous = v.get(1) as i32;
+      self.lit.count = v.get(2);
+    }
+    if which == 1 {
+      self.cmd.current = v.get(0) as i32;
+      self.cmd.previous = v.get(1) as i32;
+      self.cmd.count = v.get(2);
+    }
+    if which == 2 {
+      self.dst.current = v.get(0) as i32;
+      self.dst.previous = v.get(1) as i32;
+      self.dst.count = v.get(2);
+    }
+  }
+
+  /// The output since `from`, and the history cut to what a copy can still reach.
+  fn output_from(self : &mut Brotli, from : i32) -> Result<Vec<u8>, i32> {
+    let out = rest_from(&self.hist, from);
+    let keep = self.window + 16i64;
+    if (self.hist.len() as i64) > keep * 2i64 + 65536i64 {
+      self.hist = rest_from(&self.hist, self.hist.len() - (keep as i32));
+    }
+    return Result<Vec<u8>, i32>::Ok(out);
+  }
+
+  /// Whether the body may end here: before any input, or after the end of the stream.
+  pub fn complete(self : &Brotli) -> bool {
+    return !self.started || self.state == S_DONE;
+  }
+}
+
+fn zeros(n : i32) -> Vec<i32> {
+  let mut v = Vec<i32>::with_capacity(n);
+  let mut i = 0;
+  while i < n {
+    v.push(0);
+    i = i + 1;
+  }
+  return v;
+}
+
+/// libbrotli's upper case of the character at `at` of `p`: a letter of ASCII, and a simple
+/// change of a 2-byte or 3-byte character of UTF-8. Gives the length of the character.
+fn upper_case(p : &mut Vec<u8>, at : i32) -> i32 {
+  if at >= p.len() {
+    return 1;
+  }
+  let c = p.get(at);
+  if c < 192u8 {
+    if c >= 97u8 && c <= 122u8 {
+      p.set(at, c ^ 32u8);
+    }
+    return 1;
+  }
+  if c < 224u8 {
+    if at + 1 < p.len() {
+      p.set(at + 1, p.get(at + 1) ^ 32u8);
+    }
+    return 2;
+  }
+  if at + 2 < p.len() {
+    p.set(at + 2, p.get(at + 2) ^ 5u8);
+  }
+  return 3;
+}

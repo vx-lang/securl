@@ -25,7 +25,8 @@ time limits of reads, and `/huge-chunk` sends a chunk size too large for 64 bits
 `ENDLESS` send a status line, a header, a chunk-size line or a trailer that never ends, and
 `/chunk-junk` a chunk with no CRLF after its data. The paths of `ENCODED` send a body with a
 Content-Encoding for `--compressed`; with Python 3.14 or later, which has `compression.zstd`,
-they include zstd bodies. `/sts?VALUE` sends a Strict-Transport-Security header with
+they include zstd bodies, and with the brotli library of the system (libbrotlienc), brotli bodies.
+`/sts?VALUE` sends a Strict-Transport-Security header with
 the decoded VALUE, for `--hsts`.
 
 It runs until it is killed.
@@ -87,6 +88,35 @@ if zstd:
         "/zstd-frames": ("zstd", zstd.compress(TEXT[:1000]) + _SKIP + zstd.compress(TEXT[1000:]),
                          False),
         "/zstd-gzip": ("zstd, gzip", gzip_bytes(_ZST), True),
+    })
+
+
+def brotli_bytes(data):
+    """`data` in brotli at quality 11 from libbrotlienc, or None without that library."""
+    import ctypes
+    try:
+        enc = ctypes.CDLL("libbrotlienc.so.1")
+    except OSError:
+        return None
+    enc.BrotliEncoderMaxCompressedSize.restype = ctypes.c_size_t
+    enc.BrotliEncoderMaxCompressedSize.argtypes = [ctypes.c_size_t]
+    enc.BrotliEncoderCompress.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_size_t,
+                                          ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t),
+                                          ctypes.c_char_p]
+    size = ctypes.c_size_t(enc.BrotliEncoderMaxCompressedSize(len(data)))
+    out = ctypes.create_string_buffer(size.value)
+    if not enc.BrotliEncoderCompress(11, 22, 0, len(data), data, ctypes.byref(size), out):
+        return None
+    return out.raw[:size.value]
+
+
+_BR = brotli_bytes(TEXT)
+if _BR:
+    ENCODED.update({
+        "/br": ("br", _BR, True),
+        "/br-cut": ("br", _BR[:len(_BR) // 2], False),
+        "/br-junk": ("br", _BR + b"junk", False),
+        "/br-gzip": ("br, gzip", gzip_bytes(_BR), True),
     })
 
 

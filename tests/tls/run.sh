@@ -406,6 +406,29 @@ else
   echo "skip zstd: python3 has no compression.zstd, or $curl has no zstd"
 fi
 
+# brotli, when the servers can make it and the curl under test has it.
+if python3 -I -c 'import ctypes; ctypes.CDLL("libbrotlienc.so.1")' 2> /dev/null \
+   && "$curl" -V | grep -q '^Features:.* brotli'; then
+  check "--compressed decodes br" 0 "203890" -s --compressed -w '%{size_delivered}' \
+    -o "$work/br" "http://127.0.0.1:$http/br"
+  if cmp -s "$work/br" "$work/gz"; then
+    echo "ok     to the last byte"
+  else
+    echo "FAIL   the brotli body differs"
+    fail=1
+  fi
+  check "  and br, gzip" 0 "203890" -s --compressed -w '%{size_delivered}' -o "$work/br" \
+    "http://127.0.0.1:$http/br-gzip"
+  check "a brotli body cut short" 61 "" -sS --compressed -o /dev/null \
+    "http://127.0.0.1:$http/br-cut"
+  stderr_has "  with curl's message" "Brotli stream ended before completion"
+  check "bytes after the brotli stream" 23 "" -sS --compressed -o /dev/null \
+    "http://127.0.0.1:$http/br-junk"
+  stderr_has "  with curl's message" "Failed writing received data to disk/application"
+else
+  echo "skip brotli: no libbrotlienc for python3, or $curl has no brotli"
+fi
+
 # --tr-encoding: gzip as a transfer coding. Without it, curl refuses one that it did not ask for.
 check "--tr-encoding decodes Transfer-Encoding: gzip" 0 "203890" -s --tr-encoding \
   -w '%{size_delivered}' -o "$work/te" "http://127.0.0.1:$http/te-gzip"
