@@ -102,6 +102,16 @@ check "a chunk-size line with no end" 56 "" -sS "http://127.0.0.1:$http/endless-
 check "a trailer with no end" 100 "" -sS "http://127.0.0.1:$http/endless-trailer"
 check "chunk data with no CRLF after it" 56 "hello" -sS "http://127.0.0.1:$http/chunk-junk"
 stderr_has "  with curl's message" "Malformed encoding found in chunked-encoding"
+# A body that ends when the connection closes is whole only when TLS ends it with its close
+# message. A plain TCP close or a reset could cut it, so they fail, as in curl.
+check "a body that TLS ends with close_notify" 0 "body until close" \
+  -sS --cacert "$certs/ca.pem" "https://localhost:$https/close-notify"
+check "a TLS body cut by a TCP close" 56 "body until close" \
+  -sS --cacert "$certs/ca.pem" "https://localhost:$https/close-cut"
+stderr_has "  with curl's message" "SSL routines::unexpected eof while reading"
+check "a TLS body cut by a reset" 56 "" \
+  -sS --cacert "$certs/ca.pem" "https://localhost:$https/close-reset"
+stderr_has "  with curl's message" "Recv failure: Connection reset by peer"
 check "-m stops a stalled body" 28 "" \
   -sS -m 1 -o "$work/stalled" "http://127.0.0.1:$http/stall"
 stderr_has "  with curl's message" "with 10 out of 100 bytes received"

@@ -33,7 +33,6 @@ extern "C" {
   fn TLS_client_method() -> *mut i8;
   fn SSL_CTX_new(method : *mut i8) -> *mut i8;
   fn SSL_CTX_free(ctx : *mut i8) -> void;
-  fn SSL_CTX_set_options(ctx : *mut i8, options : u64) -> u64;
   fn SSL_CTX_ctrl(ctx : *mut i8, cmd : i32, larg : i64, parg : *mut i8) -> i64;
   fn SSL_CTX_set_verify(ctx : *mut i8, mode : i32, callback : *mut i8) -> void;
   fn SSL_CTX_load_verify_file(ctx : *mut i8, file : *const i8) -> i32;
@@ -87,7 +86,6 @@ pub fn tls_library_version() -> Vec<u8> {
 }
 
 // Values from the OpenSSL headers.
-const SSL_OP_IGNORE_UNEXPECTED_EOF : u64 = 128u64;
 const SSL_CTRL_SET_MIN_PROTO_VERSION : i32 = 123;
 const SSL_CTRL_SET_TLSEXT_HOSTNAME : i32 = 55;
 const TLSEXT_NAMETYPE_HOST_NAME : i64 = 0i64;
@@ -298,9 +296,6 @@ impl TlsConfig {
       return Result<TlsConfig, TlsError>::Err(tls_error(CURLE_SSL_CONNECT_ERROR,
         lit("SSL: could not create a context")));
     }
-    // Some servers close the connection without the TLS close message. curl reads that as the
-    // end of the body, as browsers do.
-    let _options = unsafe { SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF) };
     let _min = unsafe {
       SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, 0 as *mut i8)
     };
@@ -596,12 +591,23 @@ impl NetStream {
       if e == SSL_ERROR_ZERO_RETURN {
         return Result<u64, TlsError>::Ok(0u64);
       }
+      // Only the TLS close message (SSL_ERROR_ZERO_RETURN above) ends the stream. When the
+      // connection closes without it, a body that ends with the connection could be cut, so
+      // this is an error, as in curl: OpenSSL 3 reports "unexpected eof while reading".
       let detail = openssl_error_text();
       if e == SSL_ERROR_SYSCALL && detail.len() == 0 {
-        // The peer closed the socket with no TLS close message.
-        return Result<u64, TlsError>::Ok(0u64);
+        // No reason from OpenSSL: the socket failed, or (in OpenSSL before 3) it closed.
+        if r < 0 {
+          return Result<u64, TlsError>::Err(tls_error(CURLE_RECV_ERROR,
+            lit("Recv failure: Connection reset by peer")));
+        }
+        return Result<u64, TlsError>::Err(tls_error(CURLE_RECV_ERROR,
+          lit("Connection closed abruptly")));
       }
+      // curl's text: "OpenSSL SSL_read: OpenSSL/3.5.9: error:0A000126:...".
       let mut m = lit("OpenSSL SSL_read: ");
+      push_bytes(&mut m, &tls_library_version());
+      push_bytes(&mut m, &lit(": "));
       push_bytes(&mut m, &detail);
       return Result<u64, TlsError>::Err(tls_error(CURLE_RECV_ERROR, m));
     }

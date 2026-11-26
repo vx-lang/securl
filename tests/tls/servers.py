@@ -24,6 +24,7 @@ import os
 import socket
 import socketserver
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -83,6 +84,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except ConnectionError:
                 # curl-vx hung up at its limit, as it should.
                 pass
+        elif self.path in ("/close-notify", "/close-cut", "/close-reset"):
+            # A body that ends when the connection closes: no Content-Length, not chunked. The
+            # three paths close in three ways: with the TLS close message (close_notify), with
+            # a plain TCP close and no close message, and with a TCP reset.
+            self.close_connection = True
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody until close\n")
+            self.wfile.flush()
+            sock = self.connection
+            if self.path == "/close-notify" and isinstance(sock, ssl.SSLSocket):
+                sock.settimeout(2)
+                try:
+                    sock.unwrap()
+                except (OSError, ssl.SSLError):
+                    pass
+            elif self.path == "/close-reset":
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            sock.close()
         elif self.path == "/chunk-junk":
             # A chunk whose data does not end with CRLF.
             self.send_response(200)

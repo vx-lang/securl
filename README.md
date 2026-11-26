@@ -55,7 +55,7 @@ Vx main d3ed6cf0b.
 |---|---|
 | The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for curl-vx | 372 of 720 (52%) |
 | The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 348 of 419 (83%) |
-| TLS, time-limit and size-limit tests against local servers (`tests/tls`) | 31 of 31 |
+| TLS, time-limit and size-limit tests against local servers (`tests/tls`) | 36 of 36 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 7 of 7 |
 
@@ -73,11 +73,11 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/curlvx/` (the package with all protocol code) | 8,548 | none, and `--no-trusted-code` enforces this |
+| `src/curlvx/` (the package with all protocol code) | 8,599 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx`, `src/disk.vx` | 618 | none |
-| `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 902 | 39 `extern` functions, 56 `unsafe` blocks |
+| `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 908 | 38 `extern` functions, 55 `unsafe` blocks |
 
-Of the trusted code in `src/sys/`, 82 of the 95 items are the OpenSSL bindings: TLS (with the
+Of the trusted code in `src/sys/`, 80 of the 93 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
 `hash.vx`.
 `core` and `std` have trusted code too: the audit counts 965 `unsafe` blocks and 77 `extern`
