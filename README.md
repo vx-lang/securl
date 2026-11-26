@@ -44,7 +44,7 @@ LLVM_BIN  = /usr/lib/llvm-22/bin
 
 ```sh
 make            # builds OpenSSL once (build/openssl), then build/curl-vx
-make audit      # lists the trusted code
+make audit      # lists the trusted code, and checks that no code outside src/sys makes a raw pointer
 make unit       # unit tests
 make test-tls   # HTTPS and time-limit tests against local servers (needs python3)
 make test-h2    # HTTP/2 tests against a local server (makes a virtualenv with h2 from PyPI)
@@ -86,6 +86,13 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 Of the trusted code in `src/sys/`, 80 of the 93 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
 `hash.vx`.
+Two safe functions of `sys` read through a raw pointer with no check, `lit` and `push_lit`,
+because a Vx string literal is a `*const i8` with no length yet
+([Vx#532](https://github.com/vx-lang/Vx/issues/532)). They are correct for a literal. So that a
+literal stays the only pointer that the other packages can have, `tools/check-no-pointers.sh`
+refuses `as_mut_ptr`, `as_ptr`, pointer casts and `core::ptr` outside `src/sys`. Each build,
+`make audit` and the GitHub workflow in `.github/workflows/checks.yml` run it.
+
 `core` and `std` have trusted code too: the audit counts 965 `unsafe` blocks and 77 `extern`
 functions in the modules that the program uses. That is the trusted base of the language, as
 Rust's `std` is for a Rust program. OpenSSL itself is C.
@@ -298,4 +305,5 @@ LICENSE              curl's license, with the copyright of curl-vx and of curl
 tests/unit/          unit tests of the parsers
 tests/tls/           HTTPS tests against local servers, with test certificates
 tests/run-curl-tests.sh   runs curl's runtests.pl against build/curl-vx
+tools/check-no-pointers.sh  refuses code that makes a raw pointer outside src/sys
 ```

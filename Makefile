@@ -52,10 +52,14 @@ all: build/curl-vx
 
 build/curl-vx: $(SRCS) $(TLS_DEPS)
 	@mkdir -p build
+	tools/check-no-pointers.sh
 	PATH="$(LLVM_BIN):$$PATH" $(VXC) $(PKGS) -c src/main.vx -o build/curl-vx.o
 	cc build/curl-vx.o $(TLS_LIBS) $(LIBS) -o $@
 
+# The trusted code of the program, and the check that the code with no trusted code makes no
+# raw pointer (see tools/check-no-pointers.sh).
 audit:
+	tools/check-no-pointers.sh
 	PATH="$(LLVM_BIN):$$PATH" $(VXC) $(PKGS) --audit src/main.vx
 
 unit: $(TLS_DEPS)
