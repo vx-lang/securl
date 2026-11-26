@@ -56,7 +56,7 @@ make test-h2    # HTTP/2 tests against a local server (makes a virtualenv with h
 
 Measured with curl's own test suite: curl's `runtests.pl` and its test servers, pointed at
 `build/securl` with `-c`. The tests come from curl commit 2f5c657, and the compiler is vxc from
-Vx main 860f9f31a.
+Vx main 973d80f9b.
 
 | Test set | Passed |
 |---|---|
@@ -89,11 +89,11 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 | Part | Lines | Trusted code |
 |---|---|---|
 | `src/securl/` (the package with all protocol code) | 11,558 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 888 | none, and `--no-trusted-code` enforces this |
-| `src/main.vx` (hands `Root` to `cli`) | 11 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
-| `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,576 | 54 `extern` functions, 108 `unsafe` blocks |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 922 | none, and `--no-trusted-code` enforces this |
+| `src/main.vx` (hands `Root` and the command line to `cli`) | 13 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
+| `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,499 | 52 `extern` functions, 103 `unsafe` blocks |
 
-Of the trusted code in `src/sys/`, 132 of the 162 items are the OpenSSL bindings: TLS (with the
+Of the trusted code in `src/sys/`, 132 of the 155 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
 `hash.vx`.
 Two safe functions of `sys` read through a raw pointer with no check, `lit` and `push_lit`,
@@ -103,7 +103,7 @@ literal stays the only pointer that the other packages can have, `tools/check-no
 refuses `as_mut_ptr`, `as_ptr`, pointer casts and `core::ptr` outside `src/sys`. Each build,
 `make audit` and the GitHub workflow in `.github/workflows/checks.yml` run it.
 
-`core` and `std` have trusted code too: the audit counts 978 `unsafe` blocks and 83 `extern`
+`core` and `std` have trusted code too: the audit counts 994 `unsafe` blocks and 89 `extern`
 functions in the modules that the program uses. That is the trusted base of the language, as
 Rust's `std` is for a Rust program. OpenSSL itself is C.
 
@@ -339,7 +339,11 @@ The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #
   and the flat blocks stay because they read as well.
 - [#4005](https://github.com/vx-lang/Vx/issues/4005) No safe way to make a `String` from bytes,
   to write a `Vec<u8>` to standard output, to copy the bytes of a string literal, or to read an
-  environment variable. Vx PR #3975 adds `root.args`. `src/sys/` wraps each of these.
+  environment variable. Vx main has since added `String::to_bytes` (#4122), the command line
+  as a parameter of `main` (#4123), and rights to standard input and output (#4130). securl
+  uses the first two, so it reads its command line and the environment with no trusted code.
+  `src/sys/console.vx` still writes to standard output, and `src/sys/text.vx` still copies
+  string literals.
 - [#4001](https://github.com/vx-lang/Vx/issues/4001) The flat code generator declines `?` on a
   `Result` of a struct with an `Option` field, so securl compiles through the older AST path.
 - [#4002](https://github.com/vx-lang/Vx/issues/4002), [#4003](https://github.com/vx-lang/Vx/issues/4003),

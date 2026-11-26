@@ -12,9 +12,9 @@ import std::env;
 import std::fs;
 import std::net;
 import std::root;
+import std::string;
 import std::vec;
 import sys::console;
-import sys::env;
 import sys::hash;
 import sys::text;
 import sys::tls;
@@ -33,6 +33,39 @@ import securl::url;
 import securl::writeout;
 import disk::files;
 import sys::files;
+
+/// The words of the command line after the program name, as bytes, which securl parses as curl
+/// does.
+fn words_of(args : &Vec<String>) -> Vec<Vec<u8>> {
+  let mut out = Vec<Vec<u8>>::new();
+  let mut i = 1;
+  while i < args.len() {
+    out.push(args.get_ref(i).to_bytes());
+    i = i + 1;
+  }
+  return out;
+}
+
+/// The value of the environment variable `name`, a string literal. Gives an empty list when the
+/// variable is not set, is empty, or is not UTF-8. curl takes an empty variable as one that is
+/// not set too.
+fn env_var(env : &Environment, name : *const i8) -> Vec<u8> {
+  match String::from_utf8(&lit(name)) {
+    Result<String, Utf8Error>::Ok(key) => {
+      match env.var(&key) {
+        Result<String, EnvError>::Ok(value) => {
+          return value.to_bytes();
+        },
+        Result<String, EnvError>::Err(_e) => {
+          return Vec<u8>::new();
+        }
+      }
+    },
+    Result<String, Utf8Error>::Err(_e) => {
+      return Vec<u8>::new();
+    }
+  }
+}
 
 /// Add the environment variable `name` to `out` when it has a value.
 fn add_env(out : &mut Vec<EnvVar>, env : &Environment, name : *const i8) -> void {
@@ -74,10 +107,11 @@ fn proxy_env(env : &Environment) -> Vec<EnvVar> {
   return out;
 }
 
-/// The program, with the rights of `main`. It gives the exit code of curl.
-pub fn tool_main(root : Root) -> i32 {
+/// The program, with the rights of `main` and the words of its command line. It gives the exit
+/// code of curl.
+pub fn tool_main(root : Root, command_line : Vec<String>) -> i32 {
   ignore_sigpipe();
-  let args = args();
+  let args = words_of(&command_line);
   match parse_args(&args) {
     Result<Config, Failure>::Ok(parsed) => {
       let mut cfg = parsed;

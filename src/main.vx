@@ -1,11 +1,14 @@
 // securl: the curl command-line tool, written in Vx.
 //
 // `main` is the only function that gets the rights of the program, in `root`, and it hands
-// them to `tool_main` in the package `cli`. This file is the one file outside a package, so it
-// is the only code that `--no-trusted-code` cannot check. Keep it this small.
+// them and the words of the command line to `tool_main` in the package `cli`. This file is the
+// one file outside a package, so it is the only code that `--no-trusted-code` cannot check.
+// Keep it this small.
 import std::root;
+import std::string;
+import std::vec;
 import cli::tool;
 
-fn main(root : Root) -> i32 {
-  return tool_main(root);
+fn main(root : Root, args : Vec<String>) -> i32 {
+  return tool_main(root, args);
 }
