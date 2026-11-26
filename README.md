@@ -78,10 +78,10 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 8,728 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 8,743 | none, and `--no-trusted-code` enforces this |
 | `src/cli/` (the tool) and `src/disk/` (its files) | 619 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` to `cli`) | 11 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
-| `src/sys/` (OpenSSL calls, socket options and time limits, shims for what `std` lacks) | 937 | 38 `extern` functions, 56 `unsafe` blocks |
+| `src/sys/` (OpenSSL calls, socket options and time limits, shims for what `std` lacks) | 922 | 38 `extern` functions, 56 `unsafe` blocks |
 
 Of the trusted code in `src/sys/`, 80 of the 94 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
@@ -129,10 +129,10 @@ give exit code 28 with curl's messages: `Connection timed out after N millisecon
 name has no time limit yet.
 
 The package `securl` turns each limit into a deadline (`std::time::Instant`) for the connection.
-A socket call in `src/sys/tls.vx` runs in `std::sync::wait::within` until that deadline, so the
-runtime of Vx ends the wait. The TLS code polls in slices of 20 ms and checks the clock between
-them. `within` takes a closure. The calls are in `src/sys` and not in `securl` only because of a
-Vx bug (below).
+Each socket call runs in `std::sync::wait::within` until that deadline, so the runtime of Vx
+ends the wait: the connect in `src/securl/conn.vx`, and the reads and writes of a plain
+connection in `src/sys/tls.vx`, which holds the TCP stream of a TLS connection too. The TLS code
+polls in slices of 20 ms and checks the clock between them.
 
 ## HTTP/2
 
@@ -249,8 +249,8 @@ In order of how much users need them:
 
 ## Vx issues found while writing securl
 
-The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #4026) and #3999
-(with #4028), and securl no longer works around them.
+The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #4026), #3999
+(with #4028) and #4092 (with #4094), and securl no longer works around them.
 
 - [#3998](https://github.com/vx-lang/Vx/issues/3998) Compile time grew about 2x with each link
   of an `else if` chain. `options.vx` uses flat `if .. { return }` blocks. Vx #4024 fixed it,
@@ -264,10 +264,6 @@ The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #
   [#4004](https://github.com/vx-lang/Vx/issues/4004): a reference cannot be pointed at another
   field, `assert(false, ..)` fails at compile time on a path that never runs, and there is no
   `ref mut` pattern or `Option::as_mut`.
-- [#4092](https://github.com/vx-lang/Vx/issues/4092) `--no-trusted-code` takes the body of each
-  closure for an `unsafe` block (E5003), while `--audit` lists nothing for it. So the package
-  `securl` cannot pass a closure to `std::sync::wait::within`, and `src/sys/tls.vx` holds those
-  calls.
 
 ## License
 

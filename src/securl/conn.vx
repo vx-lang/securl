@@ -4,6 +4,7 @@ import core::option;
 import core::result;
 import std::net;
 import std::string;
+import std::sync::wait;
 import std::time;
 import std::vec;
 import sys::socket;
@@ -35,6 +36,20 @@ struct SocketOptions {
   idle : i32,
   interval : i32,
   count : i32,
+}
+
+/// Connect to `address`, written as `host:port`, and give up at `deadline`.
+pub fn connect_by(network : &Network, address : &String, deadline : Instant)
+-> Result<TcpStream, NetError> {
+  if deadline == Instant::never() {
+    return TcpStream::connect(network, address);
+  }
+  if past_deadline(deadline) {
+    return Result<TcpStream, NetError>::Err(NetError::Cancelled);
+  }
+  return within(deadline - Instant::now(), || -> Result<TcpStream, NetError> {
+    return TcpStream::connect(network, address);
+  });
 }
 
 /// The failure of curl for a TLS or socket error.

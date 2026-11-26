@@ -16,8 +16,7 @@
 // `TcpStream` runs in `std::sync::wait::within`, so it gives `NetError::Cancelled` at the
 // deadline. `poll` does not know the deadline, so this file polls in short slices and checks
 // the clock between them. A wait that passes the deadline gives `CURLE_OPERATION_TIMEDOUT`.
-// (The calls of `within` are here and not in `securl` because of a bug of Vx: the compiler
-// takes each closure body for an `unsafe` block, which `--no-trusted-code` refuses.)
+// The connect, before there is a `NetStream`, is in `securl::conn`.
 import core::option;
 import core::ptr;
 import core::result;
@@ -181,20 +180,6 @@ fn wait_for(fd : i32, events : i32, deadline : Instant) -> bool {
       return true;
     }
   }
-}
-
-/// Connect to `address`, written as `host:port`, and give up at `deadline`.
-pub fn connect_by(network : &Network, address : &String, deadline : Instant)
--> Result<TcpStream, NetError> {
-  if deadline == Instant::never() {
-    return TcpStream::connect(network, address);
-  }
-  if past_deadline(deadline) {
-    return Result<TcpStream, NetError>::Err(NetError::Cancelled);
-  }
-  return within(deadline - Instant::now(), || -> Result<TcpStream, NetError> {
-    return TcpStream::connect(network, address);
-  });
 }
 
 /// `tcp.read(buffer)`, which gives up at `deadline`.
