@@ -20,6 +20,8 @@ of 127.0.0.1, and writes them to PORT_FILE as "tls plain". The paths:
   /small-frames   SETTINGS_MAX_FRAME_SIZE stays 16384, and the body comes in 100-byte frames
   /ping           a PING before the response
   /goaway         GOAWAY (last stream 1) after the response
+  /endless-continuation  a header block whose CONTINUATION frames never end: 4 MiB of them,
+                  and then the server waits
 """
 import hashlib
 import os
@@ -27,6 +29,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 
 import h2.config
 import h2.connection
@@ -149,6 +152,22 @@ def serve(conn, sock, stream, head, body):
     elif path == "/ping":
         conn.ping(b"12345678")
         respond(conn, sock, stream, 200, [], b"after a ping\n")
+    elif path == "/endless-continuation":
+        # Raw frames, past the state machine of h2: HEADERS with ":status: 200" (index 8 of
+        # the static table) and no END_HEADERS, then CONTINUATION frames with no END_HEADERS.
+        def frame(kind, payload):
+            return (len(payload).to_bytes(3, "big") + bytes([kind, 0])
+                    + stream.to_bytes(4, "big") + payload)
+        sock.sendall(conn.data_to_send())
+        sock.sendall(frame(1, b"\x88"))
+        try:
+            for _ in range(256):
+                sock.sendall(frame(9, b"\x00" * 16384))
+            time.sleep(30)
+        except OSError:
+            # curl-vx hung up at its limit, as it should.
+            pass
+        return
     elif path == "/goaway":
         respond(conn, sock, stream, 200, [], b"then goaway\n")
         conn.close_connection(last_stream_id=1)

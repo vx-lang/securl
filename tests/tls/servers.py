@@ -13,7 +13,9 @@ It starts four servers on free ports of 127.0.0.1 and writes their ports to PORT
 - a server that accepts connections and never sends a byte, for the time limits of TLS.
 
 On both HTTP servers, `/stall` sends 10 of the 100 bytes of its body and then waits, for the
-time limits of reads, and `/huge-chunk` sends a chunk size too large for 64 bits.
+time limits of reads, and `/huge-chunk` sends a chunk size too large for 64 bits. The paths of
+`ENDLESS` send a status line, a header, a chunk-size line or a trailer that never ends, and
+`/chunk-junk` a chunk with no CRLF after its data.
 
 It runs until it is killed.
 """
@@ -27,6 +29,15 @@ import threading
 import time
 
 CERT_DIR, PORT_FILE, PROXY_LOG = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+# The paths whose response never ends a line, and the bytes before the endless line.
+ENDLESS = {
+    "/endless-status": b"HTTP/1.1 200 ",
+    "/endless-header": b"HTTP/1.1 200 OK\r\nX-Long: ",
+    "/endless-chunk-line": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;",
+    "/endless-trailer": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-T: ",
+}
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -60,6 +71,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             self.wfile.write(b"8000000000000000\r\nhello\r\n0\r\n\r\n")
+        elif self.path in ENDLESS:
+            # A response that never ends a line: 4 MiB with no newline, and then the server
+            # waits. curl-vx must give up at its limit, not read on and wait.
+            try:
+                self.wfile.write(ENDLESS[self.path])
+                for _ in range(64):
+                    self.wfile.write(b"x" * 65536)
+                self.wfile.flush()
+                time.sleep(30)
+            except ConnectionError:
+                # curl-vx hung up at its limit, as it should.
+                pass
+        elif self.path == "/chunk-junk":
+            # A chunk whose data does not end with CRLF.
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"5\r\nhelloXY0\r\n\r\n")
         elif self.path == "/stall":
             self.send_response(200)
             self.send_header("Content-Length", "100")

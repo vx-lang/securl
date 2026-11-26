@@ -94,6 +94,14 @@ fi
 check "a chunk size of 2^63" 56 "" \
   -sS "http://127.0.0.1:$http/huge-chunk"
 stderr_has "  with curl's message" "invalid chunk size: '8000000000000000'"
+# A peer that never ends a line must not make curl-vx read on: each line has a limit.
+check "a status line with no end" 100 "" -sS "http://127.0.0.1:$http/endless-status"
+stderr_has "  with curl's message" "Too large response headers"
+check "a header line with no end" 100 "" -sS "http://127.0.0.1:$http/endless-header"
+check "a chunk-size line with no end" 56 "" -sS "http://127.0.0.1:$http/endless-chunk-line"
+check "a trailer with no end" 100 "" -sS "http://127.0.0.1:$http/endless-trailer"
+check "chunk data with no CRLF after it" 56 "hello" -sS "http://127.0.0.1:$http/chunk-junk"
+stderr_has "  with curl's message" "Malformed encoding found in chunked-encoding"
 check "-m stops a stalled body" 28 "" \
   -sS -m 1 -o "$work/stalled" "http://127.0.0.1:$http/stall"
 stderr_has "  with curl's message" "with 10 out of 100 bytes received"

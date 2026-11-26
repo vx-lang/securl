@@ -116,6 +116,10 @@ struct Frame {
   payload : Vec<u8>,
 }
 
+// The largest header block, with its CONTINUATION frames, that curl-vx reads. It is the limit
+// of the decoded fields in hpack.vx.
+const MAX_HEADER_BLOCK : i32 = 1048576;
+
 fn h2_fail(message : *const i8) -> Failure {
   return fail_lit(HTTP2_ERROR, message);
 }
@@ -330,6 +334,11 @@ fn read_header_block(h : &mut H2, c : &mut Conn, first : &Frame)
     let f = read_frame(c)?;
     if f.kind != FRAME_CONTINUATION || f.stream != first.stream {
       return Result<Vec<HeaderField>, Failure>::Err(h2_fail("HTTP/2: expected CONTINUATION"));
+    }
+    // A server that sends CONTINUATION frames with no end must not fill the memory. The
+    // decoded fields have a limit of 1 MiB, so a compressed block of more is too large too.
+    if block.len() + f.payload.len() > MAX_HEADER_BLOCK {
+      return Result<Vec<HeaderField>, Failure>::Err(h2_fail("HTTP/2: header block too large"));
     }
     append(&mut block, &f.payload);
     done = (f.flags & FLAG_END_HEADERS) != 0;

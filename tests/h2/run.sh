@@ -73,6 +73,8 @@ check "PING before the response" 0 "after a ping" -sS $ca "$base/ping"
 check "GOAWAY after the response" 0 "then goaway" -sS $ca "$base/goaway"
 check "RST_STREAM" 92 "" -sS $ca "$base/reset"
 has "  with curl's message" "HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR (err 2)" "$work/stderr"
+check "CONTINUATION frames with no end" 16 "" -sS $ca "$base/endless-continuation"
+has "  stop at the limit" "HTTP/2: header block too large" "$work/stderr"
 check "redirect with -L" 0 "hello over h2
 1" -sSL $ca -w '%{num_redirects}' "$base/redirect"
 "$curl" -sS $ca -i "$base/trailers" > "$work/trailers" 2>&1

@@ -55,14 +55,16 @@ Vx main d3ed6cf0b.
 |---|---|
 | The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for curl-vx | 372 of 720 (52%) |
 | The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 348 of 419 (83%) |
-| TLS and time-limit tests against local servers (`tests/tls`) | 24 of 24 |
-| HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 23 of 23 |
+| TLS, time-limit and size-limit tests against local servers (`tests/tls`) | 31 of 31 |
+| HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 25 of 25 |
 | Unit tests (`tests/unit`) | 7 of 7 |
 
 Some HTTP tests have the keyword `libtest` or `unittest`. For those, runtests.pl runs a C
 program of the curl build, linked with curl's own libcurl, so they never run curl-vx.
 `tests/run-curl-tests.sh` and `tests/scan-supported-tests.py` leave them out. Until 2026-11-26
 the counts above included them by mistake: 152 of them passed, and the table said 522 of 874.
+Test 1070 depends on timing: it passes in about one run of four, with and without recent
+changes.
 
 The C build of the test suite has OpenSSL, so that runtests.pl runs the Digest tests (see "Run
 curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tests too.
@@ -71,7 +73,7 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/curlvx/` (the package with all protocol code) | 8,510 | none, and `--no-trusted-code` enforces this |
+| `src/curlvx/` (the package with all protocol code) | 8,548 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx`, `src/disk.vx` | 618 | none |
 | `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 902 | 39 `extern` functions, 56 `unsafe` blocks |
 

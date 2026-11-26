@@ -247,7 +247,8 @@ fn connect_address(cfg : &Config, u : &Url) -> Result<Vec<u8>, Failure> {
 }
 
 // The limits of libcurl for response headers: one header line, all headers of one response,
-// and the number of headers.
+// and the number of headers. The status line and the lines of a chunked body have the limit of
+// a header line too.
 const MAX_HEADER_LINE : i32 = 102400;
 const MAX_HEADERS_SIZE : i64 = 307200i64;
 const MAX_HEADER_COUNT : i32 = 5000;
@@ -257,7 +258,7 @@ const MAX_HEADER_COUNT : i32 = 5000;
 fn read_head(c : &mut Conn, raw : bool, total : &mut i64) -> Result<ResponseHead, Failure> {
   let mut head = empty_head();
   let mut line = Vec<u8>::new();
-  let n = c.read_line(&mut line)?;
+  let n = c.read_line(&mut line, MAX_HEADER_LINE, TOO_LARGE, "Too large response headers")?;
   if n == 0 {
     return Result<ResponseHead, Failure>::Err(fail_lit(GOT_NOTHING, "Empty reply from server"));
   }
@@ -273,7 +274,7 @@ fn read_head(c : &mut Conn, raw : bool, total : &mut i64) -> Result<ResponseHead
   let mut index = 1;
   loop {
     let mut h = Vec<u8>::new();
-    let got = c.read_line(&mut h)?;
+    let got = c.read_line(&mut h, MAX_HEADER_LINE, TOO_LARGE, "Too large response headers")?;
     if got == 0 {
       // The peer closed the connection inside the headers.
       return Result<ResponseHead, Failure>::Ok(head);
@@ -344,7 +345,8 @@ fn read_chunked(c : &mut Conn, out : &mut Output, info : &mut TransferInfo, trai
 raw : bool) -> Result<i32, Failure> {
   loop {
     let mut line = Vec<u8>::new();
-    let n = c.read_line(&mut line)?;
+    let n = c.read_line(&mut line, MAX_HEADER_LINE, RECV_ERROR,
+      "Illegal or missing hexadecimal sequence in chunked-encoding")?;
     if n == 0 {
       return Result<i32, Failure>::Err(fail_lit(PARTIAL_FILE,
         "transfer closed with outstanding read data remaining"));
@@ -372,9 +374,14 @@ raw : bool) -> Result<i32, Failure> {
       return Result<i32, Failure>::Err(bad_chunk());
     }
     if size == 0i64 {
+      let mut trailer_size : i64 = 0i64;
       loop {
         let mut t = Vec<u8>::new();
-        let got = c.read_line(&mut t)?;
+        let got = c.read_line(&mut t, MAX_HEADER_LINE, TOO_LARGE, "Too large response headers")?;
+        trailer_size = trailer_size + (got as i64);
+        if trailer_size > MAX_HEADERS_SIZE {
+          return Result<i32, Failure>::Err(fail_lit(TOO_LARGE, "Too large response headers"));
+        }
         if raw {
           let _w = out.write(&t)?;
         }
@@ -387,10 +394,19 @@ raw : bool) -> Result<i32, Failure> {
       }
     }
     let _copied = read_length(c, size, out, info)?;
+    // The data of a chunk ends with CRLF, as curl requires. Any other byte there is an error.
     let mut end = Vec<u8>::new();
-    let _n = c.read_line(&mut end)?;
+    let got = c.read_line(&mut end, 2, RECV_ERROR, "Malformed encoding found in chunked-encoding")?;
     if raw {
       let _w = out.write(&end)?;
+    }
+    if got == 0 {
+      return Result<i32, Failure>::Err(fail_lit(PARTIAL_FILE,
+        "transfer closed with outstanding read data remaining"));
+    }
+    if !eq_lit(&end, "\r\n") && !eq_lit(&end, "\n") {
+      return Result<i32, Failure>::Err(fail_lit(RECV_ERROR,
+        "Malformed encoding found in chunked-encoding"));
     }
   }
 }

@@ -150,8 +150,10 @@ impl Conn {
 
   /// Add the next line, with its `\n`, to the end of `line`, and give how many bytes it added.
   /// The last line before the peer closes can have no `\n`. 0 means that the peer closed the
-  /// connection first.
-  pub fn read_line(self : &mut Conn, line : &mut Vec<u8>) -> Result<i32, Failure> {
+  /// connection first. A line longer than `max` bytes fails with `code` and `message` as soon
+  /// as it passes `max`, so that a peer that never sends a `\n` cannot fill the memory.
+  pub fn read_line(self : &mut Conn, line : &mut Vec<u8>, max : i32, code : i32,
+  message : *const i8) -> Result<i32, Failure> {
     let mut count = 0;
     loop {
       if self.start == self.end {
@@ -169,6 +171,9 @@ impl Conn {
       append_range(line, &self.buffer, self.start, stop);
       count = count + (stop - self.start);
       self.start = stop;
+      if count > max {
+        return Result<i32, Failure>::Err(fail_lit(code, message));
+      }
       if found {
         return Result<i32, Failure>::Ok(count);
       }
