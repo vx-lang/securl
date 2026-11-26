@@ -1,0 +1,503 @@
+// The curl command-line tool: read the command line, run the transfers, write the results.
+//
+// `tool_main` gets the rights of the program from `main`, in `root`. It gives the network
+// right only to the transfer, and it keeps the right to open files for itself: it reads the
+// files that the command line names and opens the output files. So the parsers of the command
+// line, of URLs and of responses can neither open a file nor a connection, and the compiler
+// checks that.
+import core::option;
+import core::result;
+import std::fs;
+import std::net;
+import std::root;
+import std::vec;
+import sys::console;
+import sys::env;
+import sys::hash;
+import sys::text;
+import sys::tls;
+import curlvx::body;
+import curlvx::encode;
+import curlvx::bytes;
+import curlvx::cookie;
+import curlvx::failure;
+import curlvx::form;
+import curlvx::http;
+import curlvx::options;
+import curlvx::output;
+import curlvx::fetch;
+import curlvx::url;
+import curlvx::writeout;
+import disk::files;
+
+/// The program, with the rights of `main`. It gives the exit code of curl.
+pub fn tool_main(root : Root) -> i32 {
+  ignore_sigpipe();
+  let args = args();
+  match parse_args(&args) {
+    Result<Config, Failure>::Ok(cfg) => {
+      return run(&root.network, &root.files, &cfg);
+    },
+    Result<Config, Failure>::Err(f) => {
+      let mut m = lit("curl: ");
+      append(&mut m, &f.message);
+      push_lit(&mut m, "\ncurl: try 'curl --help' for more information\n");
+      to_stderr(&m);
+      return f.code;
+    }
+  }
+}
+
+/// Print `curl: (code) message` unless `-s` asks for silence and `-S` does not bring errors
+/// back.
+fn report(cfg : &Config, f : &Failure) -> void {
+  if cfg.silent && !cfg.show_error {
+    return;
+  }
+  let mut m = lit("curl: (");
+  push_i64(&mut m, f.code as i64);
+  push_lit(&mut m, ") ");
+  append(&mut m, &f.message);
+  push_lit(&mut m, "\n");
+  to_stderr(&m);
+}
+
+fn print_version() -> void {
+  let mut m = lit("curl ");
+  append(&mut m, &curl_vx_version());
+  push_lit(&mut m, " (x86_64-pc-linux-gnu) libcurl-vx/");
+  append(&mut m, &curl_vx_version());
+  push_lit(&mut m, " ");
+  append(&mut m, &tls_library_version());
+  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: HTTP2 IPv6 Largefile SSL\n");
+  let _ok = write_stdout(&m);
+}
+
+fn print_help() -> void {
+  let mut m = Vec<u8>::new();
+  push_lit(&mut m, "Usage: curl [options...] <url>\n");
+  push_lit(&mut m, "curl-vx: the curl tool for HTTP/1.1 and HTTPS, written in Vx. Options:\n");
+  push_lit(&mut m, " -d, --data <data>          HTTP POST data (--data-ascii, --data-raw, --data-binary)\n");
+  push_lit(&mut m, "     --data-urlencode <data> HTTP POST data, URL-encoded\n");
+  push_lit(&mut m, "     --json <data>          HTTP POST JSON\n");
+  push_lit(&mut m, " -F, --form <name=content>  Specify multipart MIME data\n");
+  push_lit(&mut m, "     --form-string <name=string> Specify multipart MIME data\n");
+  push_lit(&mut m, " -f, --fail                 Fail fast with no output on HTTP errors\n");
+  push_lit(&mut m, "     --fail-with-body       Fail on HTTP errors but save the body\n");
+  push_lit(&mut m, " -G, --get                  Put the post data in the URL and use GET\n");
+  push_lit(&mut m, " -H, --header <header>      Pass a custom header to the server\n");
+  push_lit(&mut m, " -I, --head                 Show document info only\n");
+  push_lit(&mut m, " -i, --include              Include response headers in the output\n");
+  push_lit(&mut m, " -k, --insecure             Allow insecure server connections\n");
+  push_lit(&mut m, "     --cacert <file>        CA certificate to verify peer against\n");
+  push_lit(&mut m, "     --capath <dir>         CA directory to verify peer against\n");
+  push_lit(&mut m, " -L, --location             Follow redirects\n");
+  push_lit(&mut m, "     --max-redirs <num>     Maximum number of redirects allowed\n");
+  push_lit(&mut m, " -o, --output <file>        Write to file instead of stdout\n");
+  push_lit(&mut m, " -O, --remote-name          Write output to a file named as the remote file\n");
+  push_lit(&mut m, "     --output-dir <dir>     Directory to save files in\n");
+  push_lit(&mut m, " -D, --dump-header <file>   Write the received headers to <file>\n");
+  push_lit(&mut m, " -s, --silent               Silent mode\n");
+  push_lit(&mut m, " -S, --show-error           Show error even when -s is used\n");
+  push_lit(&mut m, " -T, --upload-file <file>   Transfer local FILE to destination\n");
+  push_lit(&mut m, " -u, --user <user:password> Server user and password\n");
+  push_lit(&mut m, "     --digest               HTTP Digest Authentication\n");
+  push_lit(&mut m, "     --basic                HTTP Basic Authentication (the default)\n");
+  push_lit(&mut m, "     --anyauth              Pick any authentication method\n");
+  push_lit(&mut m, " -A, --user-agent <name>    Send User-Agent <name> to server\n");
+  push_lit(&mut m, " -e, --referer <URL>        Referrer URL\n");
+  push_lit(&mut m, " -b, --cookie <data|filename> Send cookies from string/load from file\n");
+  push_lit(&mut m, " -c, --cookie-jar <filename> Save cookies to <filename> after operation\n");
+  push_lit(&mut m, " -j, --junk-session-cookies Ignore session cookies read from file\n");
+  push_lit(&mut m, " -r, --range <range>        Retrieve only the bytes within RANGE\n");
+  push_lit(&mut m, " -v, --verbose              Make the operation more talkative\n");
+  push_lit(&mut m, " -w, --write-out <format>   Use output FORMAT after completion\n");
+  push_lit(&mut m, " -X, --request <method>     Specify request method to use\n");
+  push_lit(&mut m, " -x, --proxy <proxy>        Use this HTTP proxy\n");
+  push_lit(&mut m, " -U, --proxy-user <u:p>     Proxy user and password\n");
+  push_lit(&mut m, "     --proxy-digest         Digest Authentication with the proxy\n");
+  push_lit(&mut m, "     --proxy-anyauth        Pick any proxy authentication method\n");
+  push_lit(&mut m, " -m, --max-time <seconds>   Maximum time allowed for transfer\n");
+  push_lit(&mut m, "     --connect-timeout <seconds> Maximum time allowed to connect\n");
+  push_lit(&mut m, "     --noproxy <hosts>      List of hosts which do not use a proxy\n");
+  push_lit(&mut m, "     --resolve <host:port:addr> Resolve the host+port to this address\n");
+  push_lit(&mut m, "     --connect-to <HOST1:PORT1:HOST2:PORT2> Connect to host\n");
+  push_lit(&mut m, " -0, --http1.0              Use HTTP 1.0\n");
+  push_lit(&mut m, "     --http1.1              Use HTTP/1.1\n");
+  push_lit(&mut m, "     --http2                Use HTTP/2 (the default over TLS)\n");
+  push_lit(&mut m, "     --http2-prior-knowledge Use HTTP/2 without HTTP/1.1 Upgrade\n");
+  push_lit(&mut m, " -h, --help                 Get help for commands\n");
+  push_lit(&mut m, " -V, --version              Show version number and quit\n");
+  let _ok = write_stdout(&m);
+}
+
+/// Open the output of transfer number `index`: a `-o` file, a `-O` file, or standard output.
+fn open_output(files : &Files, cfg : &Config, index : i32, url_text : &Vec<u8>)
+-> Result<Output, Failure> {
+  if index < cfg.outputs.len() {
+    let name = cfg.outputs.get_ref(index);
+    if eq_lit(name, "-") {
+      return Result<Output, Failure>::Ok(stdout_output());
+    }
+    let file = create_file(files, &in_output_dir(cfg, name))?;
+    return Result<Output, Failure>::Ok(file_output(file));
+  }
+  if cfg.remote_name_all || index - cfg.outputs.len() < cfg.remote_names {
+    let u = parse_url(url_text, cfg.path_as_is)?;
+    let name = remote_file_name(&u);
+    if name.len() == 0 {
+      return Result<Output, Failure>::Err(fail_lit(WRITE_ERROR,
+        "Remote filename has no length"));
+    }
+    let file = create_file(files, &in_output_dir(cfg, &name))?;
+    return Result<Output, Failure>::Ok(file_output(file));
+  }
+  return Result<Output, Failure>::Ok(stdout_output());
+}
+
+/// The path of an output file: inside `--output-dir` when the name is not absolute.
+fn in_output_dir(cfg : &Config, name : &Vec<u8>) -> Vec<u8> {
+  if !cfg.has_output_dir || (name.len() > 0 && name.get(0) == 47u8) {
+    return clone_bytes(name);
+  }
+  let mut out = clone_bytes(&cfg.output_dir);
+  if out.len() > 0 && out.get(out.len() - 1) != 47u8 {
+    out.push(47u8);
+  }
+  append(&mut out, name);
+  return out;
+}
+
+/// Open the output of `-D`, or an output that drops what it gets.
+fn open_header_output(files : &Files, cfg : &Config) -> Result<Output, Failure> {
+  if !cfg.has_dump_header {
+    return Result<Output, Failure>::Ok(null_output());
+  }
+  if eq_lit(&cfg.dump_header, "-") {
+    return Result<Output, Failure>::Ok(stdout_output());
+  }
+  let file = create_file(files, &cfg.dump_header)?;
+  return Result<Output, Failure>::Ok(file_output(file));
+}
+
+/// The URL of an upload: curl adds the name of the file when the URL ends in `/`.
+fn upload_url(url_text : &Vec<u8>, file_name : &Vec<u8>) -> Vec<u8> {
+  let mut out = clone_bytes(url_text);
+  if eq_lit(file_name, "-") || url_text.len() == 0 {
+    return out;
+  }
+  let slash = rfind_byte(file_name, 47u8);
+  let base = url_encode(&rest_from(file_name, slash + 1));
+  let scheme_end = find_seq(url_text, &lit("://"), 0);
+  let path_start = find_byte(url_text, 47u8, scheme_end + 3);
+  if scheme_end >= 0 && path_start < 0 {
+    push_lit(&mut out, "/");
+    append(&mut out, &base);
+    return out;
+  }
+  if url_text.get(url_text.len() - 1) == 47u8 {
+    append(&mut out, &base);
+  }
+  return out;
+}
+
+/// Run every transfer of the command line, and give the exit code.
+fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
+  if cfg.show_help {
+    print_help();
+    return 0;
+  }
+  if cfg.show_version {
+    print_version();
+    return 0;
+  }
+  if cfg.urls.len() == 0 {
+    to_stderr(&lit("curl: (2) no URL specified\ncurl: try 'curl --help' for more information\n"));
+    return FAILED_INIT;
+  }
+  if cfg.head && ((cfg.data.len() > 0 && !cfg.get_data) || cfg.has_upload) {
+    let mut m = lit("curl: You can only select one HTTP request method! You asked for both POST\n");
+    push_lit(&mut m, "curl: (-d, --data) and HEAD (-I, --head).\n");
+    push_lit(&mut m, "curl: try 'curl --help' for more information\n");
+    to_stderr(&m);
+    return FAILED_INIT;
+  }
+
+  // Read each file that a data option names. curl warns and sends nothing for a file that it
+  // cannot read.
+  let mut contents = Vec<Vec<u8>>::new();
+  for part in cfg.data.iter() {
+    match data_file_name(part) {
+      Option<Vec<u8>>::Some(name) => {
+        match read_file(files, &name) {
+          Result<Vec<u8>, Failure>::Ok(bytes) => {
+            contents.push(bytes);
+          },
+          Result<Vec<u8>, Failure>::Err(_f) => {
+            let mut m = lit("Warning: Couldn't read data from file \"");
+            append(&mut m, &name);
+            push_lit(&mut m, "\", this makes an empty POST.\n");
+            to_stderr(&m);
+            contents.push(Vec<u8>::new());
+          }
+        }
+      },
+      Option<Vec<u8>>::None() => {
+        contents.push(Vec<u8>::new());
+      }
+    }
+  }
+  let mut request_body = build_body(&cfg.data, &contents);
+
+  // A form (`-F`): read the files of its fields, and make the multipart body.
+  let mut form_boundary = Vec<u8>::new();
+  if cfg.forms.len() > 0 {
+    let mut parts = Vec<FormPart>::new();
+    for arg in cfg.forms.iter() {
+      match parse_form(&arg.text, arg.literal) {
+        Result<FormPart, Failure>::Ok(parsed) => {
+          let mut part = parsed;
+          if reads_file(&part) {
+            match read_file(files, &part.data) {
+              Result<Vec<u8>, Failure>::Ok(bytes) => {
+                part.content = bytes;
+              },
+              Result<Vec<u8>, Failure>::Err(_e) => {
+                let f = fail_lit(READ_ERROR,
+                  "Failed to open/read local data from file/application");
+                report(cfg, &f);
+                return f.code;
+              }
+            }
+          }
+          parts.push(part);
+        },
+        Result<FormPart, Failure>::Err(f) => {
+          let mut m = lit("curl: ");
+          append(&mut m, &f.message);
+          push_lit(&mut m, "\ncurl: try 'curl --help' for more information\n");
+          to_stderr(&m);
+          return f.code;
+        }
+      }
+    }
+    form_boundary = make_boundary(&random_bytes(22));
+    // A `-H "Content-Type: ..."` gives the type of the whole body.
+    let mut form_type = lit("multipart/form-data");
+    for line in cfg.headers.iter() {
+      let h = split_header(line);
+      if !h.ignored && !h.remove && eq_lit_nocase(&h.name, "Content-Type") {
+        form_type = trim_blanks(&h.value);
+      }
+    }
+    request_body = multipart_body(&parts, &form_boundary, type_is(&form_type, "multipart/form-data"),
+      cfg.form_escape);
+  }
+
+  let mut headers = clone_lines(&cfg.headers);
+  if has_json(&cfg.data) {
+    if !has_custom(&headers, "Content-Type") {
+      headers.push(lit("Content-Type: application/json"));
+    }
+    if !has_custom(&headers, "Accept") {
+      headers.push(lit("Accept: application/json"));
+    }
+  }
+
+  if cfg.outputs.len() > cfg.urls.len() {
+    to_stderr(&lit("Warning: Got more output options than URLs\n"));
+  }
+  if cfg.has_upload && cfg.http10 && eq_lit(&cfg.upload, "-") && !has_custom(&headers, "Content-Length") {
+    let f = fail_lit(UPLOAD_FAILED, "Chunky upload is not supported by HTTP 1.0");
+    report(cfg, &f);
+    return f.code;
+  }
+
+  // The kind of request for the first URL. `-T` uploads only to the first URL, so the other
+  // URLs get the kind of request that the other options ask for.
+  let mut other_kind = REQ_GET;
+  if cfg.head {
+    other_kind = REQ_HEAD;
+  } else {
+    if (cfg.data.len() > 0 && !cfg.get_data) || cfg.forms.len() > 0 {
+      other_kind = REQ_POST;
+    }
+  }
+  let mut kind = other_kind;
+  let mut upload_body = Vec<u8>::new();
+  if !cfg.head {
+    if cfg.has_upload {
+      kind = REQ_PUT;
+      match read_file(files, &cfg.upload) {
+        Result<Vec<u8>, Failure>::Ok(bytes) => {
+          upload_body = bytes;
+        },
+        Result<Vec<u8>, Failure>::Err(f) => {
+          report(cfg, &f);
+          return f.code;
+        }
+      }
+    }
+  }
+
+  // The cookie engine runs when `-b` names a file or `-c` a jar. `main` reads the files with
+  // its file right, and the transfers get the jar without that right.
+  let mut jar = new_jar(cfg.cookie_files.len() > 0 || cfg.has_cookie_jar);
+  for name in cfg.cookie_files.iter() {
+    match read_file(files, name) {
+      Result<Vec<u8>, Failure>::Ok(text) => {
+        load_cookie_text(&mut jar, &text, cfg.junk_session_cookies);
+      },
+      Result<Vec<u8>, Failure>::Err(_f) => {
+        // libcurl ignores a cookie file that it cannot read.
+      }
+    }
+  }
+  start_jar(&mut jar);
+
+  // The TLS settings read the certificate authorities from files, so `main` makes them with its
+  // file right. The transfers get them without that right.
+  match TlsConfig::new(files, cfg.insecure, &cfg.cacert, &cfg.capath) {
+    Result<TlsConfig, TlsError>::Ok(t) => {
+      let code = run_all(network, files, &t, cfg, &headers, &request_body, &upload_body, kind,
+        other_kind, &form_boundary, &mut jar);
+      save_jar(files, cfg, &mut jar);
+      return code;
+    },
+    Result<TlsConfig, TlsError>::Err(e) => {
+      let f = fail_with(e.code, e.message);
+      report(cfg, &f);
+      return f.code;
+    }
+  }
+}
+
+/// Write the cookies to the jar file of `-c`, or to standard output for `-`. libcurl only notes
+/// a jar that it cannot write.
+fn save_jar(files : &Files, cfg : &Config, jar : &mut CookieJar) -> void {
+  if !cfg.has_cookie_jar {
+    return;
+  }
+  let text = jar_text(jar);
+  if eq_lit(&cfg.cookie_jar, "-") {
+    let _ok = write_stdout(&text);
+    return;
+  }
+  match append_to_file(files, &cfg.cookie_jar, false, &text) {
+    Result<i32, Failure>::Ok(_n) => {},
+    Result<i32, Failure>::Err(_f) => {
+      if cfg.verbose {
+        let mut m = lit("* WARNING: failed to save cookies in ");
+        append(&mut m, &cfg.cookie_jar);
+        push_lit(&mut m, "\n");
+        to_stderr(&m);
+      }
+      return;
+    }
+  }
+}
+
+/// Run the transfer of each URL, and give the exit code of the last one that failed.
+fn run_all(network : &Network, files : &Files, tls : &TlsConfig, cfg : &Config,
+headers : &Vec<Vec<u8>>, request_body : &Vec<u8>, upload_body : &Vec<u8>, kind : i32,
+other_kind : i32, form_boundary : &Vec<u8>, jar : &mut CookieJar) -> i32 {
+  let mut exit_code = 0;
+  let mut i = 0;
+  while i < cfg.urls.len() {
+    let mut url_text = clone_bytes(cfg.urls.get_ref(i));
+    if cfg.get_data && cfg.data.len() > 0 {
+      if find_byte(&url_text, 63u8, 0) >= 0 {
+        url_text.push(38u8);
+      } else {
+        url_text.push(63u8);
+      }
+      append(&mut url_text, request_body);
+    }
+    let mut this_kind = other_kind;
+    if i == 0 {
+      this_kind = kind;
+    }
+    if cfg.has_upload && i == 0 {
+      url_text = upload_url(&url_text, &cfg.upload);
+    }
+
+    let mut info = new_info();
+    let mut code = 0;
+    let mut message = Vec<u8>::new();
+    let mut result = Result<i32, Failure>::Ok(0);
+    if this_kind == REQ_PUT {
+      result = transfer_one(network, files, tls, cfg, headers, &url_text, upload_body, this_kind,
+        form_boundary, jar, i, &mut info);
+    } else {
+      result = transfer_one(network, files, tls, cfg, headers, &url_text, request_body, this_kind,
+        form_boundary, jar, i, &mut info);
+    }
+    match result {
+      Result<i32, Failure>::Ok(_v) => {},
+      Result<i32, Failure>::Err(f) => {
+        report(cfg, &f);
+        code = f.code;
+        message = f.message;
+      }
+    }
+    if cfg.has_write_out {
+      let ctx = WriteOutContext {
+        exit_code : code,
+        error : message,
+        url_index : i
+      };
+      let mut warnings = Vec<u8>::new();
+      let pieces = format_write_out(&cfg.write_out, &info, &ctx, &mut warnings);
+      if warnings.len() > 0 {
+        to_stderr(&warnings);
+      }
+      write_pieces(files, &pieces);
+    }
+    if code != 0 {
+      exit_code = code;
+    }
+    i = i + 1;
+  }
+  return exit_code;
+}
+
+/// Write each piece of `-w` text where it goes. A `%output{file}` piece goes to a file, which
+/// only `main` can open. When the file cannot be opened, curl writes the piece where the text
+/// before it went.
+fn write_pieces(files : &Files, pieces : &Vec<WriteOutPiece>) -> void {
+  let mut last = TO_STDOUT;
+  for piece in pieces.iter() {
+    let mut where_to = piece.destination;
+    if where_to == TO_FILE {
+      match append_to_file(files, &piece.file, piece.append, &piece.bytes) {
+        Result<i32, Failure>::Ok(_n) => {
+          continue;
+        },
+        Result<i32, Failure>::Err(_f) => {
+          where_to = last;
+        }
+      }
+    }
+    if where_to == TO_STDERR {
+      to_stderr(&piece.bytes);
+    } else {
+      let _ok = write_stdout(&piece.bytes);
+    }
+    last = where_to;
+  }
+}
+
+fn transfer_one(network : &Network, files : &Files, tls : &TlsConfig, cfg : &Config,
+headers : &Vec<Vec<u8>>,
+url_text : &Vec<u8>, request_body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>,
+jar : &mut CookieJar, index : i32, info : &mut TransferInfo) -> Result<i32, Failure> {
+  let body_output = open_output(files, cfg, index, url_text)?;
+  let header_output = open_header_output(files, cfg)?;
+  let mut sinks = Sinks {
+    body : body_output,
+    headers : header_output,
+    has_headers : cfg.has_dump_header
+  };
+  return run_transfer(network, tls, cfg, headers, url_text, request_body, kind, form_boundary,
+    jar, &mut sinks, info);
+}

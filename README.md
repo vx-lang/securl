@@ -6,15 +6,20 @@ which is a git submodule. HTTP/2 is written in Vx.
 
 The goal is to show what Vx's type system buys a network tool:
 
-- **No trusted code in the protocol code, checked by the compiler.** The package `curlvx` holds
-  the URL parser, the command-line parser, the request builder, the response parser, chunked
-  decoding, redirects and proxies. It is compiled with `--no-trusted-code curlvx`, so any
-  `unsafe`, `extern`, `mlir!`, `extern impl` or `unsafe impl` in it is a compile error.
-- **Capabilities.** Only `main` gets the rights of the program (`fn main(root : Root)`). It gives
-  the network right (`&Network`) to the transfer and keeps the file right (`&Files`) for itself.
-  It also loads the certificate authorities for TLS, because that reads files, and lends the
-  result to the transfer. The parsers get no right, so a bug in a parser cannot open a file or
-  a socket. The compiler checks this: the code has no other way to reach the operating system.
+- **No trusted code outside one small package, checked by the compiler.** The package `curlvx`
+  holds the URL parser, the command-line parser, the request builder, the response parser,
+  chunked decoding, redirects and proxies. The package `cli` holds the tool around it, and
+  `disk` its files. They are compiled with `--no-trusted-code`, so any `unsafe`, `extern`,
+  `mlir!`, `extern impl` or `unsafe impl` in them is a compile error. All trusted code is in
+  `sys`. `src/main.vx`, the one file outside a package, only hands `Root` to `cli`.
+- **Capabilities.** Only `main` gets the rights of the program (`fn main(root : Root)`), and it
+  hands them to `cli::tool_main`. That gives the network right (`&Network`) to the transfer and
+  keeps the file right (`&Files`) for itself. It also loads the certificate authorities for TLS,
+  because that reads files, and lends the result to the transfer. The parsers get no right, so
+  a bug in a parser cannot open a file or a socket: the compiler checks that the protocol code
+  has no other way to the disk or the network. It can still use standard input, output and
+  error, through `sys::console`, with no right. A right for them in `Root` would close that
+  gap, but that is a change in Vx's `std`.
 
 ## Get it
 
@@ -74,7 +79,8 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 | Part | Lines | Trusted code |
 |---|---|---|
 | `src/curlvx/` (the package with all protocol code) | 8,599 | none, and `--no-trusted-code` enforces this |
-| `src/main.vx`, `src/disk.vx` | 618 | none |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 619 | none, and `--no-trusted-code` enforces this |
+| `src/main.vx` (hands `Root` to `cli`) | 11 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 908 | 38 `extern` functions, 55 `unsafe` blocks |
 
 Of the trusted code in `src/sys/`, 80 of the 93 items are the OpenSSL bindings: TLS (with the
@@ -274,8 +280,9 @@ A curl-vx binary also holds code under other licenses:
 ## Layout
 
 ```
-src/main.vx          the only code that gets `Root`; opens files, loads the TLS settings
-src/disk.vx          reads and creates files; each function takes `&Files`
+src/main.vx          gets `Root`, and hands it to cli::tool_main
+src/cli/tool.vx      the tool: the command line, the transfers, opening files, the TLS settings
+src/disk/files.vx    reads and creates files; each function takes `&Files`
 src/sys/             trusted code: OpenSSL (tls.vx), arguments, standard output, literals
 src/curlvx/          the protocol code; no trusted code
   options.vx           the command line

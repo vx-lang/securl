@@ -39,11 +39,13 @@ else
   TLS_LIBS = $(OPENSSL_BUILD)/libssl.a $(OPENSSL_BUILD)/libcrypto.a -ldl -lpthread
 endif
 
-# `curlvx` may not hold trusted code: the compiler refuses any `unsafe`, `extern`, `mlir!`,
-# `extern impl` or `unsafe impl` in it. All trusted code lives in the small `sys` package.
-PKGS = --package sys=src/sys --package curlvx=src/curlvx --no-trusted-code curlvx
+# Only `sys` may hold trusted code. The compiler refuses any `unsafe`, `extern`, `mlir!`,
+# `extern impl` or `unsafe impl` in the other packages: `curlvx` (the protocol code), `cli`
+# (the tool) and `disk` (its files). src/main.vx, outside any package, only calls `cli`.
+PKGS = --package sys=src/sys --package curlvx=src/curlvx --package disk=src/disk \
+  --package cli=src/cli --no-trusted-code curlvx --no-trusted-code disk --no-trusted-code cli
 
-SRCS = $(wildcard src/*.vx src/sys/*.vx src/curlvx/*.vx)
+SRCS = $(wildcard src/*.vx src/sys/*.vx src/curlvx/*.vx src/disk/*.vx src/cli/*.vx)
 LIBS = -L $(VX_LIBDIR) -lvx_std_core -Wl,-rpath,$(VX_LIBDIR)
 
 all: build/curl-vx

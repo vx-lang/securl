@@ -1,5 +1,5 @@
 // The files that curl-vx reads and writes. Each function takes the right to open files, a
-// `&Files`, which only `main` has. The `curlvx` package never gets it.
+// `&Files`, which only `main` and `cli::tool` have. The `curlvx` package never gets it.
 import core::option;
 import core::result;
 import std::fs;
