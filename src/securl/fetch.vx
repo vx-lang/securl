@@ -30,6 +30,8 @@ struct TransferInfo {
   http_code : i32,
   http_version : i32,
   size_download : i64,
+  // The bytes of the body that went to the output, after `--compressed` decoded them.
+  size_delivered : i64,
   size_header : i64,
   size_request : i64,
   num_redirects : i32,
@@ -63,6 +65,7 @@ pub fn new_info() -> TransferInfo {
     http_code : 0,
     http_version : 0,
     size_download : 0i64,
+    size_delivered : 0i64,
     size_header : 0i64,
     size_request : 0i64,
     num_redirects : 0,
@@ -614,7 +617,8 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
       && !has_custom(headers, "Transfer-Encoding"),
     probe : probe,
     form_boundary : form_text(req_kind, form_boundary),
-    h2 : false
+    h2 : false,
+    accept_encoding : cfg.compressed
   };
 
   let mut address = Vec<u8>::new();
@@ -772,8 +776,15 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
       let _b = body_of(&mut c, &mut h2, use_h2, &head, cfg.raw, &mut discard, info,
         &mut trailers)?;
     } else {
+      // `--compressed` decodes the body as its Content-Encoding says.
+      let mut encodings = Vec<u8>::new();
+      if cfg.compressed && !cfg.raw {
+        encodings = content_encodings(&head);
+      }
+      let _stack = sinks.body.start_body(&encodings)?;
       let _b = body_of(&mut c, &mut h2, use_h2, &head, cfg.raw, &mut sinks.body, info,
         &mut trailers)?;
+      info.size_delivered = info.size_delivered + sinks.body.finish_body()?;
     }
   }
   if trailers.len() > 0 {
@@ -1393,6 +1404,21 @@ info : &mut TransferInfo, trailers : &mut Vec<u8>) -> Result<i32, Failure> {
     return read_length(c, head.content_length, out, info);
   }
   return read_to_close(c, out, info);
+}
+
+/// The values of the Content-Encoding headers of `head`, joined with commas.
+fn content_encodings(head : &ResponseHead) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  for h in head.headers.iter() {
+    let colon = find_byte(h, 58u8, 0);
+    if colon > 0 && eq_lit_nocase(&trim_blanks(&range_of(h, 0, colon)), "Content-Encoding") {
+      if out.len() > 0 {
+        push_lit(&mut out, ",");
+      }
+      append(&mut out, &trim_blanks(&rest_from(h, colon + 1)));
+    }
+  }
+  return out;
 }
 
 /// A copy of each line of `lines`.

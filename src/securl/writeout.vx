@@ -204,6 +204,10 @@ fn variable(name : &Vec<u8>, info : &TransferInfo, ctx : &WriteOutContext, out :
     append(out, &info.url_effective);
     return true;
   }
+  if eq_lit(name, "size_delivered") {
+    push_i64(out, info.size_delivered);
+    return true;
+  }
   if eq_lit(name, "size_download") {
     push_i64(out, info.size_download);
     return true;

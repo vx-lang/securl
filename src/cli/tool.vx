@@ -109,7 +109,7 @@ fn print_version() -> void {
   append(&mut m, &securl_version());
   push_lit(&mut m, " ");
   append(&mut m, &tls_library_version());
-  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: HTTP2 IPv6 Largefile SSL\n");
+  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: HTTP2 IPv6 Largefile libz SSL\n");
   let _ok = write_stdout(&m);
 }
 

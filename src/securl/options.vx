@@ -131,6 +131,8 @@ struct Config {
   // `--keepalive-cnt`: the probes with no answer before the connection is dropped, or 0 for
   // the 9 of libcurl.
   keepalive_cnt : i64,
+  // `--compressed`: ask for gzip and deflate, and decode them.
+  compressed : bool,
   // `-p`: reach the server through a CONNECT tunnel of the HTTP proxy, for `http://` too.
   proxytunnel : bool,
   // `-x` was given, perhaps with an empty value, which turns the proxy variables off.
@@ -227,6 +229,7 @@ pub fn default_config() -> Config {
     keepalive : true,
     keepalive_time : 0i64,
     keepalive_cnt : 0i64,
+    compressed : false,
     proxytunnel : false,
     proxy_set : false,
     proxy_kind : PROXY_HTTP,
@@ -985,10 +988,7 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     return done();
   }
   if id == OPT_COMPRESSED {
-    if enable {
-      return Result<i32, Failure>::Err(fail_with(NOT_BUILT_IN,
-        lit("option --compressed: the installed libcurl version does not support this")));
-    }
+    cfg.compressed = enable;
     return done();
   }
   // OPT_DISABLE,

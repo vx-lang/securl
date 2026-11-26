@@ -292,6 +292,34 @@ stderr_has "  with curl's message" "SSL routines::tlsv13 alert certificate requi
 check "--cert does nothing for http://" 0 "hello over tls" -sS --cert "$work/no-such.pem" \
   "http://127.0.0.1:$http/"
 
+# --compressed: gzip in chunks, and deflate (zlib), decoded as they arrive. The body has 5000
+# lines, 203890 bytes.
+check "--compressed decodes gzip" 0 "203890" -s --compressed -w '%{size_delivered}' \
+  -o "$work/gz" "http://127.0.0.1:$http/gzip"
+if [ "$(tail -n 1 "$work/gz")" = "line 4999 of a body that compresses well" ]; then
+  echo "ok     to the last line"
+else
+  echo "FAIL   the last line is '$(tail -n 1 "$work/gz")'"
+  fail=1
+fi
+check "  and deflate" 0 "203890" -s --compressed -w '%{size_delivered}' -o "$work/df" \
+  "http://127.0.0.1:$http/deflate"
+check "  over TLS" 0 "203890" -s --compressed -w '%{size_delivered}' -o "$work/df" \
+  --cacert "$certs/ca.pem" "https://localhost:$https/gzip"
+check "no --compressed, no decoding" 0 "200" -s -o "$work/raw" -w '%{http_code}' \
+  "http://127.0.0.1:$http/gzip"
+check "a gzip body cut short" 61 "" -sS --compressed -o /dev/null "http://127.0.0.1:$http/gzip-cut"
+stderr_has "  with curl's message" "Gzip stream ended before completion"
+check "a gzip body with a bad CRC" 61 "" -sS --compressed -o /dev/null \
+  "http://127.0.0.1:$http/gzip-bad-crc"
+stderr_has "  with curl's message" \
+  "Error while processing content unencoding: incorrect data check"
+check "an encoding curl does not know" 61 "" -sS --compressed -o /dev/null \
+  "http://127.0.0.1:$http/compress"
+stderr_has "  with curl's message" "Unrecognized content encoding type"
+check "six encodings" 61 "" -sS --compressed -o /dev/null "http://127.0.0.1:$http/six"
+stderr_has "  with curl's message" "Reject response exceeding limit of 5 content encodings"
+
 # The TCP options of libcurl, in its order: TCP_NODELAY, then keepalive after 60 seconds, every
 # 60 seconds, 9 times.
 sockopts "TCP_NODELAY and keepalive by default" \

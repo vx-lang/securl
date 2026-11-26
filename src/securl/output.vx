@@ -10,12 +10,25 @@ import sys::console;
 import sys::text;
 import securl::bytes;
 import securl::failure;
+import securl::inflate;
+
+// libcurl's limit of content encodings on one response.
+const MAX_ENCODE_STACK : i32 = 5;
 
 struct Output {
   to_stdout : bool,
   file : Option<File>,
   // How many bytes went to this output.
   written : i64,
+  // The decoders of `--compressed`, in the order that the body goes through them: the last
+  // encoding of Content-Encoding first. Empty when the body is written as it came.
+  decoders : Vec<Inflate>,
+  // Content-Encoding named an encoding that securl does not know. The first byte of the body
+  // fails, as in libcurl.
+  unknown_encoding : bool,
+  // A body is being written: its bytes count in `delivered`, after any decoding.
+  in_body : bool,
+  delivered : i64,
 }
 
 /// An output to standard output.
@@ -23,7 +36,11 @@ pub fn stdout_output() -> Output {
   return Output {
     to_stdout : true,
     file : Option<File>::None(),
-    written : 0i64
+    written : 0i64,
+    decoders : Vec<Inflate>::new(),
+    unknown_encoding : false,
+    in_body : false,
+    delivered : 0i64
   };
 }
 
@@ -32,7 +49,11 @@ pub fn file_output(file : File) -> Output {
   return Output {
     to_stdout : false,
     file : Option<File>::Some(file),
-    written : 0i64
+    written : 0i64,
+    decoders : Vec<Inflate>::new(),
+    unknown_encoding : false,
+    in_body : false,
+    delivered : 0i64
   };
 }
 
@@ -41,7 +62,11 @@ pub fn null_output() -> Output {
   return Output {
     to_stdout : false,
     file : Option<File>::None(),
-    written : 0i64
+    written : 0i64,
+    decoders : Vec<Inflate>::new(),
+    unknown_encoding : false,
+    in_body : false,
+    delivered : 0i64
   };
 }
 
@@ -69,12 +94,119 @@ fn write_all_to_file(file : &mut File, bytes : &Vec<u8>) -> Result<i32, Failure>
 }
 
 impl Output {
-  /// Write all of `bytes` to the output.
+  /// What comes next is the body of a response. Decode it as `encodings` says: the value of
+  /// its Content-Encoding headers, such as `deflate, gzip`, or empty for none. The last
+  /// encoding is decoded first. `identity` and `none` change nothing. As in libcurl, more than
+  /// five encodings fail at once, and an encoding that securl does not know fails at the first
+  /// byte of the body.
+  pub fn start_body(self : &mut Output, encodings : &Vec<u8>) -> Result<i32, Failure> {
+    self.in_body = true;
+    self.delivered = 0i64;
+    let mut names = Vec<Vec<u8>>::new();
+    let mut start = 0;
+    while start < encodings.len() {
+      let mut end = find_byte(encodings, 44u8, start);
+      if end < 0 {
+        end = encodings.len();
+      }
+      let name = trim_blanks(&range_of(encodings, start, end));
+      start = end + 1;
+      if name.len() > 0 {
+        if names.len() >= MAX_ENCODE_STACK {
+          return Result<i32, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
+            "Reject response exceeding limit of 5 content encodings"));
+        }
+        names.push(name);
+      }
+    }
+    let mut decoders = Vec<Inflate>::new();
+    let mut i = names.len() - 1;
+    while i >= 0 {
+      let name = names.get_ref(i);
+      if eq_lit_nocase(name, "gzip") || eq_lit_nocase(name, "x-gzip") {
+        decoders.push(new_inflate(WRAP_GZIP));
+      } else {
+        if eq_lit_nocase(name, "deflate") {
+          decoders.push(new_inflate(WRAP_ZLIB));
+        } else {
+          if !eq_lit_nocase(name, "identity") && !eq_lit_nocase(name, "none") {
+            self.unknown_encoding = true;
+          }
+        }
+      }
+      i = i - 1;
+    }
+    self.decoders = decoders;
+    return Result<i32, Failure>::Ok(0);
+  }
+
+  /// End the body. Gives how many bytes of it went out, after decoding. A body that ended
+  /// inside its compressed data fails, as in libcurl.
+  pub fn finish_body(self : &mut Output) -> Result<i64, Failure> {
+    self.in_body = false;
+    let mut result = Result<i64, Failure>::Ok(self.delivered);
+    for d in self.decoders.iter() {
+      if result.is_ok() && !d.complete() {
+        if d.wrap == WRAP_GZIP {
+          result = Result<i64, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
+            "Gzip stream ended before completion"));
+        } else {
+          result = Result<i64, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
+            "Deflate stream ended before completion"));
+        }
+      }
+    }
+    self.decoders = Vec<Inflate>::new();
+    self.unknown_encoding = false;
+    return result;
+  }
+
+  /// `bytes` through the decoders of the body.
+  fn decoded(self : &mut Output, bytes : &Vec<u8>) -> Result<Vec<u8>, Failure> {
+    if self.unknown_encoding {
+      return Result<Vec<u8>, Failure>::Err(fail_lit(BAD_CONTENT_ENCODING,
+        "Unrecognized content encoding type"));
+    }
+    let mut data = clone_bytes(bytes);
+    for d in self.decoders.iter_mut() {
+      match d.feed(&data) {
+        Result<Vec<u8>, i32>::Ok(out) => {
+          data = out;
+        },
+        Result<Vec<u8>, i32>::Err(_e) => {
+          if d.error_code == WRITE_ERROR {
+            return Result<Vec<u8>, Failure>::Err(fail_with(WRITE_ERROR, clone_bytes(&d.error)));
+          }
+          let mut m = lit("Error while processing content unencoding: ");
+          append(&mut m, &d.error);
+          return Result<Vec<u8>, Failure>::Err(fail_with(BAD_CONTENT_ENCODING, m));
+        }
+      }
+    }
+    return Result<Vec<u8>, Failure>::Ok(data);
+  }
+
+  /// Write all of `bytes` to the output, decoded when a body is being decoded.
   pub fn write(self : &mut Output, bytes : &Vec<u8>) -> Result<i32, Failure> {
     if bytes.len() == 0 {
       return Result<i32, Failure>::Ok(0);
     }
+    if self.decoders.len() > 0 || self.unknown_encoding {
+      let decoded = self.decoded(bytes)?;
+      return self.put(&decoded);
+    }
+    return self.put(bytes);
+  }
+
+  /// Write all of `bytes` to the output as they are.
+  fn put(self : &mut Output, bytes : &Vec<u8>) -> Result<i32, Failure> {
+    if bytes.len() == 0 {
+      return Result<i32, Failure>::Ok(0);
+    }
     self.written = self.written + (bytes.len() as i64);
+    if self.in_body {
+      self.delivered = self.delivered + (bytes.len() as i64);
+    }
     if self.to_stdout {
       if !write_stdout(bytes) {
         return Result<i32, Failure>::Err(write_error());

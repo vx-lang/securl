@@ -1,0 +1,833 @@
+// The decoders of `--compressed`: DEFLATE (RFC 1951) in the gzip (RFC 1952) and zlib (RFC 1950)
+// wrappers, as libcurl decodes `Content-Encoding: gzip` and `deflate` with zlib. The errors are
+// zlib's texts, which curl shows after "Error while processing content unencoding: ".
+//
+// A decoder takes the body in pieces as it arrives and gives the bytes that it could decode.
+// Each block header and each symbol of the compressed data is decoded whole or not at all: when
+// a piece ends inside one, the decoder goes back to its start and waits for the next piece. The
+// Huffman decoding follows zlib's `puff.c`, the simple and careful decoder of Mark Adler.
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import securl::bytes;
+
+// How a decoder unwraps its data.
+const WRAP_GZIP : i32 = 1;
+const WRAP_ZLIB : i32 = 2;
+const WRAP_RAW : i32 = 3;
+
+// The states of the DEFLATE data.
+const ST_BLOCK : i32 = 0;
+const ST_STORED : i32 = 1;
+const ST_CODES : i32 = 2;
+const ST_DONE : i32 = 3;
+
+// The states of the wrapper around it.
+const W_HEADER : i32 = 0;
+const W_DATA : i32 = 1;
+const W_TRAILER : i32 = 2;
+const W_END : i32 = 3;
+
+// A result of a step: it needs more input (-1), or it failed (-2). The text of the failure is in
+// `error` of the decoder.
+const NEED_MORE : i32 = -1;
+const FAILED : i32 = -2;
+
+const WINDOW_SIZE : i32 = 32768;
+
+/// A canonical Huffman code: how many codes each length from 0 to 15 has, and the symbols in
+/// the order of their codes.
+struct Huffman {
+  counts : Vec<i32>,
+  symbols : Vec<i32>,
+}
+
+/// A decoder of one content coding.
+struct Inflate {
+  wrap : i32,
+  // The input that the decoder has not used yet, from byte `pos` and bit `bit` of that byte.
+  input : Vec<u8>,
+  pos : i32,
+  bit : i32,
+  wstate : i32,
+  state : i32,
+  // The current block: whether it is the last one, its codes, and for a stored block the
+  // bytes that are left.
+  last : bool,
+  lencode : Huffman,
+  distcode : Huffman,
+  stored_left : i32,
+  // The last 32 KiB of output, for the distances of the DEFLATE data.
+  window : Vec<u8>,
+  wpos : i32,
+  total : i64,
+  // The check of the wrapper: CRC-32 for gzip, Adler-32 for zlib.
+  crc : u64,
+  adler_a : u64,
+  adler_b : u64,
+  crc_table : Vec<u64>,
+  // For zlib: no output came yet, so a bad header can still mean raw DEFLATE, as libcurl
+  // assumes for some servers.
+  can_fall_back : bool,
+  // For raw DEFLATE after that fallback: the bytes after the data that are tolerated.
+  trailer_left : i32,
+  // Some input came, so the end of the body must also be the end of the data.
+  started : bool,
+  error : Vec<u8>,
+  error_code : i32,
+}
+
+fn empty_huffman() -> Huffman {
+  return Huffman {
+    counts : Vec<i32>::new(),
+    symbols : Vec<i32>::new()
+  };
+}
+
+/// The CRC-32 table of gzip.
+fn make_crc_table() -> Vec<u64> {
+  let mut table = Vec<u64>::new();
+  let mut n : u64 = 0u64;
+  while n < 256u64 {
+    let mut c = n;
+    let mut k = 0;
+    while k < 8 {
+      if c % 2u64 == 1u64 {
+        c = 3988292384u64 ^ (c / 2u64);
+      } else {
+        c = c / 2u64;
+      }
+      k = k + 1;
+    }
+    table.push(c);
+    n = n + 1u64;
+  }
+  return table;
+}
+
+/// A decoder for `gzip` (WRAP_GZIP), `deflate` (WRAP_ZLIB) or raw DEFLATE (WRAP_RAW).
+pub fn new_inflate(wrap : i32) -> Inflate {
+  let mut window = Vec<u8>::with_capacity(WINDOW_SIZE);
+  let mut i = 0;
+  while i < WINDOW_SIZE {
+    window.push(0u8);
+    i = i + 1;
+  }
+  let mut wstate = W_HEADER;
+  if wrap == WRAP_RAW {
+    wstate = W_DATA;
+  }
+  return Inflate {
+    wrap : wrap,
+    input : Vec<u8>::new(),
+    pos : 0,
+    bit : 0,
+    wstate : wstate,
+    state : ST_BLOCK,
+    last : false,
+    lencode : empty_huffman(),
+    distcode : empty_huffman(),
+    stored_left : 0,
+    window : window,
+    wpos : 0,
+    total : 0i64,
+    crc : 4294967295u64,
+    adler_a : 1u64,
+    adler_b : 0u64,
+    crc_table : make_crc_table(),
+    can_fall_back : wrap == WRAP_ZLIB,
+    trailer_left : 0,
+    started : false,
+    error : Vec<u8>::new(),
+    error_code : 0
+  };
+}
+
+// The tables of RFC 1951: the base and the extra bits of each length and distance symbol, and
+// the order of the lengths of the code length code.
+fn length_base(i : i32) -> i32 {
+  let bases = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83,
+    99, 115, 131, 163, 195, 227, 258];
+  return bases[i];
+}
+
+fn length_extra(i : i32) -> i32 {
+  let extra = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5,
+    0];
+  return extra[i];
+}
+
+fn dist_base(i : i32) -> i32 {
+  let bases = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
+    1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+  return bases[i];
+}
+
+fn dist_extra(i : i32) -> i32 {
+  let extra = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
+    12, 12, 13, 13];
+  return extra[i];
+}
+
+fn code_length_order(i : i32) -> i32 {
+  let order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+  return order[i];
+}
+
+/// The Huffman code of the code lengths `lengths`. Gives it, and how many codes are left
+/// unused: 0 for a complete code, more for an incomplete one, and less for one with too many
+/// codes.
+fn build_huffman(lengths : &Vec<i32>, out : &mut Huffman) -> i32 {
+  let mut counts = Vec<i32>::new();
+  let mut i = 0;
+  while i < 16 {
+    counts.push(0);
+    i = i + 1;
+  }
+  for l in lengths.iter() {
+    counts.set(*l, counts.get(*l) + 1);
+  }
+  let mut symbols = Vec<i32>::new();
+  for _l in lengths.iter() {
+    symbols.push(0);
+  }
+  if counts.get(0) == lengths.len() {
+    // No codes at all: complete, but decoding with it fails.
+    out.counts = counts;
+    out.symbols = symbols;
+    return 0;
+  }
+  let mut left = 1;
+  let mut len = 1;
+  while len < 16 {
+    left = left * 2 - counts.get(len);
+    if left < 0 {
+      out.counts = counts;
+      out.symbols = symbols;
+      return left;
+    }
+    len = len + 1;
+  }
+  // The first symbol of each length in `symbols`.
+  let mut offsets = Vec<i32>::new();
+  offsets.push(0);
+  offsets.push(0);
+  len = 1;
+  while len < 15 {
+    offsets.push(offsets.get(len) + counts.get(len));
+    len = len + 1;
+  }
+  let mut symbol = 0;
+  while symbol < lengths.len() {
+    let l = lengths.get(symbol);
+    if l != 0 {
+      symbols.set(offsets.get(l), symbol);
+      offsets.set(l, offsets.get(l) + 1);
+    }
+    symbol = symbol + 1;
+  }
+  out.counts = counts;
+  out.symbols = symbols;
+  return left;
+}
+
+/// The fixed Huffman codes of block type 1.
+fn fixed_codes(lencode : &mut Huffman, distcode : &mut Huffman) -> void {
+  let mut lengths = Vec<i32>::new();
+  let mut symbol = 0;
+  while symbol < 288 {
+    if symbol < 144 {
+      lengths.push(8);
+    } else {
+      if symbol < 256 {
+        lengths.push(9);
+      } else {
+        if symbol < 280 {
+          lengths.push(7);
+        } else {
+          lengths.push(8);
+        }
+      }
+    }
+    symbol = symbol + 1;
+  }
+  let _l = build_huffman(&lengths, lencode);
+  let mut dist = Vec<i32>::new();
+  symbol = 0;
+  while symbol < 30 {
+    dist.push(5);
+    symbol = symbol + 1;
+  }
+  let _d = build_huffman(&dist, distcode);
+}
+
+impl Inflate {
+  fn fail(self : &mut Inflate, message : *const i8) -> i32 {
+    self.error = lit(message);
+    self.error_code = 61;
+    return FAILED;
+  }
+
+  /// `n` bits, the first one in the lowest place, or NEED_MORE.
+  fn bits(self : &mut Inflate, n : i32) -> i32 {
+    let mut value = 0;
+    let mut i = 0;
+    while i < n {
+      if self.pos >= self.input.len() {
+        return NEED_MORE;
+      }
+      let b = ((self.input.get(self.pos) as i32) / (1 << self.bit)) % 2;
+      value = value + b * (1 << i);
+      self.bit = self.bit + 1;
+      if self.bit == 8 {
+        self.bit = 0;
+        self.pos = self.pos + 1;
+      }
+      i = i + 1;
+    }
+    return value;
+  }
+
+  /// The next symbol of the code `h`, or NEED_MORE, or -3 for a code that `h` does not have.
+  fn decode(self : &mut Inflate, which : i32) -> i32 {
+    let mut code = 0;
+    let mut first = 0;
+    let mut index = 0;
+    let mut len = 1;
+    while len < 16 {
+      let b = self.bits(1);
+      if b < 0 {
+        return NEED_MORE;
+      }
+      code = code + b;
+      let mut count = 0;
+      if which == 0 {
+        count = self.lencode.counts.get(len);
+      } else {
+        count = self.distcode.counts.get(len);
+      }
+      if code - count < first {
+        if which == 0 {
+          return self.lencode.symbols.get(index + (code - first));
+        }
+        return self.distcode.symbols.get(index + (code - first));
+      }
+      index = index + count;
+      first = (first + count) * 2;
+      code = code * 2;
+      len = len + 1;
+    }
+    return -3;
+  }
+
+  /// Add one byte of output.
+  fn emit(self : &mut Inflate, out : &mut Vec<u8>, b : u8) -> void {
+    out.push(b);
+    self.window.set(self.wpos, b);
+    self.wpos = (self.wpos + 1) % WINDOW_SIZE;
+    self.total = self.total + 1i64;
+  }
+
+  /// The header of the next block. ST_STORED, ST_CODES or NEED_MORE or FAILED.
+  fn block_header(self : &mut Inflate) -> i32 {
+    let last = self.bits(1);
+    let kind = self.bits(2);
+    if last < 0 || kind < 0 {
+      return NEED_MORE;
+    }
+    self.last = last == 1;
+    if kind == 0 {
+      // A stored block starts at the next byte: LEN and its complement NLEN.
+      if self.bit != 0 {
+        self.bit = 0;
+        self.pos = self.pos + 1;
+      }
+      if self.pos + 4 > self.input.len() {
+        return NEED_MORE;
+      }
+      let len = (self.input.get(self.pos) as i32) + (self.input.get(self.pos + 1) as i32) * 256;
+      let nlen = (self.input.get(self.pos + 2) as i32) + (self.input.get(self.pos + 3) as i32) * 256;
+      if len != 65535 - nlen {
+        return self.fail("invalid stored block lengths");
+      }
+      self.pos = self.pos + 4;
+      self.stored_left = len;
+      return ST_STORED;
+    }
+    if kind == 1 {
+      let mut lencode = empty_huffman();
+      let mut distcode = empty_huffman();
+      fixed_codes(&mut lencode, &mut distcode);
+      self.lencode = lencode;
+      self.distcode = distcode;
+      return ST_CODES;
+    }
+    if kind == 2 {
+      return self.dynamic_header();
+    }
+    return self.fail("invalid block type");
+  }
+
+  /// The codes of a block of type 2, which its header gives.
+  fn dynamic_header(self : &mut Inflate) -> i32 {
+    let hlit = self.bits(5);
+    let hdist = self.bits(5);
+    let hclen = self.bits(4);
+    if hlit < 0 || hdist < 0 || hclen < 0 {
+      return NEED_MORE;
+    }
+    let nlen = hlit + 257;
+    let ndist = hdist + 1;
+    let ncode = hclen + 4;
+    if nlen > 286 || ndist > 30 {
+      return self.fail("too many length or distance symbols");
+    }
+    let mut code_lengths = Vec<i32>::new();
+    let mut i = 0;
+    while i < 19 {
+      code_lengths.push(0);
+      i = i + 1;
+    }
+    i = 0;
+    while i < ncode {
+      let l = self.bits(3);
+      if l < 0 {
+        return NEED_MORE;
+      }
+      code_lengths.set(code_length_order(i), l);
+      i = i + 1;
+    }
+    let mut lencode = empty_huffman();
+    if build_huffman(&code_lengths, &mut lencode) != 0 {
+      return self.fail("invalid code lengths set");
+    }
+    self.lencode = lencode;
+    // The code lengths of the literal/length and distance codes, which the code above codes.
+    let mut lengths = Vec<i32>::new();
+    while lengths.len() < nlen + ndist {
+      let symbol = self.decode(0);
+      if symbol == NEED_MORE {
+        return NEED_MORE;
+      }
+      if symbol < 0 {
+        return self.fail("invalid code lengths set");
+      }
+      if symbol < 16 {
+        lengths.push(symbol);
+        continue;
+      }
+      let mut repeat = 0;
+      let mut value = 0;
+      if symbol == 16 {
+        if lengths.len() == 0 {
+          return self.fail("invalid bit length repeat");
+        }
+        value = lengths.get(lengths.len() - 1);
+        let extra = self.bits(2);
+        if extra < 0 {
+          return NEED_MORE;
+        }
+        repeat = 3 + extra;
+      } else {
+        if symbol == 17 {
+          let extra = self.bits(3);
+          if extra < 0 {
+            return NEED_MORE;
+          }
+          repeat = 3 + extra;
+        } else {
+          let extra = self.bits(7);
+          if extra < 0 {
+            return NEED_MORE;
+          }
+          repeat = 11 + extra;
+        }
+      }
+      if lengths.len() + repeat > nlen + ndist {
+        return self.fail("invalid bit length repeat");
+      }
+      while repeat > 0 {
+        lengths.push(value);
+        repeat = repeat - 1;
+      }
+    }
+    if lengths.get(256) == 0 {
+      return self.fail("invalid code -- missing end-of-block");
+    }
+    let mut lit_lengths = Vec<i32>::new();
+    i = 0;
+    while i < nlen {
+      lit_lengths.push(lengths.get(i));
+      i = i + 1;
+    }
+    let mut dist_lengths = Vec<i32>::new();
+    while i < nlen + ndist {
+      dist_lengths.push(lengths.get(i));
+      i = i + 1;
+    }
+    let mut new_lencode = empty_huffman();
+    let left = build_huffman(&lit_lengths, &mut new_lencode);
+    // An incomplete code is fine only when it has a single code of length 1.
+    if left < 0 || (left > 0 && nlen - new_lencode.counts.get(0) != 1) {
+      return self.fail("invalid literal/lengths set");
+    }
+    let mut new_distcode = empty_huffman();
+    let dleft = build_huffman(&dist_lengths, &mut new_distcode);
+    if dleft < 0 || (dleft > 0 && ndist - new_distcode.counts.get(0) != 1) {
+      return self.fail("invalid distances set");
+    }
+    self.lencode = new_lencode;
+    self.distcode = new_distcode;
+    return ST_CODES;
+  }
+
+  /// Decode the symbols of the current block until its end, or until the input runs out.
+  /// ST_BLOCK or ST_DONE at the end of the block, or NEED_MORE or FAILED.
+  fn codes(self : &mut Inflate, out : &mut Vec<u8>) -> i32 {
+    loop {
+      let start_pos = self.pos;
+      let start_bit = self.bit;
+      let symbol = self.decode(0);
+      if symbol == NEED_MORE {
+        self.pos = start_pos;
+        self.bit = start_bit;
+        return NEED_MORE;
+      }
+      if symbol < 0 {
+        return self.fail("invalid literal/length code");
+      }
+      if symbol < 256 {
+        self.emit(out, symbol as u8);
+        continue;
+      }
+      if symbol == 256 {
+        if self.last {
+          return ST_DONE;
+        }
+        return ST_BLOCK;
+      }
+      let index = symbol - 257;
+      if index >= 29 {
+        return self.fail("invalid literal/length code");
+      }
+      let extra = self.bits(length_extra(index));
+      if extra < 0 {
+        self.pos = start_pos;
+        self.bit = start_bit;
+        return NEED_MORE;
+      }
+      let len = length_base(index) + extra;
+      let dsymbol = self.decode(1);
+      if dsymbol == NEED_MORE {
+        self.pos = start_pos;
+        self.bit = start_bit;
+        return NEED_MORE;
+      }
+      if dsymbol < 0 || dsymbol >= 30 {
+        return self.fail("invalid distance code");
+      }
+      let dextra = self.bits(dist_extra(dsymbol));
+      if dextra < 0 {
+        self.pos = start_pos;
+        self.bit = start_bit;
+        return NEED_MORE;
+      }
+      let dist = dist_base(dsymbol) + dextra;
+      if (dist as i64) > self.total {
+        return self.fail("invalid distance too far back");
+      }
+      let mut k = 0;
+      while k < len {
+        let from = (self.wpos - dist + WINDOW_SIZE) % WINDOW_SIZE;
+        let b = self.window.get(from);
+        self.emit(out, b);
+        k = k + 1;
+      }
+    }
+  }
+
+  /// Decode as much of the DEFLATE data as the input holds. ST_DONE at its end, or NEED_MORE,
+  /// or FAILED.
+  fn deflate_data(self : &mut Inflate, out : &mut Vec<u8>) -> i32 {
+    loop {
+      if self.state == ST_DONE {
+        return ST_DONE;
+      }
+      if self.state == ST_BLOCK {
+        let start_pos = self.pos;
+        let start_bit = self.bit;
+        let next = self.block_header();
+        if next == NEED_MORE {
+          self.pos = start_pos;
+          self.bit = start_bit;
+          return NEED_MORE;
+        }
+        if next == FAILED {
+          return FAILED;
+        }
+        self.state = next;
+        continue;
+      }
+      if self.state == ST_STORED {
+        while self.stored_left > 0 && self.pos < self.input.len() {
+          let b = self.input.get(self.pos);
+          self.emit(out, b);
+          self.pos = self.pos + 1;
+          self.stored_left = self.stored_left - 1;
+        }
+        if self.stored_left > 0 {
+          return NEED_MORE;
+        }
+        if self.last {
+          self.state = ST_DONE;
+        } else {
+          self.state = ST_BLOCK;
+        }
+        continue;
+      }
+      let next = self.codes(out);
+      if next == NEED_MORE || next == FAILED {
+        return next;
+      }
+      self.state = next;
+    }
+  }
+
+  /// Update the check of the wrapper with the new output `bytes`.
+  fn check_output(self : &mut Inflate, bytes : &Vec<u8>) -> void {
+    if self.wrap == WRAP_GZIP {
+      let mut c = self.crc;
+      for b in bytes.iter() {
+        c = self.crc_table.get(((c ^ (*b as u64)) % 256u64) as i32) ^ (c / 256u64);
+      }
+      self.crc = c;
+    }
+    if self.wrap == WRAP_ZLIB {
+      let mut a = self.adler_a;
+      let mut b2 = self.adler_b;
+      for b in bytes.iter() {
+        a = (a + (*b as u64)) % 65521u64;
+        b2 = (b2 + a) % 65521u64;
+      }
+      self.adler_a = a;
+      self.adler_b = b2;
+    }
+  }
+
+  /// The gzip header, with its optional fields. W_DATA, or NEED_MORE or FAILED.
+  fn gzip_header(self : &mut Inflate) -> i32 {
+    let n = self.input.len();
+    let mut p = self.pos;
+    if p + 10 > n {
+      return NEED_MORE;
+    }
+    if self.input.get(p) != 31u8 || self.input.get(p + 1) != 139u8 {
+      return self.fail("incorrect header check");
+    }
+    if self.input.get(p + 2) != 8u8 {
+      return self.fail("unknown compression method");
+    }
+    let flags = self.input.get(p + 3) as i32;
+    if flags >= 32 {
+      return self.fail("unknown header flags set");
+    }
+    p = p + 10;
+    // FEXTRA: a length of two bytes, then the field.
+    if (flags / 4) % 2 == 1 {
+      if p + 2 > n {
+        return NEED_MORE;
+      }
+      p = p + 2 + (self.input.get(p) as i32) + (self.input.get(p + 1) as i32) * 256;
+      if p > n {
+        return NEED_MORE;
+      }
+    }
+    // FNAME and FCOMMENT: text up to a 0 byte.
+    let mut field = 8;
+    while field <= 16 {
+      if (flags / field) % 2 == 1 {
+        while p < n && self.input.get(p) != 0u8 {
+          p = p + 1;
+        }
+        if p >= n {
+          return NEED_MORE;
+        }
+        p = p + 1;
+      }
+      field = field * 2;
+    }
+    // FHCRC: two bytes of the CRC of the header.
+    if (flags / 2) % 2 == 1 {
+      p = p + 2;
+      if p > n {
+        return NEED_MORE;
+      }
+    }
+    self.pos = p;
+    return W_DATA;
+  }
+
+  /// The zlib header. W_DATA, or NEED_MORE or FAILED.
+  fn zlib_header(self : &mut Inflate) -> i32 {
+    if self.pos + 2 > self.input.len() {
+      return NEED_MORE;
+    }
+    let cmf = self.input.get(self.pos) as i32;
+    let flg = self.input.get(self.pos + 1) as i32;
+    if (cmf * 256 + flg) % 31 != 0 {
+      return self.fail("incorrect header check");
+    }
+    if cmf % 16 != 8 {
+      return self.fail("unknown compression method");
+    }
+    if cmf / 16 > 7 {
+      return self.fail("invalid window size");
+    }
+    if (flg / 32) % 2 == 1 {
+      // A preset dictionary, which HTTP never has.
+      return self.fail("need dictionary");
+    }
+    self.pos = self.pos + 2;
+    return W_DATA;
+  }
+
+  /// The trailer of the wrapper after the DEFLATE data. W_END, or NEED_MORE or FAILED.
+  fn trailer(self : &mut Inflate) -> i32 {
+    // The trailer starts at a byte.
+    if self.bit != 0 {
+      self.bit = 0;
+      self.pos = self.pos + 1;
+    }
+    if self.wrap == WRAP_GZIP {
+      if self.pos + 8 > self.input.len() {
+        return NEED_MORE;
+      }
+      let crc = read_le32(&self.input, self.pos);
+      let size = read_le32(&self.input, self.pos + 4);
+      if crc != (self.crc ^ 4294967295u64) {
+        return self.fail("incorrect data check");
+      }
+      if size != ((self.total as u64) % 4294967296u64) {
+        return self.fail("incorrect length check");
+      }
+      self.pos = self.pos + 8;
+      return W_END;
+    }
+    if self.wrap == WRAP_ZLIB {
+      if self.pos + 4 > self.input.len() {
+        return NEED_MORE;
+      }
+      let adler = ((self.input.get(self.pos) as u64) * 16777216u64)
+        + ((self.input.get(self.pos + 1) as u64) * 65536u64)
+        + ((self.input.get(self.pos + 2) as u64) * 256u64) + (self.input.get(self.pos + 3) as u64);
+      if adler != self.adler_b * 65536u64 + self.adler_a {
+        return self.fail("incorrect data check");
+      }
+      self.pos = self.pos + 4;
+      return W_END;
+    }
+    return W_END;
+  }
+
+  /// Decode `piece`, the next bytes of the body. Gives the decoded bytes, or FAILED with the
+  /// text in `error` and the exit code in `error_code`.
+  pub fn feed(self : &mut Inflate, piece : &Vec<u8>) -> Result<Vec<u8>, i32> {
+    let mut out = Vec<u8>::new();
+    if piece.len() == 0 {
+      return Result<Vec<u8>, i32>::Ok(out);
+    }
+    self.started = true;
+    // Drop the input that is used, and add the new piece.
+    if self.pos > 0 {
+      self.input = rest_from(&self.input, self.pos);
+      self.pos = 0;
+    }
+    append(&mut self.input, piece);
+    loop {
+      if self.wstate == W_HEADER {
+        let mut next = NEED_MORE;
+        if self.wrap == WRAP_GZIP {
+          next = self.gzip_header();
+        } else {
+          next = self.zlib_header();
+        }
+        if next == FAILED && self.can_fall_back {
+          // Some servers send raw DEFLATE as `deflate`: libcurl tries that, and allows up to
+          // four bytes after it.
+          self.wrap = WRAP_RAW;
+          self.trailer_left = 4;
+          self.error = Vec<u8>::new();
+          self.error_code = 0;
+          self.wstate = W_DATA;
+          continue;
+        }
+        if next < 0 {
+          return self.result_of(next, out);
+        }
+        self.can_fall_back = false;
+        self.wstate = next;
+        continue;
+      }
+      if self.wstate == W_DATA {
+        let before = out.len();
+        let next = self.deflate_data(&mut out);
+        if out.len() > before {
+          self.can_fall_back = false;
+          let fresh = rest_from(&out, before);
+          self.check_output(&fresh);
+        }
+        if next != ST_DONE {
+          return self.result_of(next, out);
+        }
+        self.wstate = W_TRAILER;
+        continue;
+      }
+      if self.wstate == W_TRAILER {
+        let next = self.trailer();
+        if next < 0 {
+          return self.result_of(next, out);
+        }
+        self.wstate = W_END;
+        continue;
+      }
+      // After the end: raw DEFLATE may have up to four bytes more. Anything else is an error,
+      // as in libcurl, which has no way to decode a second gzip member.
+      let rest = self.input.len() - self.pos;
+      if rest == 0 {
+        return Result<Vec<u8>, i32>::Ok(out);
+      }
+      if self.wrap == WRAP_RAW && rest <= self.trailer_left {
+        self.trailer_left = self.trailer_left - rest;
+        self.pos = self.input.len();
+        return Result<Vec<u8>, i32>::Ok(out);
+      }
+      if self.wrap == WRAP_GZIP && rest >= 2 && self.input.get(self.pos) == 31u8
+         && self.input.get(self.pos + 1) == 139u8 {
+        self.error = lit("Multi-member gzip response not supported");
+      } else {
+        self.error = lit("Failed writing received data to disk/application");
+      }
+      self.error_code = 23;
+      return Result<Vec<u8>, i32>::Err(FAILED);
+    }
+  }
+
+  fn result_of(self : &mut Inflate, step : i32, out : Vec<u8>) -> Result<Vec<u8>, i32> {
+    if step == FAILED {
+      return Result<Vec<u8>, i32>::Err(FAILED);
+    }
+    return Result<Vec<u8>, i32>::Ok(out);
+  }
+
+  /// Whether the data ended, so that the end of the body is fine.
+  pub fn complete(self : &Inflate) -> bool {
+    return !self.started || self.wstate == W_END;
+  }
+}
+
+/// The 4 bytes at `at` as a little-endian number.
+fn read_le32(bytes : &Vec<u8>, at : i32) -> u64 {
+  return (bytes.get(at) as u64) + (bytes.get(at + 1) as u64) * 256u64
+    + (bytes.get(at + 2) as u64) * 65536u64 + (bytes.get(at + 3) as u64) * 16777216u64;
+}

@@ -167,6 +167,8 @@ struct RequestInfo {
   form_boundary : Vec<u8>,
   // The request goes over HTTP/2: no `Expect: 100-continue` and no chunks.
   h2 : bool,
+  // `--compressed`: ask for the encodings that securl decodes.
+  accept_encoding : bool,
 }
 
 fn add_line(out : &mut Vec<u8>, name : *const i8, value : &Vec<u8>) -> void {
@@ -255,6 +257,9 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
 
   if !has_custom(&info.headers, "Accept") {
     push_lit(&mut out, "Accept: */*\r\n");
+  }
+  if info.accept_encoding && !has_custom(&info.headers, "Accept-Encoding") {
+    push_lit(&mut out, "Accept-Encoding: deflate, gzip\r\n");
   }
 
   if info.has_referer && !has_custom(&info.headers, "Referer") {

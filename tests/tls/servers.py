@@ -21,7 +21,8 @@ It starts six servers on free ports of 127.0.0.1 and writes their ports to PORT_
 On both HTTP servers, `/stall` sends 10 of the 100 bytes of its body and then waits, for the
 time limits of reads, and `/huge-chunk` sends a chunk size too large for 64 bits. The paths of
 `ENDLESS` send a status line, a header, a chunk-size line or a trailer that never ends, and
-`/chunk-junk` a chunk with no CRLF after its data.
+`/chunk-junk` a chunk with no CRLF after its data. The paths of `ENCODED` send a body with a
+Content-Encoding for `--compressed`.
 
 It runs until it is killed.
 """
@@ -34,6 +35,7 @@ import struct
 import sys
 import threading
 import time
+import zlib
 
 CERT_DIR, PORT_FILE, PROXY_LOG = sys.argv[1], sys.argv[2], sys.argv[3]
 
@@ -44,6 +46,24 @@ ENDLESS = {
     "/endless-header": b"HTTP/1.1 200 OK\r\nX-Long: ",
     "/endless-chunk-line": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;",
     "/endless-trailer": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-T: ",
+}
+
+
+def gzip_bytes(data):
+    c = zlib.compressobj(9, zlib.DEFLATED, 31)
+    return c.compress(data) + c.flush()
+
+
+TEXT = b"".join(b"line %d of a body that compresses well\n" % i for i in range(5000))
+_GZ = gzip_bytes(TEXT)
+# path: (Content-Encoding, body, chunked)
+ENCODED = {
+    "/gzip": ("gzip", _GZ, True),
+    "/deflate": ("deflate", zlib.compress(TEXT), False),
+    "/gzip-cut": ("gzip", _GZ[:len(_GZ) // 2], False),
+    "/gzip-bad-crc": ("gzip", _GZ[:-8] + bytes([_GZ[-8] ^ 1]) + _GZ[-7:], False),
+    "/compress": ("compress", b"not decodable", False),
+    "/six": ("gzip, gzip, gzip, gzip, gzip, gzip", _GZ, False),
 }
 
 
@@ -61,7 +81,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/":
+        if self.path in ENCODED:
+            encoding, body, chunked = ENCODED[self.path]
+            self.send_response(200)
+            self.send_header("Content-Encoding", encoding)
+            if chunked:
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                for i in range(0, len(body), 1000):
+                    part = body[i:i + 1000]
+                    self.wfile.write(b"%x\r\n" % len(part) + part + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+            else:
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        elif self.path == "/":
             self.send_body(b"hello over tls\n")
         elif self.path == "/whoami":
             cert = self.connection.getpeercert() or {}
