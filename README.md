@@ -59,7 +59,7 @@ make test-h2    # HTTP/2 tests against a local server (makes a virtualenv with h
 
 Measured with curl's own test suite: curl's `runtests.pl` and its test servers, pointed at
 `build/securl` with `-c`. The tests come from curl commit 2f5c657, and the compiler is vxc from
-Vx main 973d80f9b.
+Vx main 12f3786c8.
 
 | Test set | Passed |
 |---|---|
@@ -395,7 +395,9 @@ The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #
 - [#4118](https://github.com/vx-lang/Vx/issues/4118) A move of a field out of `&mut self` got
   no E4008 in the full securl build, and the program freed the field twice, in a package with
   `--no-trusted-code`. A small program with the same function gets E4008. `output.vx` now
-  borrows the field instead.
+  borrows the field instead. Vx #4121 fixed it: the checker skipped the body of a function
+  that a `?` checked first. With it, the old securl tree gets E4008, and the current one
+  builds with no new error.
 - [#4119](https://github.com/vx-lang/Vx/issues/4119) `main` cannot get a command-line word that
   is not UTF-8, so securl cannot either.
 - [#4120](https://github.com/vx-lang/Vx/issues/4120) `std::net` has no name lookup, so
