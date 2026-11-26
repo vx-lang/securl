@@ -66,10 +66,12 @@ Vx main 860f9f31a.
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 7 of 7 |
 
-`CURL=/path/to/curl tests/tls/run.sh` runs the checks of `tests/tls` against another curl. curl
-8.23.1-DEV, built from the same curl commit, passes all of them but one, which it skips: curl
-reads the extension of a chunk-size line with no limit and waits for `-m`, while securl stops
-after 100 KiB.
+`CURL=/path/to/curl tests/tls/run.sh` runs the checks of `tests/tls` against another curl, and
+`tests/h2/run.sh` takes `CURL` too. curl 8.23.1-DEV, built from the same curl commit, passes all
+TLS checks but one, which it skips: curl reads the extension of a chunk-size line with no limit
+and waits for `-m`, while securl stops after 100 KiB. curl 8.18 with nghttp2 passes all HTTP/2
+checks, with the same exit codes. It skips four that look for securl's own messages, where
+curl gives the error texts of nghttp2.
 
 Some HTTP tests have the keyword `libtest` or `unittest`. For those, runtests.pl runs a C
 program of the curl build, linked with curl's own libcurl, so they never run securl.

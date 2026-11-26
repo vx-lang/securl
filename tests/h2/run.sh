@@ -4,10 +4,11 @@
 # makes a Python virtualenv with h2 in build/h2-venv (it needs pip and PyPI).
 #
 #   tests/h2/run.sh
+#   CURL=/usr/bin/curl tests/h2/run.sh     # the same checks against another curl
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-curl=$root/build/securl
+curl=${CURL:-$root/build/securl}
 certs=$root/tests/tls/certs
 work=$root/build/h2-tests
 venv=$root/build/h2-venv
@@ -45,6 +46,15 @@ check() {
     echo "ok   $name"
   fi
 }
+# own NAME TEXT FILE: as `has`, for a message of securl's own. curl takes these texts from
+# nghttp2, such as "nghttp2 recv error -902", so the check runs only for securl.
+own() {
+  if [ -n "${CURL:-}" ]; then
+    echo "skip $1: securl's own message"
+  else
+    has "$@"
+  fi
+}
 # has NAME TEXT FILE: FILE holds TEXT.
 has() {
   if grep -qF -- "$2" "$3"; then
@@ -74,14 +84,14 @@ check "GOAWAY after the response" 0 "then goaway" -sS $ca "$base/goaway"
 check "RST_STREAM" 92 "" -sS $ca "$base/reset"
 has "  with curl's message" "HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR (err 2)" "$work/stderr"
 check "CONTINUATION frames with no end" 16 "" -sS $ca "$base/endless-continuation"
-has "  stop at the limit" "HTTP/2: header block too large" "$work/stderr"
+own "  stop at the limit" "HTTP/2: header block too large" "$work/stderr"
 check "WINDOW_UPDATE of 0 on the connection" 16 "" -sS $ca "$base/window-zero-conn"
-has "  is a connection error" "HTTP/2: WINDOW_UPDATE with an increment of 0" "$work/stderr"
+own "  is a connection error" "HTTP/2: WINDOW_UPDATE with an increment of 0" "$work/stderr"
 check "WINDOW_UPDATE of 0 on the stream" 92 "" -sS $ca "$base/window-zero-stream"
-has "  is a stream error" "PROTOCOL_ERROR (err 1)" "$work/stderr"
+own "  is a stream error" "PROTOCOL_ERROR (err 1)" "$work/stderr"
 check "connection window above 2^31 - 1" 16 "" -sS $ca "$base/window-overflow-conn"
 check "stream window above 2^31 - 1" 92 "" -sS $ca "$base/window-overflow-stream"
-has "  is a stream error" "FLOW_CONTROL_ERROR (err 3)" "$work/stderr"
+own "  is a stream error" "FLOW_CONTROL_ERROR (err 3)" "$work/stderr"
 check "redirect with -L" 0 "hello over h2
 1" -sSL $ca -w '%{num_redirects}' "$base/redirect"
 "$curl" -sS $ca -i "$base/trailers" > "$work/trailers" 2>&1
