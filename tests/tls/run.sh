@@ -4,10 +4,13 @@
 # 127.0.0.1.
 #
 #   tests/tls/run.sh
+#   CURL=/usr/bin/curl tests/tls/run.sh     # the same checks against another curl
 set -u
+# The proxy checks set these themselves.
+unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-curl=$root/build/securl
+curl=${CURL:-$root/build/securl}
 certs=$here/certs
 work=$root/build/tls-tests
 mkdir -p "$work"
@@ -26,12 +29,15 @@ read -r https http proxy mute < "$work/ports"
 
 fail=0
 # check NAME EXPECTED_EXIT EXPECTED_STDOUT CURL_ARGUMENTS...
+# It runs curl with the variables of `curl_env`, such as `https_proxy=...`, in its environment.
+curl_env=
 check() {
   name=$1
   want_exit=$2
   want_out=$3
   shift 3
-  out=$(timeout 20 "$curl" "$@" 2> "$work/stderr")
+  # shellcheck disable=SC2086
+  out=$(env $curl_env timeout 20 "$curl" "$@" 2> "$work/stderr")
   got=$?
   if [ "$got" -ne "$want_exit" ] || [ "$out" != "$want_out" ]; then
     echo "FAIL $name: exit $got (want $want_exit), output '$out' (want '$want_out')"
@@ -147,6 +153,47 @@ stderr_has "  with curl's message" "Connection timed out after"
 check "--connect-timeout leaves a slow body alone" 28 "" \
   -sS --connect-timeout 1 -m 2 -o "$work/stalled" "http://127.0.0.1:$http/stall"
 stderr_has "  and -m ends it" "Operation timed out after"
+# Proxies from the environment, as libcurl reads them. The proxy of servers.py does only
+# CONNECT and answers 405 to anything else, so a request that went to it directly gives 405.
+p=http://127.0.0.1:$proxy
+: > "$work/proxy.log"
+curl_env="https_proxy=$p"
+check "https_proxy" 0 "hello over tls" -sS --cacert "$certs/ca.pem" "https://localhost:$https/"
+if grep -q "^CONNECT localhost:$https " "$work/proxy.log"; then
+  echo "ok     through a CONNECT of the proxy"
+else
+  echo "FAIL   no CONNECT in the log of the proxy"
+  fail=1
+fi
+curl_env="HTTPS_PROXY=$p"
+check "HTTPS_PROXY" 0 "hello over tls" -sS --cacert "$certs/ca.pem" "https://localhost:$https/"
+curl_env="all_proxy=$p"
+check "all_proxy" 0 "hello over tls" -sS --cacert "$certs/ca.pem" "https://localhost:$https/"
+curl_env="http_proxy=$p"
+check "http_proxy" 0 "405" -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$http/"
+check "http_proxy with -p goes through a tunnel" 0 "hello over tls" \
+  -sS -p "http://127.0.0.1:$http/"
+check "  and --proxytunnel too" 0 "hello over tls" -sS --proxytunnel "http://127.0.0.1:$http/"
+curl_env="HTTP_PROXY=$p"
+check "no HTTP_PROXY in upper case" 0 "hello over tls" -sS "http://127.0.0.1:$http/"
+curl_env="http_proxy=$p no_proxy=localhost,127.0.0.1"
+check "no_proxy" 0 "hello over tls" -sS "http://127.0.0.1:$http/"
+curl_env="http_proxy=$p NO_PROXY=*"
+check "NO_PROXY=*" 0 "hello over tls" -sS "http://127.0.0.1:$http/"
+curl_env="http_proxy=$p no_proxy=127.0.0.1"
+check "--noproxy '' wins over no_proxy" 0 "405" -s --noproxy '' -o /dev/null \
+  -w '%{http_code}' "http://127.0.0.1:$http/"
+curl_env="http_proxy=$p"
+check "-x '' turns the variables off" 0 "hello over tls" -sS -x '' "http://127.0.0.1:$http/"
+curl_env="http_proxy=http://127.0.0.1:$mute"
+check "-x wins over http_proxy" 0 "405" -s -x "$p" -o /dev/null -w '%{http_code}' \
+  "http://127.0.0.1:$http/"
+curl_env="https_proxy=$p"
+check "-v names the variable" 0 "hello over tls" -sS -v --cacert "$certs/ca.pem" \
+  "https://localhost:$https/"
+stderr_has "  with curl's message" "Uses proxy env variable https_proxy == '$p'"
+curl_env=
+
 # The TCP options of libcurl, in its order: TCP_NODELAY, then keepalive after 60 seconds, every
 # 60 seconds, 9 times.
 sockopts "TCP_NODELAY and keepalive by default" \

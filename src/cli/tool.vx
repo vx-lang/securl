@@ -2,11 +2,13 @@
 //
 // `tool_main` gets the rights of the program from `main`, in `root`. It gives the network
 // right only to the transfer, and it keeps the right to open files for itself: it reads the
-// files that the command line names and opens the output files. So the parsers of the command
-// line, of URLs and of responses can neither open a file nor a connection, and the compiler
-// checks that.
+// files that the command line names and opens the output files. It reads the proxy variables
+// of the environment with the environment right, and gives the transfer only their values. So
+// the parsers of the command line, of URLs and of responses can neither open a file nor a
+// connection, nor read the environment, and the compiler checks that.
 import core::option;
 import core::result;
+import std::env;
 import std::fs;
 import std::net;
 import std::root;
@@ -30,12 +32,40 @@ import securl::url;
 import securl::writeout;
 import disk::files;
 
+/// Add the environment variable `name` to `out` when it has a value.
+fn add_env(out : &mut Vec<EnvVar>, env : &Environment, name : *const i8) -> void {
+  let value = env_var(env, name);
+  if value.len() > 0 {
+    out.push(EnvVar {
+      name : lit(name),
+      value : value
+    });
+  }
+}
+
+/// The proxy variables of the environment that libcurl reads for HTTP and HTTPS. Only the
+/// lower-case `http_proxy`, as in libcurl: a CGI program gets `HTTP_PROXY` from the `Proxy:`
+/// header of a request, which anyone can send.
+fn proxy_env(env : &Environment) -> Vec<EnvVar> {
+  let mut out = Vec<EnvVar>::new();
+  add_env(&mut out, env, "http_proxy");
+  add_env(&mut out, env, "https_proxy");
+  add_env(&mut out, env, "HTTPS_PROXY");
+  add_env(&mut out, env, "all_proxy");
+  add_env(&mut out, env, "ALL_PROXY");
+  add_env(&mut out, env, "no_proxy");
+  add_env(&mut out, env, "NO_PROXY");
+  return out;
+}
+
 /// The program, with the rights of `main`. It gives the exit code of curl.
 pub fn tool_main(root : Root) -> i32 {
   ignore_sigpipe();
   let args = args();
   match parse_args(&args) {
-    Result<Config, Failure>::Ok(cfg) => {
+    Result<Config, Failure>::Ok(parsed) => {
+      let mut cfg = parsed;
+      cfg.proxy_env = proxy_env(&root.env);
       return run(&root.network, &root.files, &cfg);
     },
     Result<Config, Failure>::Err(f) => {

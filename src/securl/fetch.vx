@@ -474,7 +474,7 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
     &creds.password, has_custom(headers, "Authorization"), &method, &u.path, &origin_of(u));
   // The credentials of an HTTP proxy go with each request that goes through it. The CONNECT of
   // a tunnel sends its own.
-  let via_proxy = proxy.used && !secure;
+  let via_proxy = proxy.used && !secure && !cfg.proxytunnel;
   let proxy_allowed = via_proxy && proxy.has_credentials;
   let proxy_header = output_auth(&mut auth.proxy, &mut auth.proxy_digest, proxy_allowed,
     &proxy.user, &proxy.password, has_custom(headers, "Proxy-Authorization"), &method, &u.path,
@@ -863,10 +863,11 @@ address : &Vec<u8>, secure : bool, deadline : Instant, info : &mut TransferInfo)
     push_u64(&mut m, u.port as u64);
     verbose_info(&m);
   }
+  // HTTPS through a proxy goes through a CONNECT tunnel, and so does HTTP with `-p`.
+  if proxy.used && (secure || cfg.proxytunnel) {
+    open_tunnel(&mut c, cfg, u, proxy, info)?;
+  }
   if secure {
-    if proxy.used {
-      open_tunnel(&mut c, cfg, u, proxy, info)?;
-    }
     // curl offers HTTP/2 over TLS unless `--http1.1` or `--http1.0` says no.
     let _tls = c.start_tls(tls, &u.host, host_is_address(&u.host, u.ipv6),
       !cfg.no_h2 && !cfg.http10)?;
@@ -974,7 +975,37 @@ fn no_proxy_for(list : &Vec<u8>, host : &Vec<u8>) -> bool {
   return false;
 }
 
-/// The proxy for a request to `u`. securl speaks only to HTTP proxies.
+/// The first of the proxy variables `a` and `b` that is set, or an empty list. With `-v` it says
+/// which one, as libcurl does. `b` may be empty, for no second variable.
+fn proxy_env_value(cfg : &Config, a : *const i8, b : *const i8) -> Vec<u8> {
+  let mut k = 0;
+  while k < 2 {
+    let mut name = lit(a);
+    if k == 1 {
+      name = lit(b);
+    }
+    for var in cfg.proxy_env.iter() {
+      if name.len() > 0 && same_bytes(&var.name, &name) {
+        if cfg.verbose {
+          let mut m = lit("Uses proxy env variable ");
+          append(&mut m, &var.name);
+          push_lit(&mut m, " == '");
+          append(&mut m, &var.value);
+          push_lit(&mut m, "'");
+          verbose_info(&m);
+        }
+        return clone_bytes(&var.value);
+      }
+    }
+    k = k + 1;
+  }
+  return Vec<u8>::new();
+}
+
+/// The proxy for a request to `u`, as libcurl chooses it. securl speaks only to HTTP proxies.
+/// `--noproxy`, or else `no_proxy` or `NO_PROXY`, names the hosts that go direct. Then `-x`,
+/// where an empty value means no proxy. Then the variables: `https_proxy` or `HTTPS_PROXY`
+/// for HTTPS, `http_proxy` for HTTP, and last `all_proxy` or `ALL_PROXY`.
 fn proxy_for(cfg : &Config, u : &Url) -> Result<Proxy, Failure> {
   let none = Proxy {
     used : false,
@@ -983,16 +1014,34 @@ fn proxy_for(cfg : &Config, u : &Url) -> Result<Proxy, Failure> {
     user : Vec<u8>::new(),
     password : Vec<u8>::new()
   };
-  if !cfg.has_proxy || no_proxy_for(&cfg.noproxy, &u.host) {
+  let mut noproxy = clone_bytes(&cfg.noproxy);
+  if !cfg.has_noproxy {
+    noproxy = proxy_env_value(cfg, "no_proxy", "NO_PROXY");
+  }
+  if no_proxy_for(&noproxy, &u.host) {
     return Result<Proxy, Failure>::Ok(none);
   }
-  let mut text = clone_bytes(&cfg.proxy);
+  let mut given = clone_bytes(&cfg.proxy);
+  if !cfg.proxy_set {
+    if eq_lit(&u.scheme, "https") {
+      given = proxy_env_value(cfg, "https_proxy", "HTTPS_PROXY");
+    } else {
+      given = proxy_env_value(cfg, "http_proxy", "");
+    }
+    if given.len() == 0 {
+      given = proxy_env_value(cfg, "all_proxy", "ALL_PROXY");
+    }
+  }
+  if given.len() == 0 {
+    return Result<Proxy, Failure>::Ok(none);
+  }
+  let mut text = clone_bytes(&given);
   let sep = find_seq(&text, &lit("://"), 0);
   if sep >= 0 {
     let scheme = to_lower(&range_of(&text, 0, sep));
     if !eq_lit(&scheme, "http") {
       let mut m = lit("Unsupported proxy scheme for '");
-      append(&mut m, &cfg.proxy);
+      append(&mut m, &given);
       push_lit(&mut m, "'");
       return Result<Proxy, Failure>::Err(fail_with(COULDNT_CONNECT, m));
     }
@@ -1040,7 +1089,8 @@ fn has_port_in(text : &Vec<u8>) -> bool {
   return find_byte(&host_port, 58u8, close + 1) >= 0;
 }
 
-/// Ask the HTTP proxy for a tunnel to the host of `u` with CONNECT, for HTTPS through a proxy.
+/// Ask the HTTP proxy for a tunnel to the host of `u` with CONNECT, for HTTPS through a proxy
+/// and for `-p`.
 fn open_tunnel(c : &mut Conn, cfg : &Config, u : &Url, proxy : &Proxy, info : &mut TransferInfo)
 -> Result<i32, Failure> {
   let request = build_connect_request(u, proxy.has_credentials, &proxy.user, &proxy.password,

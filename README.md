@@ -15,7 +15,9 @@ The goal is to show what Vx's type system buys a network tool:
 - **Capabilities.** Only `main` gets the rights of the program (`fn main(root : Root)`), and it
   hands them to `cli::tool_main`. That gives the network right (`&Network`) to the transfer and
   keeps the file right (`&Files`) for itself. It also loads the certificate authorities for TLS,
-  because that reads files, and lends the result to the transfer. The parsers get no right, so
+  because that reads files, and lends the result to the transfer. With the environment right
+  (`&Environment`) it reads the proxy variables, such as `https_proxy`, and gives the transfer
+  their values, not the right. The parsers get no right, so
   a bug in a parser cannot open a file or a socket: the compiler checks that the protocol code
   has no other way to the disk or the network. It can still use standard input, output and
   error, through `sys::console`, with no right. A right for them in `Root` would close that
@@ -58,9 +60,9 @@ Vx main 860f9f31a.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 372 of 720 (52%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 348 of 419 (83%) |
-| TLS, time-limit and size-limit tests against local servers (`tests/tls`) | 36 of 36 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 376 of 720 (52%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 353 of 429 (82%) |
+| TLS, proxy, socket-option and limit tests against local servers (`tests/tls`) | 55 of 55 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 7 of 7 |
 
@@ -78,12 +80,12 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 8,743 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 619 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 8,821 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 649 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` to `cli`) | 11 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
-| `src/sys/` (OpenSSL calls, socket options and time limits, shims for what `std` lacks) | 922 | 38 `extern` functions, 56 `unsafe` blocks |
+| `src/sys/` (OpenSSL calls, socket options and time limits, shims for what `std` lacks) | 963 | 38 `extern` functions, 58 `unsafe` blocks |
 
-Of the trusted code in `src/sys/`, 80 of the 94 items are the OpenSSL bindings: TLS (with the
+Of the trusted code in `src/sys/`, 80 of the 96 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
 `hash.vx`.
 Two safe functions of `sys` read through a raw pointer with no check, `lit` and `push_lit`,
@@ -117,7 +119,7 @@ address, as curl does, with TLS 1.2 at least, SNI and ALPN `http/1.1`. It trusts
 authorities of the system: the first bundle that it finds in the usual places of Linux and
 macOS, and the paths that OpenSSL knows, including `SSL_CERT_FILE` and `SSL_CERT_DIR`.
 `--cacert` and `--capath` name others, and `-k` turns the check off. An `https://` URL through
-an HTTP proxy uses a CONNECT tunnel. The exit codes are curl's: 60 for a certificate problem, 35
+an HTTP proxy uses a CONNECT tunnel, and so does an `http://` URL with `-p`. The exit codes are curl's: 60 for a certificate problem, 35
 for a failed handshake, and 77 for a file of certificate authorities that cannot be read.
 
 ## Time limits
@@ -219,7 +221,7 @@ missing options that block the most tests.
 `name;` forms) `-I` `-i` `-k` `--cacert` `--capath` `-L` `--location-trusted` `--max-redirs`
 `-o` `-O` `--remote-name-all` `--output-dir` `-r` `-s` `-S` `-T` `-u` `--digest` `--basic`
 `--anyauth` `-v` `-w` (most variables, `%header{}`, `%{header_json}`, `%output{}`, `%{stderr}`)
-`-X` `-x` `-U`
+`-X` `-x` `-U` `-p` `--proxytunnel`
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
 `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
 `--connect-timeout` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay` `-h`
@@ -230,6 +232,12 @@ seconds with no traffic, then one each 60 seconds, and 9 probes with no answer d
 connection. `--keepalive-time` sets both times, `--keepalive-cnt` the probes, and
 `--no-keepalive` and `--no-tcp-nodelay` turn them off. `src/sys/socket.vx` calls `setsockopt`,
 because `std::net::TcpStream` has no socket options.
+
+Without `-x`, the proxy comes from the environment, as in libcurl: `https_proxy` or
+`HTTPS_PROXY` for HTTPS, `http_proxy` for HTTP, and then `all_proxy` or `ALL_PROXY`. As libcurl
+does, securl does not read `HTTP_PROXY` in upper case, which a CGI program gets from the
+`Proxy:` header of any request. `--noproxy`, or else `no_proxy` or `NO_PROXY`, lists the hosts
+that go direct, and `-x ""` turns the variables off. `-v` says which variable it used.
 
 The 2025 curl user survey asked for each user's favourite option. securl accepts 19 of the top
 20 answers. It does not have `--libcurl`. `-vv` and `-vvv` work as `-v`, and `-w` has no
@@ -243,8 +251,7 @@ In order of how much users need them:
    `Upgrade: h2c` of `--http2` on plain HTTP, and HTTP/2 through an HTTP proxy.
 1. URL globbing (`{a,b}` and `[1-9]`), `--next`, `-J`, `-C` resume, `-K` config files,
    `--netrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
-   encoders, `http_proxy` and `NO_PROXY` variables (Vx has no safe way to read the
-   environment), HTTPS proxies, and Digest with the proxy of a CONNECT tunnel.
+   encoders, SOCKS proxies, HTTPS proxies, and Digest with the proxy of a CONNECT tunnel.
 1. HTTP/3.
 
 ## Vx issues found while writing securl
