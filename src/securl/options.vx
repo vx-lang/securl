@@ -140,6 +140,14 @@ struct Config {
   proxy_kind : i32,
   // `--noproxy` was given, perhaps with an empty value, which turns `no_proxy` off.
   has_noproxy : bool,
+  // `--cert` (`-E`), `--cert-type`, `--key`, `--key-type` and `--pass`: the client
+  // certificate for TLS. A password after the file name of `--cert` sets `pass` too.
+  cert : Vec<u8>,
+  cert_type : Vec<u8>,
+  key : Vec<u8>,
+  key_type : Vec<u8>,
+  has_pass : bool,
+  pass : Vec<u8>,
   // The proxy variables of the environment that are set, such as `https_proxy`. The tool
   // reads them. This package gets their values, and not the right to read the environment.
   proxy_env : Vec<EnvVar>,
@@ -223,6 +231,12 @@ pub fn default_config() -> Config {
     proxy_set : false,
     proxy_kind : PROXY_HTTP,
     has_noproxy : false,
+    cert : Vec<u8>::new(),
+    cert_type : Vec<u8>::new(),
+    key : Vec<u8>::new(),
+    key_type : Vec<u8>::new(),
+    has_pass : false,
+    pass : Vec<u8>::new(),
     proxy_env : Vec<EnvVar>::new()
   };
 }
@@ -306,6 +320,11 @@ const OPT_SOCKS4 : i32 = 76;
 const OPT_SOCKS4A : i32 = 77;
 const OPT_SOCKS5 : i32 = 78;
 const OPT_SOCKS5_HOSTNAME : i32 = 79;
+const OPT_CERT : i32 = 80;
+const OPT_CERT_TYPE : i32 = 81;
+const OPT_KEY : i32 = 82;
+const OPT_KEY_TYPE : i32 = 83;
+const OPT_PASS : i32 = 84;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -392,6 +411,11 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "socks4a") { return OPT_SOCKS4A; }
   if eq_lit(name, "socks5") { return OPT_SOCKS5; }
   if eq_lit(name, "socks5-hostname") { return OPT_SOCKS5_HOSTNAME; }
+  if eq_lit(name, "cert") { return OPT_CERT; }
+  if eq_lit(name, "cert-type") { return OPT_CERT_TYPE; }
+  if eq_lit(name, "key") { return OPT_KEY; }
+  if eq_lit(name, "key-type") { return OPT_KEY_TYPE; }
+  if eq_lit(name, "pass") { return OPT_PASS; }
   return OPT_UNKNOWN;
 }
 
@@ -433,6 +457,7 @@ fn short_option(letter : u8) -> i32 {
   if letter == 35u8 { return OPT_PROGRESS_BAR; }    // #
   if letter == 78u8 { return OPT_NO_BUFFER; }       // N
   if letter == 112u8 { return OPT_PROXYTUNNEL; }    // p
+  if letter == 69u8 { return OPT_CERT; }            // E
   return OPT_UNKNOWN;
 }
 
@@ -441,7 +466,7 @@ fn takes_value(id : i32) -> bool {
   return (id >= OPT_USER_AGENT && id <= OPT_OUTPUT_DIR) || id == OPT_CACERT || id == OPT_CAPATH
     || id == OPT_FORM || id == OPT_FORM_STRING || id == OPT_COOKIE_JAR
     || id == OPT_KEEPALIVE_TIME || id == OPT_KEEPALIVE_CNT
-    || (id >= OPT_SOCKS4 && id <= OPT_SOCKS5_HOSTNAME);
+    || (id >= OPT_SOCKS4 && id <= OPT_PASS);
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -514,6 +539,62 @@ fn unsigned_arg(value : &Vec<u8>, shown : &Vec<u8>) -> Result<i64, Failure> {
     return Result<i64, Failure>::Err(option_error(shown, "expected a positive numerical parameter"));
   }
   return Result<i64, Failure>::Ok(n);
+}
+
+/// The value of `--cert`, split into the file name and the password after it.
+struct CertParameter {
+  name : Vec<u8>,
+  has_password : bool,
+  password : Vec<u8>,
+}
+
+/// Split the value of `--cert` as curl's `parse_cert_parameter` does: the first `:` that no
+/// backslash escapes ends the name, and the rest is the password. `\:` is a colon and `\\` a
+/// backslash in the name, and a backslash before anything else stays. A value that starts with
+/// `pkcs11:` is a PKCS#11 URI and stays whole.
+pub fn split_cert_parameter(value : &Vec<u8>) -> CertParameter {
+  let mut name = Vec<u8>::new();
+  if starts_lit_nocase(value, "pkcs11:") {
+    return CertParameter {
+      name : clone_bytes(value),
+      has_password : false,
+      password : Vec<u8>::new()
+    };
+  }
+  let mut i = 0;
+  while i < value.len() {
+    let b = value.get(i);
+    if b == 92u8 {
+      if i + 1 >= value.len() {
+        name.push(92u8);
+        i = i + 1;
+        continue;
+      }
+      let next = value.get(i + 1);
+      if next != 92u8 && next != 58u8 {
+        name.push(92u8);
+      }
+      name.push(next);
+      i = i + 2;
+      continue;
+    }
+    if b == 58u8 {
+      // An empty password counts as none.
+      let rest = rest_from(value, i + 1);
+      return CertParameter {
+        name : name,
+        has_password : rest.len() > 0,
+        password : rest
+      };
+    }
+    name.push(b);
+    i = i + 1;
+  }
+  return CertParameter {
+    name : name,
+    has_password : false,
+    password : Vec<u8>::new()
+  };
 }
 
 fn add_data(cfg : &mut Config, kind : i32, value : &Vec<u8>) -> void {
@@ -760,6 +841,34 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     cfg.http10 = false;
     cfg.no_h2 = false;
     cfg.h2_prior_knowledge = true;
+    return done();
+  }
+  if id >= OPT_CERT && id <= OPT_PASS {
+    if value.len() == 0 {
+      return Result<i32, Failure>::Err(option_error(shown,
+        "blank argument where content is expected"));
+    }
+    if id == OPT_CERT {
+      let split = split_cert_parameter(value);
+      cfg.cert = split.name;
+      if split.has_password {
+        cfg.has_pass = true;
+        cfg.pass = split.password;
+      }
+    }
+    if id == OPT_CERT_TYPE {
+      cfg.cert_type = clone_bytes(value);
+    }
+    if id == OPT_KEY {
+      cfg.key = clone_bytes(value);
+    }
+    if id == OPT_KEY_TYPE {
+      cfg.key_type = clone_bytes(value);
+    }
+    if id == OPT_PASS {
+      cfg.has_pass = true;
+      cfg.pass = clone_bytes(value);
+    }
     return done();
   }
   if id == OPT_PROXYTUNNEL {

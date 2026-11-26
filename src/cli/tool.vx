@@ -399,7 +399,19 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
   // file right. The transfers get them without that right.
   match TlsConfig::new(files, cfg.insecure, &cfg.cacert, &cfg.capath) {
     Result<TlsConfig, TlsError>::Ok(t) => {
-      let code = run_all(network, files, &t, cfg, &headers, &request_body, &upload_body, kind,
+      let mut tls = t;
+      // The client certificate, read with the file right like the certificate authorities.
+      if cfg.cert.len() > 0 {
+        tls.use_client_cert(files, &ClientCert {
+          cert : clone_bytes(&cfg.cert),
+          cert_type : clone_bytes(&cfg.cert_type),
+          key : clone_bytes(&cfg.key),
+          key_type : clone_bytes(&cfg.key_type),
+          has_pass : cfg.has_pass,
+          pass : clone_bytes(&cfg.pass)
+        });
+      }
+      let code = run_all(network, files, &tls, cfg, &headers, &request_body, &upload_body, kind,
         other_kind, &form_boundary, &mut jar);
       save_jar(files, cfg, &mut jar);
       return code;

@@ -3,8 +3,8 @@
 
     python3 tests/tls/servers.py CERT_DIR PORT_FILE PROXY_LOG
 
-It starts five servers on free ports of 127.0.0.1 and writes their ports to PORT_FILE as
-"https http proxy mute socks":
+It starts six servers on free ports of 127.0.0.1 and writes their ports to PORT_FILE as
+"https http proxy mute socks mtls":
 
 - an HTTPS server with the certificate in CERT_DIR. `/` answers "hello over tls", and `/big`
   answers 1 MiB in chunks, so that TLS reads have to wait for more data.
@@ -15,6 +15,8 @@ It starts five servers on free ports of 127.0.0.1 and writes their ports to PORT
   PROXY_LOG, such as "SOCKS5 atyp=3 localhost:443 user=". For SOCKS5 it asks for a user name
   and a password when the client offers them, and takes only "user" and "secret". It refuses
   port 1 with the error code of the protocol.
+- an HTTPS server that asks for a client certificate signed by client-ca.pem. `/whoami`
+  answers with the common name of the certificate.
 
 On both HTTP servers, `/stall` sends 10 of the 100 bytes of its body and then waits, for the
 time limits of reads, and `/huge-chunk` sends a chunk size too large for 64 bits. The paths of
@@ -61,6 +63,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
             self.send_body(b"hello over tls\n")
+        elif self.path == "/whoami":
+            cert = self.connection.getpeercert() or {}
+            names = [v for rdn in cert.get("subject", ()) for k, v in rdn if k == "commonName"]
+            self.send_body(("hello " + (names[0] if names else "nobody") + "\n").encode())
         elif self.path == "/big":
             self.send_response(200)
             self.send_header("Transfer-Encoding", "chunked")
@@ -301,11 +307,19 @@ def main():
     proxy = Proxy(("127.0.0.1", 0), ProxyHandler)
     mute = Proxy(("127.0.0.1", 0), MuteHandler)
     socks = Proxy(("127.0.0.1", 0), SocksHandler)
-    for server in (https, plain, proxy, mute, socks):
+    mtls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    mtls_context.load_cert_chain(os.path.join(CERT_DIR, "server.pem"),
+                                 os.path.join(CERT_DIR, "server.key"))
+    mtls_context.verify_mode = ssl.CERT_REQUIRED
+    mtls_context.load_verify_locations(os.path.join(CERT_DIR, "client-ca.pem"))
+    mtls = Server(("127.0.0.1", 0), Handler)
+    mtls.socket = mtls_context.wrap_socket(mtls.socket, server_side=True)
+    for server in (https, plain, proxy, mute, socks, mtls):
         threading.Thread(target=server.serve_forever, daemon=True).start()
     with open(PORT_FILE + ".tmp", "w") as f:
         f.write(f"{https.server_address[1]} {plain.server_address[1]} {proxy.server_address[1]} "
-                f"{mute.server_address[1]} {socks.server_address[1]}\n")
+                f"{mute.server_address[1]} {socks.server_address[1]} "
+                f"{mtls.server_address[1]}\n")
     os.replace(PORT_FILE + ".tmp", PORT_FILE)
     threading.Event().wait()
 

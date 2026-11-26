@@ -1,0 +1,32 @@
+// Checks how securl::options splits the value of `--cert` into a file name and a password,
+// with the cases of curl's unit test tool1394 that are not about Windows drive letters.
+import std::vec;
+import sys::text;
+import securl::bytes;
+import securl::options;
+
+fn split_is(value : *const i8, name : *const i8, has_password : bool, password : *const i8) -> bool {
+  let s = split_cert_parameter(&lit(value));
+  return eq_lit(&s.name, name) && s.has_password == has_password && eq_lit(&s.password, password);
+}
+
+fn main() -> i32 {
+  assert(split_is("foo:bar:baz", "foo", true, "bar:baz"), "foo:bar:baz");
+  assert(split_is("foo\\:bar:baz", "foo:bar", true, "baz"), "foo\\:bar:baz");
+  assert(split_is("foo\\\\:bar:baz", "foo\\", true, "bar:baz"), "foo\\\\:bar:baz");
+  assert(split_is("foo:bar\\:baz", "foo", true, "bar\\:baz"), "foo:bar\\:baz");
+  assert(split_is("foo:bar\\\\:baz", "foo", true, "bar\\\\:baz"), "foo:bar\\\\:baz");
+  assert(split_is("foo\\bar\\baz", "foo\\bar\\baz", false, ""), "foo\\bar\\baz");
+  assert(split_is("foo\\\\bar\\\\baz", "foo\\bar\\baz", false, ""), "foo\\\\bar\\\\baz");
+  assert(split_is("foo\\", "foo\\", false, ""), "foo\\");
+  assert(split_is("foo\\\\", "foo\\", false, ""), "foo\\\\");
+  assert(split_is("foo:bar\\", "foo", true, "bar\\"), "foo:bar\\");
+  assert(split_is("foo:bar\\\\", "foo", true, "bar\\\\"), "foo:bar\\\\");
+  assert(split_is("foo:bar:", "foo", true, "bar:"), "foo:bar:");
+  assert(split_is("foo\\::bar\\:", "foo:", true, "bar\\:"), "foo\\::bar\\:");
+  assert(split_is("pkcs11:foobar", "pkcs11:foobar", false, ""), "pkcs11:foobar");
+  assert(split_is("PKCS11:foobar", "PKCS11:foobar", false, ""), "PKCS11:foobar");
+  assert(split_is("PkCs11:foobar", "PkCs11:foobar", false, ""), "PkCs11:foobar");
+  assert(split_is("foo:", "foo", false, ""), "foo:");
+  return 0;
+}

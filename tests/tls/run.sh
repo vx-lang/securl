@@ -25,7 +25,7 @@ while [ ! -s "$work/ports" ] && [ $tries -lt 50 ]; do
   sleep 0.1
   tries=$((tries + 1))
 done
-read -r https http proxy mute socks < "$work/ports"
+read -r https http proxy mute socks mtls < "$work/ports"
 
 fail=0
 # check NAME EXPECTED_EXIT EXPECTED_STDOUT CURL_ARGUMENTS...
@@ -258,6 +258,39 @@ check "a blank --socks5" 2 "" -sS --socks5 '' "http://127.0.0.1:$http/"
 curl_env="all_proxy=socks5h://$s"
 check "all_proxy with a SOCKS URL" 0 "hello over tls" -sS "http://localhost:$http/"
 curl_env=
+
+# Client certificates. The server on $mtls asks for one signed by client-ca.pem and answers
+# with its common name.
+who="https://localhost:$mtls/whoami"
+check "a client certificate and key in PEM" 0 "hello securl test client" -sS \
+  --cacert "$certs/ca.pem" --cert "$certs/client.pem" --key "$certs/client.key" "$who"
+check "  both in one file" 0 "hello securl test client" -sS --cacert "$certs/ca.pem" \
+  -E "$certs/client-both.pem" "$who"
+check "  with -k too" 0 "hello securl test client" -sSk -E "$certs/client-both.pem" "$who"
+check "an encrypted key with --pass" 0 "hello securl test client" -sS --cacert "$certs/ca.pem" \
+  --cert "$certs/client.pem" --key "$certs/client-enc.key" --pass secret "$who"
+check "  and with the password after the file name" 0 "hello securl test client" -sS \
+  --cacert "$certs/ca.pem" --cert "$certs/client.pem:secret" --key "$certs/client-enc.key" "$who"
+check "  and a wrong password" 43 "" -sS --cacert "$certs/ca.pem" --cert "$certs/client.pem" \
+  --key "$certs/client-enc.key" --pass wrong "$who"
+stderr_has "  with curl's message" "unable to set private key file: '$certs/client-enc.key' type PEM"
+check "a certificate and key in DER" 0 "hello securl test client" -sS --cacert "$certs/ca.pem" \
+  --cert "$certs/client.der" --cert-type DER --key "$certs/client-key.der" --key-type der "$who"
+# OpenSSL 3 refuses a key that does not match while it loads it.
+check "a key that does not match the certificate" 43 "" -sS --cacert "$certs/ca.pem" \
+  --cert "$certs/client.pem" --key "$certs/server.key" "$who"
+stderr_has "  with curl's message" "unable to set private key file: '$certs/server.key' type PEM"
+check "a file that holds no certificate" 58 "" -sS --cacert "$certs/ca.pem" \
+  --cert "$certs/client.key" --key "$certs/client.key" "$who"
+stderr_has "  with curl's message" "could not load PEM client certificate from $certs/client.key"
+check "a certificate type that curl does not know" 43 "" -sS --cacert "$certs/ca.pem" \
+  --cert "$certs/client.pem" --cert-type XYZ "$who"
+stderr_has "  with curl's message" "not supported file type 'XYZ' for certificate"
+# A TLS 1.3 server refuses with an alert after the handshake, which comes with the response.
+check "no client certificate" 56 "" -sS --cacert "$certs/ca.pem" "$who"
+stderr_has "  with curl's message" "SSL routines::tlsv13 alert certificate required, errno 0"
+check "--cert does nothing for http://" 0 "hello over tls" -sS --cert "$work/no-such.pem" \
+  "http://127.0.0.1:$http/"
 
 # The TCP options of libcurl, in its order: TCP_NODELAY, then keepalive after 60 seconds, every
 # 60 seconds, 9 times.
