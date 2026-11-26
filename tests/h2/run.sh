@@ -75,6 +75,13 @@ check "RST_STREAM" 92 "" -sS $ca "$base/reset"
 has "  with curl's message" "HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR (err 2)" "$work/stderr"
 check "CONTINUATION frames with no end" 16 "" -sS $ca "$base/endless-continuation"
 has "  stop at the limit" "HTTP/2: header block too large" "$work/stderr"
+check "WINDOW_UPDATE of 0 on the connection" 16 "" -sS $ca "$base/window-zero-conn"
+has "  is a connection error" "HTTP/2: WINDOW_UPDATE with an increment of 0" "$work/stderr"
+check "WINDOW_UPDATE of 0 on the stream" 92 "" -sS $ca "$base/window-zero-stream"
+has "  is a stream error" "PROTOCOL_ERROR (err 1)" "$work/stderr"
+check "connection window above 2^31 - 1" 16 "" -sS $ca "$base/window-overflow-conn"
+check "stream window above 2^31 - 1" 92 "" -sS $ca "$base/window-overflow-stream"
+has "  is a stream error" "FLOW_CONTROL_ERROR (err 3)" "$work/stderr"
 check "redirect with -L" 0 "hello over h2
 1" -sSL $ca -w '%{num_redirects}' "$base/redirect"
 "$curl" -sS $ca -i "$base/trailers" > "$work/trailers" 2>&1

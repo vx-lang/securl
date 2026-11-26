@@ -206,6 +206,36 @@ pub fn h2_start(h : &mut H2, c : &mut Conn) -> Result<i32, Failure> {
   return Result<i32, Failure>::Ok(0);
 }
 
+// HTTP/2 error codes that curl-vx sends.
+const ERR_PROTOCOL : i64 = 1i64;
+const ERR_FLOW_CONTROL : i64 = 3i64;
+
+/// Tell the server with GOAWAY that the connection broke the rules with `code`, and give the
+/// failure of the transfer (curl's exit code 16). The GOAWAY is a courtesy: when it does not
+/// go out, the transfer fails the same.
+fn connection_error(c : &mut Conn, code : i64, message : *const i8) -> Failure {
+  let mut payload = Vec<u8>::new();
+  // No stream of the server was processed: curl-vx takes no pushed streams.
+  push_u32(&mut payload, 0i64);
+  push_u32(&mut payload, code);
+  let _sent = write_frame(c, FRAME_GOAWAY, 0, 0, &payload);
+  return h2_fail(message);
+}
+
+/// Reset the stream with RST_STREAM and `code`, and give the failure that curl reports for a
+/// stream that closed with an error (exit code 92).
+fn stream_error(c : &mut Conn, code : i64) -> Failure {
+  let mut payload = Vec<u8>::new();
+  push_u32(&mut payload, code);
+  let _sent = write_frame(c, FRAME_RST_STREAM, 0, STREAM, &payload);
+  let mut m = lit("HTTP/2 stream 1 was not closed cleanly: ");
+  append(&mut m, &error_name(code));
+  push_lit(&mut m, " (err ");
+  push_i64(&mut m, code);
+  push_lit(&mut m, ")");
+  return fail_with(HTTP2_STREAM_ERROR, m);
+}
+
 /// The name of an HTTP/2 error code, as curl says it.
 fn error_name(code : i64) -> Vec<u8> {
   let names = lit("NO_ERROR PROTOCOL_ERROR INTERNAL_ERROR FLOW_CONTROL_ERROR SETTINGS_TIMEOUT STREAM_CLOSED FRAME_SIZE_ERROR REFUSED_STREAM CANCEL COMPRESSION_ERROR CONNECT_ERROR ENHANCE_YOUR_CALM INADEQUATE_SECURITY HTTP_1_1_REQUIRED");
@@ -243,9 +273,14 @@ fn handle_control(h : &mut H2, c : &mut Conn, f : &Frame) -> Result<i32, Failure
         if value > MAX_WINDOW {
           return Result<i32, Failure>::Err(h2_fail("HTTP/2: bad initial window size"));
         }
-        // A new initial window moves the window of the open stream by the difference.
+        // A new initial window moves the window of the open stream by the difference. A
+        // window above 2^31 - 1 is a FLOW_CONTROL_ERROR of the connection (RFC 9113, 6.9.2).
         h.send_stream = h.send_stream + (value - h.peer_initial_window);
         h.peer_initial_window = value;
+        if h.send_stream > MAX_WINDOW {
+          return Result<i32, Failure>::Err(connection_error(c, ERR_FLOW_CONTROL,
+            "HTTP/2: SETTINGS_INITIAL_WINDOW_SIZE made the window too large"));
+        }
       }
       if id == 5 {
         if value < 16384i64 || value > 16777215i64 {
@@ -268,11 +303,27 @@ fn handle_control(h : &mut H2, c : &mut Conn, f : &Frame) -> Result<i32, Failure
     if f.payload.len() != 4 {
       return Result<i32, Failure>::Err(h2_fail("HTTP/2: bad WINDOW_UPDATE frame"));
     }
+    // RFC 9113, 6.9: an increment of 0 is a PROTOCOL_ERROR, and a window above 2^31 - 1 a
+    // FLOW_CONTROL_ERROR. On stream 0 they are errors of the connection, else of the stream.
     let inc = read_u32(&f.payload, 0) % 2147483648i64;
     if f.stream == 0 {
+      if inc == 0i64 {
+        return Result<i32, Failure>::Err(connection_error(c, ERR_PROTOCOL,
+          "HTTP/2: WINDOW_UPDATE with an increment of 0"));
+      }
+      if h.send_conn + inc > MAX_WINDOW {
+        return Result<i32, Failure>::Err(connection_error(c, ERR_FLOW_CONTROL,
+          "HTTP/2: WINDOW_UPDATE made the window of the connection too large"));
+      }
       h.send_conn = h.send_conn + inc;
     }
     if f.stream == STREAM {
+      if inc == 0i64 {
+        return Result<i32, Failure>::Err(stream_error(c, ERR_PROTOCOL));
+      }
+      if h.send_stream + inc > MAX_WINDOW {
+        return Result<i32, Failure>::Err(stream_error(c, ERR_FLOW_CONTROL));
+      }
       h.send_stream = h.send_stream + inc;
     }
     return Result<i32, Failure>::Ok(0);

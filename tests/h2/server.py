@@ -22,6 +22,9 @@ of 127.0.0.1, and writes them to PORT_FILE as "tls plain". The paths:
   /goaway         GOAWAY (last stream 1) after the response
   /endless-continuation  a header block whose CONTINUATION frames never end: 4 MiB of them,
                   and then the server waits
+  /window-zero-conn, /window-zero-stream, /window-overflow-conn, /window-overflow-stream
+                  a WINDOW_UPDATE that RFC 9113 forbids (an increment of 0, or a window above
+                  2^31 - 1) on the connection or on the stream, and then the response
 """
 import hashlib
 import os
@@ -37,6 +40,21 @@ import h2.events
 import h2.settings
 
 CERT_DIR, PORT_FILE = sys.argv[1], sys.argv[2]
+
+
+def raw_frame(kind, flags, stream, payload):
+    """A frame as bytes, sent past the state machine of h2."""
+    return (len(payload).to_bytes(3, "big") + bytes([kind, flags])
+            + stream.to_bytes(4, "big") + payload)
+
+
+# The bad WINDOW_UPDATE frames: (on the stream, increment).
+BAD_WINDOWS = {
+    "/window-zero-conn": (False, 0),
+    "/window-zero-stream": (True, 0),
+    "/window-overflow-conn": (False, 2**31 - 1),
+    "/window-overflow-stream": (True, 2**31 - 1),
+}
 
 
 def respond(conn, sock, stream, status, headers, body, end=True):
@@ -155,19 +173,21 @@ def serve(conn, sock, stream, head, body):
     elif path == "/endless-continuation":
         # Raw frames, past the state machine of h2: HEADERS with ":status: 200" (index 8 of
         # the static table) and no END_HEADERS, then CONTINUATION frames with no END_HEADERS.
-        def frame(kind, payload):
-            return (len(payload).to_bytes(3, "big") + bytes([kind, 0])
-                    + stream.to_bytes(4, "big") + payload)
         sock.sendall(conn.data_to_send())
-        sock.sendall(frame(1, b"\x88"))
+        sock.sendall(raw_frame(1, 0, stream, b"\x88"))
         try:
             for _ in range(256):
-                sock.sendall(frame(9, b"\x00" * 16384))
+                sock.sendall(raw_frame(9, 0, stream, b"\x00" * 16384))
             time.sleep(30)
         except OSError:
             # curl-vx hung up at its limit, as it should.
             pass
         return
+    elif path in BAD_WINDOWS:
+        on_stream, increment = BAD_WINDOWS[path]
+        sock.sendall(conn.data_to_send())
+        sock.sendall(raw_frame(8, 0, stream if on_stream else 0, increment.to_bytes(4, "big")))
+        respond(conn, sock, stream, 200, [], b"the client took a bad WINDOW_UPDATE\n")
     elif path == "/goaway":
         respond(conn, sock, stream, 200, [], b"then goaway\n")
         conn.close_connection(last_stream_id=1)

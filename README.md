@@ -56,7 +56,7 @@ Vx main d3ed6cf0b.
 | The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for curl-vx | 372 of 720 (52%) |
 | The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 348 of 419 (83%) |
 | TLS, time-limit and size-limit tests against local servers (`tests/tls`) | 31 of 31 |
-| HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 25 of 25 |
+| HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 7 of 7 |
 
 Some HTTP tests have the keyword `libtest` or `unittest`. For those, runtests.pl runs a C
