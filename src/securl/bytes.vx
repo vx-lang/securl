@@ -1,6 +1,8 @@
 // Helpers for byte lists (`Vec<u8>`). Vx has no slices and no byte-string type yet, so the
 // whole program keeps text as `Vec<u8>` and works on index ranges.
 import core::option;
+import core::result;
+import std::string;
 import std::vec;
 import sys::text;
 
@@ -293,4 +295,24 @@ pub fn to_lower(a : &Vec<u8>) -> Vec<u8> {
     out.push(ascii_lower(*b));
   }
   return out;
+}
+
+/// A `String` with the bytes of `bytes`, for the `std` calls that take a `String`, such as
+/// `TcpStream::connect` and `File::open`. Gives None when the bytes are not UTF-8, which a
+/// `String` must hold, or hold a NUL byte, because `std` passes the text on as a C string, which
+/// ends at its first NUL.
+pub fn to_string(bytes : &Vec<u8>) -> Option<String> {
+  for b in bytes.iter() {
+    if *b == 0u8 {
+      return Option<String>::None();
+    }
+  }
+  match String::from_utf8(bytes) {
+    Result<String, Utf8Error>::Ok(s) => {
+      return Option<String>::Some(s);
+    },
+    Result<String, Utf8Error>::Err(_e) => {
+      return Option<String>::None();
+    }
+  }
 }

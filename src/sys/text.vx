@@ -1,4 +1,4 @@
-// String literals and `String` values as byte lists.
+// String literals as byte lists.
 //
 // TRUSTED CODE. A Vx string literal is a `*const i8` that ends in a NUL byte, and it does not
 // carry its length yet (Vx#532). So reading its bytes needs `unsafe`. `lit` uses the default
@@ -7,7 +7,6 @@
 // same gap. Pass only string literals to `lit` and `push_lit`.
 import core::fmt;
 import core::result;
-import std::string;
 import std::vec;
 
 struct Sink {
@@ -36,20 +35,4 @@ pub fn push_lit(dst : &mut Vec<u8>, s : *const i8) -> void {
   for b in bytes.iter() {
     dst.push(*b);
   }
-}
-
-/// A `String` with the bytes of `bytes`, for the `std` calls that take a `String`, such as
-/// `TcpStream::connect` and `File::open`. Gives None when `bytes` holds a NUL byte, because the
-/// copy goes through a C string, which ends at its first NUL.
-pub fn to_string(bytes : &Vec<u8>) -> Option<String> {
-  let mut c = Vec<i8>::new();
-  for b in bytes.iter() {
-    if *b == 0u8 {
-      return Option<String>::None();
-    }
-    c.push(*b as i8);
-  }
-  c.push(0i8);
-  let s = unsafe { String::from_c_str(c.as_mut_ptr() as *const i8) };
-  return Option<String>::Some(s);
 }
