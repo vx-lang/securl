@@ -1,0 +1,49 @@
+// Options of a TCP socket.
+//
+// TRUSTED CODE. `std::net::TcpStream` sets no socket options, so this file calls `setsockopt`
+// of the C library on the file descriptor of the stream. The numbers of the options are the
+// ones of Linux.
+import core::ptr;
+import std::net;
+import std::vec;
+
+extern "C" {
+  fn setsockopt(fd : i32, level : i32, name : i32, value : *const i32, len : u32) -> i32;
+}
+
+const SOL_SOCKET : i32 = 1;
+const SO_KEEPALIVE : i32 = 9;
+const IPPROTO_TCP : i32 = 6;
+const TCP_KEEPIDLE : i32 = 4;
+const TCP_KEEPINTVL : i32 = 5;
+const TCP_KEEPCNT : i32 = 6;
+const TCP_NODELAY : i32 = 1;
+
+/// Set the option `name` of `level` to the number `value`. Gives false when the system says no.
+fn set_option(fd : i32, level : i32, name : i32, value : i32) -> bool {
+  let mut v = Vec<i32>::new();
+  v.push(value);
+  return unsafe { setsockopt(fd, level, name, v.as_mut_ptr() as *const i32, 4u32) } == 0;
+}
+
+/// Send small packets at once, without Nagle's wait for more data (TCP_NODELAY), as libcurl
+/// does by default.
+pub fn set_nodelay(tcp : &TcpStream) -> void {
+  let fd = unsafe { vx_tcp_stream_fd(tcp.ptr) };
+  let _set = set_option(fd, IPPROTO_TCP, TCP_NODELAY, 1);
+}
+
+/// Turn on TCP keepalive for `tcp`, as libcurl does. The system sends the first probe after
+/// `idle` seconds with no traffic, then one each `interval` seconds, and drops the connection
+/// after `count` probes with no answer. As in libcurl, a failure only leaves the defaults of
+/// the system.
+pub fn set_keepalive(tcp : &TcpStream, idle : i32, interval : i32, count : i32) -> void {
+  let fd = unsafe { vx_tcp_stream_fd(tcp.ptr) };
+  // libcurl sets the times only when the system took SO_KEEPALIVE.
+  if !set_option(fd, SOL_SOCKET, SO_KEEPALIVE, 1) {
+    return;
+  }
+  let _idle = set_option(fd, IPPROTO_TCP, TCP_KEEPIDLE, idle);
+  let _interval = set_option(fd, IPPROTO_TCP, TCP_KEEPINTVL, interval);
+  let _count = set_option(fd, IPPROTO_TCP, TCP_KEEPCNT, count);
+}

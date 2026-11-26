@@ -6,6 +6,7 @@ import std::net;
 import std::string;
 import std::time;
 import std::vec;
+import sys::socket;
 import sys::text;
 import sys::tls;
 import securl::bytes;
@@ -24,16 +25,28 @@ struct Conn {
   closed : bool,
 }
 
+/// The options that curl sets on each socket, in the order that libcurl sets them.
+struct SocketOptions {
+  // TCP_NODELAY.
+  nodelay : bool,
+  // TCP keepalive, with the seconds before the first probe and between probes, and the
+  // probes with no answer before the system drops the connection.
+  keepalive : bool,
+  idle : i32,
+  interval : i32,
+  count : i32,
+}
+
 /// The failure of curl for a TLS or socket error.
 fn failure_of(e : TlsError) -> Failure {
   return fail_with(e.code, e.message);
 }
 
-/// Connect to `address`, written as `host:port`. `host` and `port` are for the messages. The
-/// connect, and each wait of the connection after it, give up at `deadline`, which
-/// `Instant::never()` turns off. The caller needs the network right.
+/// Connect to `address`, written as `host:port`, and set the socket options `options`. `host`
+/// and `port` are for the messages. The connect, and each wait of the connection after it, give
+/// up at `deadline`, which `Instant::never()` turns off. The caller needs the network right.
 pub fn open_conn(network : &Network, address : &Vec<u8>, host : &Vec<u8>, port : i32,
-deadline : Instant) -> Result<Conn, Failure> {
+deadline : Instant, options : &SocketOptions) -> Result<Conn, Failure> {
   let mut target = String::new();
   match to_string(address) {
     Option<String>::Some(s) => {
@@ -46,6 +59,12 @@ deadline : Instant) -> Result<Conn, Failure> {
   }
   match connect_by(network, &target, deadline) {
     Result<TcpStream, NetError>::Ok(stream) => {
+      if options.nodelay {
+        set_nodelay(&stream);
+      }
+      if options.keepalive {
+        set_keepalive(&stream, options.idle, options.interval, options.count);
+      }
       let mut buffer = Vec<u8>::new();
       let mut i = 0;
       while i < READ_BUFFER_SIZE {

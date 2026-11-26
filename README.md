@@ -78,12 +78,12 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 8,593 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 8,728 | none, and `--no-trusted-code` enforces this |
 | `src/cli/` (the tool) and `src/disk/` (its files) | 619 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` to `cli`) | 11 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
-| `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 905 | 37 `extern` functions, 54 `unsafe` blocks |
+| `src/sys/` (OpenSSL calls, socket options and time limits, shims for what `std` lacks) | 937 | 38 `extern` functions, 56 `unsafe` blocks |
 
-Of the trusted code in `src/sys/`, 80 of the 91 items are the OpenSSL bindings: TLS (with the
+Of the trusted code in `src/sys/`, 80 of the 94 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
 `hash.vx`.
 Two safe functions of `sys` read through a raw pointer with no check, `lit` and `push_lit`,
@@ -222,8 +222,14 @@ missing options that block the most tests.
 `-X` `-x` `-U`
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
 `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
-`--connect-timeout` `-h` `-V`, and the options that
-runtests.pl adds: `-q` `--trace-ascii` `--trace-time`.
+`--connect-timeout` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay` `-h`
+`-V`, and the options that runtests.pl adds: `-q` `--trace-ascii` `--trace-time`.
+
+As libcurl does, each connection sets TCP_NODELAY and TCP keepalive: the first probe after 60
+seconds with no traffic, then one each 60 seconds, and 9 probes with no answer drop the
+connection. `--keepalive-time` sets both times, `--keepalive-cnt` the probes, and
+`--no-keepalive` and `--no-tcp-nodelay` turn them off. `src/sys/socket.vx` calls `setsockopt`,
+because `std::net::TcpStream` has no socket options.
 
 The 2025 curl user survey asked for each user's favourite option. securl accepts 19 of the top
 20 answers. It does not have `--libcurl`. `-vv` and `-vvv` work as `-v`, and `-w` has no

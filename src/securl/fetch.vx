@@ -805,6 +805,35 @@ fn connect_limit_ms(cfg : &Config) -> i64 {
   return 300000i64;
 }
 
+/// The socket options of the command line, with the defaults of libcurl: keepalive after 60
+/// seconds, every 60 seconds, 9 times. A time or count above the largest `int` is that `int`,
+/// as in libcurl.
+fn socket_options(cfg : &Config) -> SocketOptions {
+  let mut time = 60i64;
+  if cfg.keepalive_time > 0i64 {
+    time = cfg.keepalive_time;
+  }
+  let mut count = 9i64;
+  if cfg.keepalive_cnt > 0i64 {
+    count = cfg.keepalive_cnt;
+  }
+  return SocketOptions {
+    nodelay : cfg.tcp_nodelay,
+    keepalive : cfg.keepalive,
+    idle : int_of(time),
+    interval : int_of(time),
+    count : int_of(count)
+  };
+}
+
+/// `n`, or the largest `i32` when it is larger.
+fn int_of(n : i64) -> i32 {
+  if n > 2147483647i64 {
+    return 2147483647;
+  }
+  return n as i32;
+}
+
 /// The earlier of two deadlines.
 fn earliest(a : Instant, b : Instant) -> Instant {
   if a < b {
@@ -824,7 +853,7 @@ address : &Vec<u8>, secure : bool, deadline : Instant, info : &mut TransferInfo)
     push_lit(&mut m, "...");
     verbose_info(&m);
   }
-  let mut c = open_conn(network, address, &u.host, u.port, deadline)?;
+  let mut c = open_conn(network, address, &u.host, u.port, deadline, &socket_options(cfg))?;
   info.num_connects = info.num_connects + 1;
   info.remote_address = clone_bytes(address);
   if cfg.verbose {

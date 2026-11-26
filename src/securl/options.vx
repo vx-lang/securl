@@ -114,6 +114,16 @@ struct Config {
   no_h2 : bool,
   // `--http2-prior-knowledge`: HTTP/2 over plain TCP with no upgrade.
   h2_prior_knowledge : bool,
+  // `--tcp-nodelay`, on by default: send small packets at once (TCP_NODELAY).
+  tcp_nodelay : bool,
+  // `--keepalive`, on by default: TCP keepalive probes on an idle connection.
+  keepalive : bool,
+  // `--keepalive-time`: the seconds before the first probe and between probes, or 0 for the
+  // 60 of libcurl.
+  keepalive_time : i64,
+  // `--keepalive-cnt`: the probes with no answer before the connection is dropped, or 0 for
+  // the 9 of libcurl.
+  keepalive_cnt : i64,
 }
 
 /// A `Config` with curl's defaults.
@@ -185,7 +195,11 @@ pub fn default_config() -> Config {
     cookie_jar : Vec<u8>::new(),
     junk_session_cookies : false,
     no_h2 : false,
-    h2_prior_knowledge : false
+    h2_prior_knowledge : false,
+    tcp_nodelay : true,
+    keepalive : true,
+    keepalive_time : 0i64,
+    keepalive_cnt : 0i64
   };
 }
 
@@ -259,6 +273,10 @@ const OPT_COOKIE_JAR : i32 = 67;
 const OPT_JUNK_SESSION_COOKIES : i32 = 68;
 const OPT_HTTP2 : i32 = 69;
 const OPT_HTTP2_PRIOR_KNOWLEDGE : i32 = 70;
+const OPT_TCP_NODELAY : i32 = 71;
+const OPT_KEEPALIVE : i32 = 72;
+const OPT_KEEPALIVE_TIME : i32 = 73;
+const OPT_KEEPALIVE_CNT : i32 = 74;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -336,6 +354,10 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "http2-prior-knowledge") { return OPT_HTTP2_PRIOR_KNOWLEDGE; }
   if eq_lit(name, "cacert") { return OPT_CACERT; }
   if eq_lit(name, "capath") { return OPT_CAPATH; }
+  if eq_lit(name, "tcp-nodelay") { return OPT_TCP_NODELAY; }
+  if eq_lit(name, "keepalive") { return OPT_KEEPALIVE; }
+  if eq_lit(name, "keepalive-time") { return OPT_KEEPALIVE_TIME; }
+  if eq_lit(name, "keepalive-cnt") { return OPT_KEEPALIVE_CNT; }
   return OPT_UNKNOWN;
 }
 
@@ -382,7 +404,8 @@ fn short_option(letter : u8) -> i32 {
 /// Whether the option takes a value.
 fn takes_value(id : i32) -> bool {
   return (id >= OPT_USER_AGENT && id <= OPT_OUTPUT_DIR) || id == OPT_CACERT || id == OPT_CAPATH
-    || id == OPT_FORM || id == OPT_FORM_STRING || id == OPT_COOKIE_JAR;
+    || id == OPT_FORM || id == OPT_FORM_STRING || id == OPT_COOKIE_JAR
+    || id == OPT_KEEPALIVE_TIME || id == OPT_KEEPALIVE_CNT;
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -429,6 +452,32 @@ fn option_error(name : &Vec<u8>, what : *const i8) -> Failure {
   push_lit(&mut m, ": ");
   push_lit(&mut m, what);
   return fail_with(FAILED_INIT, m);
+}
+
+/// The value of an option that takes a number of 0 or more, as curl's `str2unum` reads it: an
+/// optional `-`, then decimal digits that fit in 63 bits, and nothing else.
+fn unsigned_arg(value : &Vec<u8>, shown : &Vec<u8>) -> Result<i64, Failure> {
+  let negative = value.len() > 0 && value.get(0) == 45u8;
+  let mut digits = clone_bytes(value);
+  if negative {
+    digits = rest_from(value, 1);
+  }
+  let mut n : i64 = 0i64;
+  let mut ok = digits.len() > 0;
+  for b in digits.iter() {
+    if !is_digit(*b) || n > 922337203685477579i64 {
+      ok = false;
+      break;
+    }
+    n = n * 10i64 + ((*b - 48u8) as i64);
+  }
+  if !ok {
+    return Result<i64, Failure>::Err(option_error(shown, "expected a proper numerical parameter"));
+  }
+  if negative && n > 0i64 {
+    return Result<i64, Failure>::Err(option_error(shown, "expected a positive numerical parameter"));
+  }
+  return Result<i64, Failure>::Ok(n);
 }
 
 fn add_data(cfg : &mut Config, kind : i32, value : &Vec<u8>) -> void {
@@ -651,6 +700,22 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     cfg.http10 = false;
     cfg.no_h2 = false;
     cfg.h2_prior_knowledge = true;
+    return done();
+  }
+  if id == OPT_TCP_NODELAY {
+    cfg.tcp_nodelay = enable;
+    return done();
+  }
+  if id == OPT_KEEPALIVE {
+    cfg.keepalive = enable;
+    return done();
+  }
+  if id == OPT_KEEPALIVE_TIME {
+    cfg.keepalive_time = unsigned_arg(value, shown)?;
+    return done();
+  }
+  if id == OPT_KEEPALIVE_CNT {
+    cfg.keepalive_cnt = unsigned_arg(value, shown)?;
     return done();
   }
   if id == OPT_FAIL {

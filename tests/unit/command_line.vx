@@ -62,5 +62,24 @@ fn main() -> i32 {
     "an unknown short option");
   assert(eq_lit(&error_of(&words("a", "b", "c", "d", "-H")), "option -H: requires parameter"),
     "a missing value");
+
+  // TCP options: TCP_NODELAY and keepalive are on unless the command line says no.
+  let d = parsed(&words("http://h/", "-s", "-s", "-s", "-s"));
+  assert(d.tcp_nodelay && d.keepalive && d.keepalive_time == 0i64 && d.keepalive_cnt == 0i64,
+    "the defaults of curl");
+  let e = parsed(&words("--no-tcp-nodelay", "--no-keepalive", "--keepalive-time", "17", "-s"));
+  assert(!e.tcp_nodelay && !e.keepalive && e.keepalive_time == 17i64, "--no- and a time");
+  let f = parsed(&words("--keepalive-cnt", "3", "--keepalive-time", "-0", "--keepalive"));
+  assert(f.keepalive && f.keepalive_cnt == 3i64 && f.keepalive_time == 0i64, "a count, and -0");
+  assert(eq_lit(&error_of(&words("--keepalive-time", "-5", "a", "b", "c")),
+    "option --keepalive-time: expected a positive numerical parameter"), "a negative time");
+  assert(eq_lit(&error_of(&words("--keepalive-cnt", " 5", "a", "b", "c")),
+    "option --keepalive-cnt: expected a proper numerical parameter"), "a blank before the number");
+  assert(eq_lit(&error_of(&words("--keepalive-time", "5x", "a", "b", "c")),
+    "option --keepalive-time: expected a proper numerical parameter"), "a letter after it");
+  assert(eq_lit(&error_of(&words("--keepalive-time", "99999999999999999999", "a", "b", "c")),
+    "option --keepalive-time: expected a proper numerical parameter"), "a number too large");
+  assert(eq_lit(&error_of(&words("--keepalive-time", "", "a", "b", "c")),
+    "option --keepalive-time: expected a proper numerical parameter"), "no number");
   return 0;
 }

@@ -53,6 +53,29 @@ stderr_has() {
   fi
 }
 
+# sockopts NAME EXPECTED CURL_ARGUMENTS...: the TCP options that securl sets on its connection,
+# as strace shows them, such as `TCP_NODELAY=1 SO_KEEPALIVE=1`. IP_RECVERR comes from the
+# connect of the Vx runtime. Skipped when strace is not installed.
+sockopts() {
+  name=$1
+  want=$2
+  shift 2
+  if ! command -v strace > /dev/null 2>&1; then
+    echo "skip $name: no strace"
+    return
+  fi
+  timeout 20 strace -f -qq -e trace=setsockopt -o "$work/strace" "$curl" "$@" \
+    > /dev/null 2> "$work/stderr"
+  got=$(sed -n 's/.*setsockopt([0-9]*, SOL_[A-Z]*, \([A-Z_]*\), \[\([0-9]*\)\].*/\1=\2/p' \
+    "$work/strace" | grep -v IP_RECVERR | tr '\n' ' ' | sed 's/ $//')
+  if [ "$got" != "$want" ]; then
+    echo "FAIL $name: '$got' (want '$want')"
+    fail=1
+  else
+    echo "ok   $name"
+  fi
+}
+
 check "trusted CA" 0 "hello over tls" \
   -sS --cacert "$certs/ca.pem" "https://localhost:$https/"
 check "unknown CA" 60 "" \
@@ -124,4 +147,16 @@ stderr_has "  with curl's message" "Connection timed out after"
 check "--connect-timeout leaves a slow body alone" 28 "" \
   -sS --connect-timeout 1 -m 2 -o "$work/stalled" "http://127.0.0.1:$http/stall"
 stderr_has "  and -m ends it" "Operation timed out after"
+# The TCP options of libcurl, in its order: TCP_NODELAY, then keepalive after 60 seconds, every
+# 60 seconds, 9 times.
+sockopts "TCP_NODELAY and keepalive by default" \
+  "TCP_NODELAY=1 SO_KEEPALIVE=1 TCP_KEEPIDLE=60 TCP_KEEPINTVL=60 TCP_KEEPCNT=9" \
+  -s "http://127.0.0.1:$http/"
+sockopts "--keepalive-time, --keepalive-cnt and --no-tcp-nodelay" \
+  "SO_KEEPALIVE=1 TCP_KEEPIDLE=17 TCP_KEEPINTVL=17 TCP_KEEPCNT=3" \
+  -s --keepalive-time 17 --keepalive-cnt 3 --no-tcp-nodelay "http://127.0.0.1:$http/"
+sockopts "--no-keepalive" "TCP_NODELAY=1" -s --no-keepalive "http://127.0.0.1:$http/"
+sockopts "the same options over TLS" \
+  "TCP_NODELAY=1 SO_KEEPALIVE=1 TCP_KEEPIDLE=60 TCP_KEEPINTVL=60 TCP_KEEPCNT=9" \
+  -s --cacert "$certs/ca.pem" "https://localhost:$https/"
 exit $fail
