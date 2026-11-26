@@ -13,7 +13,7 @@ It starts four servers on free ports of 127.0.0.1 and writes their ports to PORT
 - a server that accepts connections and never sends a byte, for the time limits of TLS.
 
 On both HTTP servers, `/stall` sends 10 of the 100 bytes of its body and then waits, for the
-time limits of reads.
+time limits of reads, and `/huge-chunk` sends a chunk size too large for 64 bits.
 
 It runs until it is killed.
 """
@@ -53,6 +53,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for _ in range(64):
                 self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
             self.wfile.write(b"0\r\n\r\n")
+        elif self.path == "/huge-chunk":
+            # A chunk size of 2^63, which does not fit in a signed 64-bit number. Read as a
+            # wrapped negative length, it would skip to the "0" line and end the body there.
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"8000000000000000\r\nhello\r\n0\r\n\r\n")
         elif self.path == "/stall":
             self.send_response(200)
             self.send_header("Content-Length", "100")

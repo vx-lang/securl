@@ -356,6 +356,14 @@ raw : bool) -> Result<i32, Failure> {
     let mut digits = 0;
     let mut i = 0;
     while i < line.len() && hex_value(line.get(i)) >= 0 {
+      // A size of 2^63 or more does not fit in an i64: one more digit would wrap it to a
+      // negative length. 576460752303423487 is (2^63 - 1) / 16. curl refuses such a size too.
+      if size > 576460752303423487i64 {
+        let mut m = lit("invalid chunk size: '");
+        append_range(&mut m, &line, 0, i + 1);
+        push_lit(&mut m, "'");
+        return Result<i32, Failure>::Err(fail_with(RECV_ERROR, m));
+      }
       size = size * 16i64 + (hex_value(line.get(i)) as i64);
       digits = digits + 1;
       i = i + 1;

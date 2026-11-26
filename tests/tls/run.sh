@@ -91,6 +91,9 @@ else
   fail=1
 fi
 
+check "a chunk size of 2^63" 56 "" \
+  -sS "http://127.0.0.1:$http/huge-chunk"
+stderr_has "  with curl's message" "invalid chunk size: '8000000000000000'"
 check "-m stops a stalled body" 28 "" \
   -sS -m 1 -o "$work/stalled" "http://127.0.0.1:$http/stall"
 stderr_has "  with curl's message" "with 10 out of 100 bytes received"
