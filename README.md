@@ -45,7 +45,7 @@ make test-tls   # HTTPS and time-limit tests against local servers (needs python
 make test-h2    # HTTP/2 tests against a local server (makes a virtualenv with h2 from PyPI)
 ```
 
-## Status (2026-11-25)
+## Status (2026-11-26)
 
 Measured with curl's own test suite: curl's `runtests.pl` and its test servers, pointed at
 `build/curl-vx` with `-c`. The tests come from curl commit 2f5c657, and the compiler is vxc from
@@ -53,21 +53,25 @@ Vx main d3ed6cf0b.
 
 | Test set | Passed |
 |---|---|
-| All tests with the keyword `HTTP` that runtests.pl runs for curl-vx | 522 of 874 (60%) |
-| The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 452 of 523 (86%) |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for curl-vx | 371 of 720 (52%) |
+| The HTTP tests that use only options curl-vx implements (`tests/supported-tests.txt`) | 348 of 419 (83%) |
 | TLS and time-limit tests against local servers (`tests/tls`) | 18 of 18 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 23 of 23 |
 | Unit tests (`tests/unit`) | 6 of 6 |
 
-The C build of the test suite has OpenSSL, so that runtests.pl runs 61 more tests, most of them
-Digest tests (see "Run curl's test suite"). Before Digest, curl-vx passed 409 of those 855.
-`stunnel` and `nghttpx` let runtests.pl run its HTTPS and HTTP/2 tests too.
+Some HTTP tests have the keyword `libtest` or `unittest`. For those, runtests.pl runs a C
+program of the curl build, linked with curl's own libcurl, so they never run curl-vx.
+`tests/run-curl-tests.sh` and `tests/scan-supported-tests.py` leave them out. Until 2026-11-26
+the counts above included them by mistake: 152 of them passed, and the table said 522 of 874.
+
+The C build of the test suite has OpenSSL, so that runtests.pl runs the Digest tests (see "Run
+curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tests too.
 
 `vxc --audit` (`make audit`) lists the trusted code of the program:
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/curlvx/` (the package with all protocol code) | 8,187 | none, and `--no-trusted-code` enforces this |
+| `src/curlvx/` (the package with all protocol code) | 8,202 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx`, `src/disk.vx` | 618 | none |
 | `src/sys/` (OpenSSL calls, time limits of sockets, shims for what `std` lacks) | 872 | 39 `extern` functions, 55 `unsafe` blocks |
 

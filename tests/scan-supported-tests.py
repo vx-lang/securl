@@ -23,7 +23,8 @@ resolve connect-to trace-ascii trace http1.0 http1.1 fail fail-with-body get inc
 show-headers head insecure location location-trusted remote-name remote-name-all disable silent
 show-error verbose version help globoff path-as-is trace-time progress-bar no-progress-meter
 buffer raw compressed proxy proxy-user noproxy output-dir digest basic anyauth proxy-digest
-proxy-basic proxy-anyauth form form-string form-escape cookie-jar junk-session-cookies
+proxy-basic proxy-anyauth form form-string form-escape cookie-jar junk-session-cookies cacert capath
+http2 http2-prior-knowledge
 """.split())
 SUPPORTED_SHORT = set("AbcdDeFHjmorTuwXxU0fGiIkLOqsSvVhg#N")
 # The short options that take a value: the rest of the word is that value.
@@ -42,6 +43,9 @@ def http_tests(data):
         if not server or server.group(1).split() != ["http"]:
             continue
         if re.search(r"<tool>|type=\"(perl|shell)\"", text):
+            continue
+        # runtests.pl runs a C program of the curl build for these, not the curl tool.
+        if re.search(r"<keywords>[^<]*^(libtest|unittest|tunittest)$", text, re.M):
             continue
         command = re.search(r"<command[^>]*>\s*(.*?)\s*</command>", text, re.S)
         if command:

@@ -104,6 +104,20 @@ fn verbose_lines(prefix : *const i8, bytes : &Vec<u8>) -> void {
   to_stderr(&out);
 }
 
+/// The request as `-v` shows it. Over HTTP/2, curl ends the request line with `HTTP/2`, so
+/// the HTTP/1.1 text that `build_request` makes gets that version for the display.
+fn shown_request(request : &Vec<u8>, h2 : bool) -> Vec<u8> {
+  let line_end = find_byte(request, 13u8, 0);
+  if !h2 || line_end < 8 {
+    return clone_bytes(request);
+  }
+  let mut out = Vec<u8>::new();
+  append_range(&mut out, request, 0, line_end - 8);
+  push_lit(&mut out, "HTTP/2");
+  append_range(&mut out, request, line_end, request.len());
+  return out;
+}
+
 fn verbose_info(text : &Vec<u8>) -> void {
   let mut out = lit("* ");
   append(&mut out, text);
@@ -518,7 +532,8 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
   }
   let request = build_request(u, &req_info);
   if cfg.verbose {
-    verbose_lines("> ", &request);
+    let shown = shown_request(&request, use_h2);
+    verbose_lines("> ", &shown);
   }
   info.size_request = info.size_request + (request.len() as i64);
   if use_h2 {

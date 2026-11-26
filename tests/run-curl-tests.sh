@@ -7,6 +7,10 @@
 # so that its test servers exist (README.md has the commands). Without TEST arguments,
 # it runs every test with the keyword HTTP. curl's runtests.pl skips the tests that need a
 # protocol or a feature that `curl-vx --version` does not list.
+#
+# It leaves out the tests with the keyword libtest, unittest or tunittest: runtests.pl runs a C
+# program of the curl build for those, linked with curl's own libcurl, so they never run
+# curl-vx and their results say nothing about it.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/.." && pwd)
@@ -15,6 +19,7 @@ shift
 if [ $# -eq 0 ]; then
   set -- HTTP
 fi
+set -- "$@" '!libtest' '!unittest' '!tunittest'
 # The servers that tools/build-test-tools.sh builds into the virtualenv: nghttpx for the HTTP/2
 # tests and stunnel for the HTTPS tests. runtests.pl finds stunnel on PATH, and nghttpx in
 # $NGHTTPX.
