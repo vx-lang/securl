@@ -24,6 +24,7 @@ import securl::bytes;
 import securl::cookie;
 import securl::failure;
 import securl::form;
+import securl::hsts;
 import securl::http;
 import securl::options;
 import securl::output;
@@ -109,7 +110,7 @@ fn print_version() -> void {
   append(&mut m, &securl_version());
   push_lit(&mut m, " ");
   append(&mut m, &tls_library_version());
-  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: HTTP2 IPv6 Largefile libz SSL\n");
+  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: HSTS HTTP2 IPv6 Largefile libz SSL\n");
   let _ok = write_stdout(&m);
 }
 
@@ -395,6 +396,25 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
   }
   start_jar(&mut jar);
 
+  // The HSTS cache of `--hsts`, which `main` reads and writes with its file right too. libcurl
+  // skips a file that it cannot read.
+  // A line that is too long fails the first transfer. libcurl reads the file again before
+  // each transfer, and by then the first one saved it without that line.
+  let mut hsts = new_hsts(cfg.has_hsts);
+  let mut hsts_too_long = false;
+  if cfg.hsts.len() > 0 {
+    match read_path(files, &cfg.hsts) {
+      Result<Vec<u8>, Failure>::Ok(text) => {
+        hsts_too_long = !load_hsts_text(&mut hsts, &text);
+      },
+      Result<Vec<u8>, Failure>::Err(_f) => {}
+    }
+  }
+  let mut session = Session {
+    jar : jar,
+    hsts : hsts
+  };
+
   // The TLS settings read the certificate authorities from files, so `main` makes them with its
   // file right. The transfers get them without that right.
   match TlsConfig::new(files, cfg.insecure, &cfg.cacert, &cfg.capath) {
@@ -412,8 +432,9 @@ fn run(network : &Network, files : &Files, cfg : &Config) -> i32 {
         });
       }
       let code = run_all(network, files, &tls, cfg, &headers, &request_body, &upload_body, kind,
-        other_kind, &form_boundary, &mut jar);
-      save_jar(files, cfg, &mut jar);
+        other_kind, &form_boundary, &mut session, hsts_too_long);
+      save_jar(files, cfg, &mut session.jar);
+      save_hsts(files, cfg, &session.hsts);
       return code;
     },
     Result<TlsConfig, TlsError>::Err(e) => {
@@ -449,10 +470,30 @@ fn save_jar(files : &Files, cfg : &Config, jar : &mut CookieJar) -> void {
   }
 }
 
+/// Write the HSTS cache to the file of `--hsts`. libcurl says nothing when it cannot.
+fn save_hsts(files : &Files, cfg : &Config, hsts : &Hsts) -> void {
+  if cfg.hsts.len() == 0 {
+    return;
+  }
+  let _written = append_to_file(files, &cfg.hsts, false, &hsts_text(hsts));
+}
+
+/// The URL that `%{url_effective}` shows for `text` before a transfer starts.
+fn effective_url(text : &Vec<u8>, path_as_is : bool) -> Vec<u8> {
+  match parse_url(text, path_as_is) {
+    Result<Url, Failure>::Ok(u) => {
+      return url_text(&u);
+    },
+    Result<Url, Failure>::Err(_f) => {
+      return clone_bytes(text);
+    }
+  }
+}
+
 /// Run the transfer of each URL, and give the exit code of the last one that failed.
 fn run_all(network : &Network, files : &Files, tls : &TlsConfig, cfg : &Config,
 headers : &Vec<Vec<u8>>, request_body : &Vec<u8>, upload_body : &Vec<u8>, kind : i32,
-other_kind : i32, form_boundary : &Vec<u8>, jar : &mut CookieJar) -> i32 {
+other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first : bool) -> i32 {
   let mut exit_code = 0;
   let mut i = 0;
   while i < cfg.urls.len() {
@@ -477,12 +518,16 @@ other_kind : i32, form_boundary : &Vec<u8>, jar : &mut CookieJar) -> i32 {
     let mut code = 0;
     let mut message = Vec<u8>::new();
     let mut result = Result<i32, Failure>::Ok(0);
-    if this_kind == REQ_PUT {
+    if i == 0 && fail_first {
+      info.url_effective = effective_url(&url_text, cfg.path_as_is);
+      result = Result<i32, Failure>::Err(fail_lit(TOO_LARGE,
+        "A value or data field grew larger than allowed"));
+    } else if this_kind == REQ_PUT {
       result = transfer_one(network, files, tls, cfg, headers, &url_text, upload_body, this_kind,
-        form_boundary, jar, i, &mut info);
+        form_boundary, session, i, &mut info);
     } else {
       result = transfer_one(network, files, tls, cfg, headers, &url_text, request_body, this_kind,
-        form_boundary, jar, i, &mut info);
+        form_boundary, session, i, &mut info);
     }
     match result {
       Result<i32, Failure>::Ok(_v) => {},
@@ -542,7 +587,7 @@ fn write_pieces(files : &Files, pieces : &Vec<WriteOutPiece>) -> void {
 fn transfer_one(network : &Network, files : &Files, tls : &TlsConfig, cfg : &Config,
 headers : &Vec<Vec<u8>>,
 url_text : &Vec<u8>, request_body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>,
-jar : &mut CookieJar, index : i32, info : &mut TransferInfo) -> Result<i32, Failure> {
+session : &mut Session, index : i32, info : &mut TransferInfo) -> Result<i32, Failure> {
   let body_output = open_output(files, cfg, index, url_text)?;
   let header_output = open_header_output(files, cfg)?;
   let mut sinks = Sinks {
@@ -551,5 +596,5 @@ jar : &mut CookieJar, index : i32, info : &mut TransferInfo) -> Result<i32, Fail
     has_headers : cfg.has_dump_header
   };
   return run_transfer(network, tls, cfg, headers, url_text, request_body, kind, form_boundary,
-    jar, &mut sinks, info);
+    session, &mut sinks, info);
 }

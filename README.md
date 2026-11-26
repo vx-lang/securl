@@ -60,9 +60,9 @@ Vx main 860f9f31a.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 414 of 743 (55%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 377 of 453 (83%) |
-| TLS, client-certificate, proxy, compression, socket-option and limit tests against local servers (`tests/tls`) | 117 of 117 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 429 of 747 (57%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 387 of 457 (84%) |
+| TLS, client-certificate, proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 142 of 142 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 9 of 9 |
 
@@ -77,7 +77,8 @@ Some HTTP tests have the keyword `libtest` or `unittest`. For those, runtests.pl
 program of the curl build, linked with curl's own libcurl, so they never run securl.
 `tests/run-curl-tests.sh` and `tests/scan-supported-tests.py` leave them out. Until 2026-11-26
 the counts above included them by mistake: 152 of them passed, and the table said 522 of 874.
-Test 1070 depends on timing: it passes in about one run of four, with and without recent
+Test 1070 depends on timing: the test server closes the connection while securl sends the
+body. It passes in some runs, between one in four and one in twelve, with and without recent
 changes.
 
 The C build of the test suite has OpenSSL, so that runtests.pl runs the Digest tests (see "Run
@@ -87,8 +88,8 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 10,567 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 701 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 11,222 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 751 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` to `cli`) | 11 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,302 | 45 `extern` functions, 76 `unsafe` blocks |
 
@@ -130,8 +131,21 @@ after a `:` as in curl), `--key` and `--pass` give a client certificate in PEM o
 libcurl's messages and exit codes (58, or 43 for a key that does not load). A TLS 1.3 server
 that wants a certificate refuses after the handshake; securl reads its alert, as curl does,
 and gives exit 56 with "tlsv13 alert certificate required". An `https://` URL through
-an HTTP proxy uses a CONNECT tunnel, and so does an `http://` URL with `-p`. The exit codes are curl's: 60 for a certificate problem, 35
-for a failed handshake, and 77 for a file of certificate authorities that cannot be read.
+an HTTP proxy uses a CONNECT tunnel, and so does an `http://` URL with `-p`. As in curl 8.23,
+`-i` and `-D` show the reply of the proxy before the response, `--suppress-connect-headers`
+leaves it out, `%{http_connect}` gives its status, and a proxy that refuses the tunnel gives
+exit 7. The exit codes are curl's: 60 for a certificate problem, 35 for a failed handshake, and
+77 for a file of certificate authorities that cannot be read.
+
+`--hsts FILE` turns on HSTS, a port of libcurl's `hsts.c` in `src/securl/hsts.vx`. The tool
+reads the file before the transfers and writes it after them, in libcurl's format. A
+`Strict-Transport-Security` header of an HTTPS response adds its host, with `max-age` capped at
+two years and `includeSubDomains`, and `max-age=0` removes it. An IP address never gets an
+entry, and a header over plain HTTP changes nothing. Before each request, redirects included,
+an `http://` URL for a host in the cache, or a subdomain of one that covers its subdomains,
+becomes `https://`. The port stays when the URL gives one, as in curl, and `-v` says
+`Switched from HTTP to HTTPS due to HSTS`. As in libcurl, a line of 4095 bytes or more stops
+the reading of the file and fails the first transfer with exit 100.
 
 ## Time limits
 
@@ -246,7 +260,8 @@ missing options that block the most tests.
 `name;` forms) `-I` `-i` `-k` `--cacert` `--capath` `-E` (`--cert`) `--cert-type` `--key` `--key-type` `--pass` `-L` `--location-trusted` `--max-redirs`
 `-o` `-O` `--remote-name-all` `--output-dir` `-r` `-s` `-S` `-T` `-u` `--digest` `--basic`
 `--anyauth` `-v` `-w` (most variables, `%header{}`, `%{header_json}`, `%output{}`, `%{stderr}`)
-`-X` `-x` `-U` `-p` `--proxytunnel` `--socks4` `--socks4a` `--socks5` `--socks5-hostname`
+`-X` `-x` `-U` `-p` `--proxytunnel` `--suppress-connect-headers` `--socks4` `--socks4a`
+`--socks5` `--socks5-hostname` `--hsts`
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
 `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
 `--connect-timeout` `--compressed` `--tr-encoding` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay` `-h`
@@ -306,6 +321,14 @@ The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #
   [#4004](https://github.com/vx-lang/Vx/issues/4004): a reference cannot be pointed at another
   field, `assert(false, ..)` fails at compile time on a path that never runs, and there is no
   `ref mut` pattern or `Option::as_mut`.
+- [#4118](https://github.com/vx-lang/Vx/issues/4118) A move of a field out of `&mut self` got
+  no E4008 in the full securl build, and the program freed the field twice, in a package with
+  `--no-trusted-code`. A small program with the same function gets E4008. `output.vx` now
+  borrows the field instead.
+- [#4119](https://github.com/vx-lang/Vx/issues/4119) `main` cannot get a command-line word that
+  is not UTF-8, so securl cannot either.
+- [#4120](https://github.com/vx-lang/Vx/issues/4120) `std::net` has no name lookup, so
+  `src/sys/socket.vx` calls `getaddrinfo` for SOCKS4 and SOCKS5.
 
 ## License
 
@@ -329,6 +352,8 @@ src/sys/             trusted code: OpenSSL (tls.vx), arguments, standard output,
 src/securl/          the protocol code; no trusted code
   options.vx           the command line
   url.vx               URLs and redirects
+  hsts.vx              the HSTS cache of --hsts
+  cookie.vx date.vx    the cookie engine, and libcurl's date parser
   http.vx              the request bytes, in libcurl's header order; the response head
   fetch.vx             one transfer: connect, TLS, send, read, redirects, proxies
   conn.vx              a connection with a read buffer; needs `&Network`

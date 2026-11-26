@@ -19,6 +19,7 @@ import securl::conn;
 import securl::cookie;
 import securl::failure;
 import securl::h2;
+import securl::hsts;
 import securl::http;
 import securl::options;
 import securl::output;
@@ -28,6 +29,8 @@ import securl::url;
 /// What `-w` can print about a transfer.
 struct TransferInfo {
   http_code : i32,
+  // The status of the reply of a CONNECT proxy, or 0.
+  http_connect : i32,
   http_version : i32,
   size_download : i64,
   // The bytes of the body that went to the output, after `--compressed` decoded them.
@@ -63,6 +66,7 @@ struct TransferInfo {
 pub fn new_info() -> TransferInfo {
   return TransferInfo {
     http_code : 0,
+    http_connect : 0,
     http_version : 0,
     size_download : 0i64,
     size_delivered : 0i64,
@@ -87,11 +91,44 @@ pub fn new_info() -> TransferInfo {
   };
 }
 
+/// What the transfers of a run share: the cookies and the HSTS cache.
+struct Session {
+  jar : CookieJar,
+  hsts : Hsts,
+}
+
 /// Where the bytes of one transfer go.
 struct Sinks {
   body : Output,
   headers : Output,
   has_headers : bool,
+}
+
+/// Write the header lines `raw` to the output when `to_body` (`-i`), and to the file of `-D`.
+/// When both get them, curl writes each line to the one and then to the other, which shows
+/// when both are standard output.
+fn write_head(sinks : &mut Sinks, to_body : bool, raw : &Vec<u8>) -> Result<i32, Failure> {
+  if !to_body || !sinks.has_headers {
+    if to_body {
+      let _w = sinks.body.write(raw)?;
+    }
+    if sinks.has_headers {
+      let _w = sinks.headers.write(raw)?;
+    }
+    return Result<i32, Failure>::Ok(0);
+  }
+  let mut start = 0;
+  while start < raw.len() {
+    let mut end = find_byte(raw, 10u8, start);
+    if end < 0 {
+      end = raw.len() - 1;
+    }
+    let line = range_of(raw, start, end + 1);
+    let _b = sinks.body.write(&line)?;
+    let _h = sinks.headers.write(&line)?;
+    start = end + 1;
+  }
+  return Result<i32, Failure>::Ok(0);
 }
 
 /// Write `bytes` to standard error with `prefix` before each line, for `-v`.
@@ -524,7 +561,7 @@ struct Hop {
 fn one_hop(network : &Network, tls : &TlsConfig, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
 req_kind : i32, body : &Vec<u8>, creds : &Credentials, same_host : bool, has_referer : bool,
 referer : &Vec<u8>, deadline : Instant, form_boundary : &Vec<u8>, auth : &mut AuthContext,
-jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop, Failure> {
+session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Hop, Failure> {
   let secure = eq_lit(&u.scheme, "https");
   let mut method = lit("GET");
   if cfg.has_method {
@@ -578,7 +615,7 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
   let cookie_path = path_of(&u.path);
   let secure_context = secure || (!proxy.used && (eq_lit_nocase(&cookie_host, "localhost")
     || eq_lit(&cookie_host, "127.0.0.1") || eq_lit(&cookie_host, "::1")));
-  let mut cookies = cookie_header(jar, &cookie_host, &cookie_path, secure_context);
+  let mut cookies = cookie_header(&session.jar, &cookie_host, &cookie_path, secure_context);
   if cfg.has_cookie && trusted_host && !has_custom(headers, "Cookie") {
     if cookies.len() > 0 {
       push_lit(&mut cookies, "; ");
@@ -638,7 +675,7 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
   let connect_deadline = earliest(deadline,
     deadline_after(Duration::from_millis(connect_limit_ms(cfg) as u64)));
   let mut c = connected(connect_phase(network, tls, cfg, u, &proxy, &address, secure,
-    connect_deadline, info), &connect_started)?;
+    connect_deadline, info, sinks), &connect_started)?;
   c.set_deadline(deadline);
   // HTTP/2 when TLS chose it with ALPN, or with `--http2-prior-knowledge` on plain TCP.
   let use_h2 = c.is_h2() || (cfg.h2_prior_knowledge && !secure && !via_proxy);
@@ -675,22 +712,20 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
   // Skip each informational response, such as `100 Continue`. With `-i`, curl shows it.
   let mut head = next_head(&mut c, &mut h2, use_h2, cfg.raw, cfg.tr_encoding,
     &mut info.size_header_total)?;
-  let mut set_cookies = take_cookies(jar, &head, &cookie_host, &cookie_path, secure_context, 0);
+  let mut set_cookies = take_cookies(&mut session.jar, &head, &cookie_host, &cookie_path,
+    secure_context, 0);
+  take_hsts(cfg, &mut session.hsts, &head, u, secure);
   while head.error_code == 0 && head.status >= 100 && head.status < 200 && head.status != 101 {
     info.size_header = info.size_header + (head.raw.len() as i64);
     if cfg.verbose {
       verbose_lines("< ", &head.raw);
     }
-    if cfg.include {
-      let _w = sinks.body.write(&head.raw)?;
-    }
-    if sinks.has_headers {
-      let _w = sinks.headers.write(&head.raw)?;
-    }
+    let _w = write_head(sinks, cfg.include, &head.raw)?;
     head = next_head(&mut c, &mut h2, use_h2, cfg.raw, cfg.tr_encoding,
       &mut info.size_header_total)?;
-    set_cookies = take_cookies(jar, &head, &cookie_host, &cookie_path, secure_context,
-      set_cookies);
+    set_cookies = take_cookies(&mut session.jar, &head, &cookie_host, &cookie_path,
+      secure_context, set_cookies);
+    take_hsts(cfg, &mut session.hsts, &head, u, secure);
   }
   if head.error_code != 0 {
     // curl writes the headers before the bad one, and stops.
@@ -760,12 +795,7 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
     return Result<Hop, Failure>::Err(http_error(head.status));
   }
 
-  if cfg.include || cfg.head {
-    let _w = sinks.body.write(&head.raw)?;
-  }
-  if sinks.has_headers {
-    let _w = sinks.headers.write(&head.raw)?;
-  }
+  let _w = write_head(sinks, cfg.include || cfg.head, &head.raw)?;
 
   // The body of a redirect that curl follows goes nowhere.
   let mut trailers = Vec<u8>::new();
@@ -793,12 +823,7 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
     }
   }
   if trailers.len() > 0 {
-    if cfg.include {
-      let _w = sinks.body.write(&trailers)?;
-    }
-    if sinks.has_headers {
-      let _w = sinks.headers.write(&trailers)?;
-    }
+    let _w = write_head(sinks, cfg.include, &trailers)?;
   }
   if failed {
     return Result<Hop, Failure>::Err(http_error(head.status));
@@ -806,6 +831,8 @@ jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<Ho
   if cfg.verbose && !follow {
     let mut m = lit("Connection #0 to host ");
     append(&mut m, &host_text(u));
+    push_lit(&mut m, ":");
+    push_u64(&mut m, u.port as u64);
     push_lit(&mut m, " left intact");
     verbose_info(&m);
   }
@@ -886,6 +913,42 @@ secure : bool, count : i32) -> i32 {
   return n;
 }
 
+/// Give each `Strict-Transport-Security` header of `head` to the HSTS cache, when the response
+/// came over HTTPS. libcurl skips a header that it cannot read, and says so with `-v`.
+fn take_hsts(cfg : &Config, hsts : &mut Hsts, head : &ResponseHead, u : &Url, secure : bool)
+-> void {
+  if !hsts.enabled || !secure {
+    return;
+  }
+  for line in head.headers.iter() {
+    if starts_lit_nocase(line, "Strict-Transport-Security:") {
+      let value = rest_from(line, 26);
+      if !hsts_header(hsts, &u.host, &value) && cfg.verbose {
+        verbose_info(&lit("Illegal STS header skipped"));
+      }
+    }
+  }
+}
+
+/// `u` over HTTPS when the HSTS cache says that its host must be reached that way, as
+/// libcurl's `hsts_upgrade`. A port that the URL gives stays.
+fn hsts_upgrade(cfg : &Config, hsts : &mut Hsts, u : Url) -> Url {
+  if !eq_lit(&u.scheme, "http") || !hsts_applies(hsts, &u.host) {
+    return u;
+  }
+  let mut up = u;
+  up.scheme = lit("https");
+  if !up.port_given {
+    up.port = 443;
+  }
+  if cfg.verbose {
+    let mut m = lit("Switched from HTTP to HTTPS due to HSTS => ");
+    append(&mut m, &url_text(&up));
+    verbose_info(&m);
+  }
+  return up;
+}
+
 // How many times one transfer sends a request again for authentication.
 const MAX_AUTH_ROUNDS : i32 = 50;
 
@@ -947,8 +1010,8 @@ fn earliest(a : Instant, b : Instant) -> Instant {
 /// Connect to `address`, then make the tunnel of a proxy and start TLS when `secure`. Each step
 /// gives up at `deadline`.
 fn connect_phase(network : &Network, tls : &TlsConfig, cfg : &Config, u : &Url, proxy : &Proxy,
-address : &Vec<u8>, secure : bool, deadline : Instant, info : &mut TransferInfo)
--> Result<Conn, Failure> {
+address : &Vec<u8>, secure : bool, deadline : Instant, info : &mut TransferInfo,
+sinks : &mut Sinks) -> Result<Conn, Failure> {
   if cfg.verbose {
     let mut m = lit("  Trying ");
     append(&mut m, address);
@@ -972,7 +1035,7 @@ address : &Vec<u8>, secure : bool, deadline : Instant, info : &mut TransferInfo)
     let _socks = socks_connect(&mut c, &request)?;
   }
   if proxy.used && !is_socks(proxy.kind) && (secure || cfg.proxytunnel) {
-    open_tunnel(&mut c, cfg, u, proxy, info)?;
+    open_tunnel(&mut c, cfg, u, proxy, info, sinks)?;
   }
   if secure {
     // curl offers HTTP/2 over TLS unless `--http1.1` or `--http1.0` says no.
@@ -1209,9 +1272,10 @@ fn has_port_in(text : &Vec<u8>) -> bool {
 }
 
 /// Ask the HTTP proxy for a tunnel to the host of `u` with CONNECT, for HTTPS through a proxy
-/// and for `-p`.
-fn open_tunnel(c : &mut Conn, cfg : &Config, u : &Url, proxy : &Proxy, info : &mut TransferInfo)
--> Result<i32, Failure> {
+/// and for `-p`. The head of the reply goes to the output with `-i` and to the file of `-D`, as
+/// in curl, unless `--suppress-connect-headers`.
+fn open_tunnel(c : &mut Conn, cfg : &Config, u : &Url, proxy : &Proxy, info : &mut TransferInfo,
+sinks : &mut Sinks) -> Result<i32, Failure> {
   let request = build_connect_request(u, proxy.has_credentials, &proxy.user, &proxy.password,
     cfg.has_user_agent, &cfg.user_agent);
   if cfg.verbose {
@@ -1225,10 +1289,36 @@ fn open_tunnel(c : &mut Conn, cfg : &Config, u : &Url, proxy : &Proxy, info : &m
   if head.error_code != 0 {
     return Result<i32, Failure>::Err(fail_with(head.error_code, clone_bytes(&head.error)));
   }
+  info.size_header = info.size_header + (head.raw.len() as i64);
+  info.http_connect = head.status;
+  if !cfg.suppress_connect_headers {
+    let _w = write_head(sinks, cfg.include, &head.raw)?;
+  }
+  if head.status == 407 {
+    // libcurl reads the body of a 407 before it gives up, so that the connection could take
+    // a retry with credentials. A body that it cannot read is a receive error.
+    let mut discard = null_output();
+    let mut scratch = new_info();
+    let mut trailers = Vec<u8>::new();
+    if head.chunked {
+      if cfg.verbose {
+        verbose_info(&lit("Ignore chunked response-body"));
+      }
+      let _b = read_chunked(c, &mut discard, &mut scratch, &mut trailers, false)?;
+    } else if head.content_length > 0i64 && !head.has_transfer_encoding {
+      if cfg.verbose {
+        let mut m = lit("Ignore ");
+        push_i64(&mut m, head.content_length);
+        push_lit(&mut m, " bytes of response-body");
+        verbose_info(&m);
+      }
+      let _b = read_length(c, head.content_length, &mut discard, &mut scratch)?;
+    }
+  }
   if head.status / 100 != 2 {
     let mut m = lit("CONNECT tunnel failed, response ");
     push_u64(&mut m, head.status as u64);
-    return Result<i32, Failure>::Err(fail_with(RECV_ERROR, m));
+    return Result<i32, Failure>::Err(fail_with(COULDNT_CONNECT, m));
   }
   // A 2xx reply to CONNECT has no body.
   return Result<i32, Failure>::Ok(0);
@@ -1262,7 +1352,7 @@ fn credentials_of(cfg : &Config, u : &Url) -> Credentials {
 /// `REQ_GET`, `REQ_POST`, `REQ_PUT` or `REQ_HEAD`. With `-m`, the whole transfer, redirects
 /// included, has that time limit.
 pub fn run_transfer(network : &Network, tls : &TlsConfig, cfg : &Config, headers : &Vec<Vec<u8>>,
-url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>, jar : &mut CookieJar,
+url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>, session : &mut Session,
 sinks : &mut Sinks, info : &mut TransferInfo) -> Result<i32, Failure> {
   let started = Instant::now();
   let mut deadline = Instant::never();
@@ -1270,7 +1360,7 @@ sinks : &mut Sinks, info : &mut TransferInfo) -> Result<i32, Failure> {
     deadline = deadline_after(Duration::from_millis(cfg.max_time_ms as u64));
   }
   match follow_redirects(network, tls, cfg, headers, url_text, body, kind, deadline, form_boundary,
-    jar, sinks, info) {
+    session, sinks, info) {
     Result<i32, Failure>::Ok(n) => {
       return Result<i32, Failure>::Ok(n);
     },
@@ -1301,9 +1391,10 @@ fn timeout_message(f : Failure, started : &Instant, info : &TransferInfo) -> Fai
 /// The transfer of `url_text`, and of each redirect that it follows, until `deadline`.
 fn follow_redirects(network : &Network, tls : &TlsConfig, cfg : &Config,
 headers : &Vec<Vec<u8>>, url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, deadline : Instant,
-form_boundary : &Vec<u8>, jar : &mut CookieJar, sinks : &mut Sinks, info : &mut TransferInfo)
+form_boundary : &Vec<u8>, session : &mut Session, sinks : &mut Sinks, info : &mut TransferInfo)
 -> Result<i32, Failure> {
-  let first = parse_url(url_text, cfg.path_as_is)?;
+  let parsed = parse_url(url_text, cfg.path_as_is)?;
+  let first = hsts_upgrade(cfg, &mut session.hsts, parsed);
   let mut creds = credentials_of(cfg, &first);
   let mut auth = new_auth_context(cfg.auth_type, cfg.proxy_auth_type);
   // A server that asks for new credentials again and again does not keep securl forever.
@@ -1332,7 +1423,7 @@ form_boundary : &Vec<u8>, jar : &mut CookieJar, sinks : &mut Sinks, info : &mut 
       creds = credentials_of(cfg, &u);
     }
     let hop = one_hop(network, tls, cfg, headers, &u, req_kind, body, &creds, same_host, has_referer,
-      &referer, deadline, form_boundary, &mut auth, jar, sinks, info)?;
+      &referer, deadline, form_boundary, &mut auth, session, sinks, info)?;
     if hop.retry && auth_rounds < MAX_AUTH_ROUNDS {
       auth_rounds = auth_rounds + 1;
       continue;
@@ -1368,7 +1459,7 @@ form_boundary : &Vec<u8>, jar : &mut CookieJar, sinks : &mut Sinks, info : &mut 
       has_referer = true;
       referer = url_text(&u);
     }
-    u = next;
+    u = hsts_upgrade(cfg, &mut session.hsts, next);
     info.num_redirects = redirects;
   }
 }

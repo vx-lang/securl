@@ -1,0 +1,487 @@
+// HSTS, as libcurl's `hsts.c` does it: the hosts that must be reached over HTTPS. They come
+// from the file of `--hsts` and from the `Strict-Transport-Security` headers of HTTPS
+// responses, and go back to the file.
+//
+// `main` reads and writes the file, because only it has the file right. A transfer asks
+// `hsts_applies` before it sends a request to an `http://` URL, and gives each
+// `Strict-Transport-Security` header of an HTTPS response to `hsts_header`.
+import core::option;
+import std::time;
+import std::vec;
+import sys::text;
+import securl::bytes;
+import securl::cookie;
+import securl::date;
+
+/// libcurl keeps at most this many hosts. A new one pushes out the oldest.
+const MAX_ENTRIES : i32 = 10000;
+/// A line of the file, its newline included, must be shorter than this.
+const MAX_LINE : i32 = 4095;
+const MAX_HOSTLEN : i32 = 2048;
+const MAX_DATELEN : i32 = 17;
+/// The longest `max-age` that libcurl takes: two years.
+const CAP_MAX_AGE : i64 = 63072000i64;
+/// The expiry of an entry that never expires, which the file calls `unlimited`.
+const UNLIMITED : i64 = 9223372036854775807i64;
+
+/// One host. `live` is false once libcurl would have taken it off its list.
+struct HstsEntry {
+  host : Vec<u8>,
+  expires : i64,
+  subdomains : bool,
+  live : bool,
+}
+
+/// The HSTS cache of a run. `enabled` is false without `--hsts`.
+struct Hsts {
+  enabled : bool,
+  entries : Vec<HstsEntry>,
+}
+
+/// An empty cache.
+pub fn new_hsts(enabled : bool) -> Hsts {
+  return Hsts {
+    enabled : enabled,
+    entries : Vec<HstsEntry>::new()
+  };
+}
+
+/// The clock, in seconds since 1970.
+fn now_seconds() -> i64 {
+  return unix_timestamp() as i64;
+}
+
+/// `host` without one dot at its end.
+fn without_trailing_dot(host : &Vec<u8>) -> Vec<u8> {
+  if host.len() > 0 && host.get(host.len() - 1) == 46u8 {
+    return range_of(host, 0, host.len() - 1);
+  }
+  return clone_bytes(host);
+}
+
+fn live_count(h : &Hsts) -> i32 {
+  let mut n = 0;
+  for e in h.entries.iter() {
+    if e.live {
+      n = n + 1;
+    }
+  }
+  return n;
+}
+
+/// Take the entry at `index` off the list.
+fn drop_entry(h : &mut Hsts, index : i32) -> void {
+  let mut i = 0;
+  for e in h.entries.iter_mut() {
+    if i == index {
+      e.live = false;
+    }
+    i = i + 1;
+  }
+}
+
+/// Give the entry at `index` a new expiry and subdomain rule.
+fn update_entry(h : &mut Hsts, index : i32, expires : i64, subdomains : bool) -> void {
+  let mut i = 0;
+  for e in h.entries.iter_mut() {
+    if i == index {
+      e.expires = expires;
+      e.subdomains = subdomains;
+    }
+    i = i + 1;
+  }
+}
+
+/// Add `host`, as libcurl's `hsts_create`: without a dot at its end, and at the end of the
+/// list, which drops the oldest entry when it is full.
+fn create_entry(h : &mut Hsts, host : &Vec<u8>, subdomains : bool, expires : i64) -> void {
+  let name = without_trailing_dot(host);
+  if name.len() == 0 {
+    return;
+  }
+  if live_count(h) == MAX_ENTRIES {
+    let mut first = -1;
+    let mut i = 0;
+    while i < h.entries.len() && first < 0 {
+      if h.entries.get_ref(i).live {
+        first = i;
+      }
+      i = i + 1;
+    }
+    drop_entry(h, first);
+  }
+  h.entries.push(HstsEntry {
+    host : name,
+    expires : expires,
+    subdomains : subdomains,
+    live : true
+  });
+}
+
+const NO_MATCH : i32 = 0;
+const EXPIRED : i32 = 1;
+const EXACT : i32 = 2;
+const PARENT : i32 = 3;
+
+/// How the entry `e` matches `host`, which has no dot at its end.
+fn match_entry(e : &HstsEntry, host : &Vec<u8>, subdomain : bool, now : i64) -> i32 {
+  if !e.live {
+    return NO_MATCH;
+  }
+  if e.expires <= now {
+    return EXPIRED;
+  }
+  let tail = e.host.len();
+  if host.len() == tail && eq_nocase(host, &e.host) {
+    return EXACT;
+  }
+  if subdomain && e.subdomains && tail < host.len() {
+    let offs = host.len() - tail;
+    if host.get(offs - 1) == 46u8 && eq_nocase(&rest_from(host, offs), &e.host) {
+      return PARENT;
+    }
+  }
+  return NO_MATCH;
+}
+
+/// The entry for `hostname`, or -1, as libcurl's `hsts_check`. With `subdomain`, an entry
+/// with `includeSubDomains` for a parent domain counts too, the longest one first. An entry
+/// for the host itself wins. Expired entries that it passes go off the list.
+fn check(h : &mut Hsts, hostname : &Vec<u8>, subdomain : bool) -> i32 {
+  if hostname.len() == 0 {
+    return -1;
+  }
+  let host = without_trailing_dot(hostname);
+  let now = now_seconds();
+  let mut best = -1;
+  let mut best_len = 0;
+  let mut exact = -1;
+  let mut i = 0;
+  for e in h.entries.iter_mut() {
+    if exact < 0 {
+      let how = match_entry(e, &host, subdomain, now);
+      if how == EXPIRED {
+        e.live = false;
+      }
+      if how == EXACT {
+        exact = i;
+      }
+      if how == PARENT && e.host.len() > best_len {
+        best = i;
+        best_len = e.host.len();
+      }
+    }
+    i = i + 1;
+  }
+  if exact >= 0 {
+    return exact;
+  }
+  return best;
+}
+
+/// Whether a request to `host` must go over HTTPS.
+pub fn hsts_applies(h : &mut Hsts, host : &Vec<u8>) -> bool {
+  return h.enabled && check(h, host, true) >= 0;
+}
+
+/// Add a host of the file with its expiry text, as libcurl's `hsts_add_host_expire`. A name
+/// that starts with a dot covers its subdomains. A host that is there already keeps the later
+/// expiry, and covers its subdomains when either says so.
+fn add_host_expire(h : &mut Hsts, host_text : &Vec<u8>, expire : &Vec<u8>) -> void {
+  if expire.len() > MAX_DATELEN {
+    return;
+  }
+  let mut expires = 0i64;
+  if eq_lit(expire, "unlimited") {
+    expires = UNLIMITED;
+  } else {
+    match parse_date(expire) {
+      Option<i64>::Some(t) => {
+        expires = t;
+      },
+      Option<i64>::None() => {}
+    }
+  }
+  if expires <= now_seconds() {
+    return;
+  }
+  let mut host = clone_bytes(host_text);
+  let mut subdomain = false;
+  if host.len() > 0 && host.get(0) == 46u8 {
+    host = rest_from(&host, 1);
+    subdomain = true;
+  }
+  host = without_trailing_dot(&host);
+  if host.len() == 0 {
+    return;
+  }
+  let found = check(h, &host, false);
+  if found < 0 {
+    create_entry(h, &host, subdomain, expires);
+    return;
+  }
+  let mut i = 0;
+  for e in h.entries.iter_mut() {
+    if i == found && eq_nocase(&host, &e.host) {
+      if expires > e.expires {
+        e.expires = expires;
+      }
+      if subdomain {
+        e.subdomains = true;
+      }
+    }
+    i = i + 1;
+  }
+}
+
+/// The end of the word at `at` that stops at a space, as libcurl's `curlx_str_word`, or -1
+/// when it is empty or longer than `max`.
+fn word_end(s : &Vec<u8>, at : i32, max : i32) -> i32 {
+  let mut i = at;
+  while i < s.len() && s.get(i) != 32u8 {
+    i = i + 1;
+    if i - at > max {
+      return -1;
+    }
+  }
+  if i == at {
+    return -1;
+  }
+  return i;
+}
+
+/// The end of the quoted word at `at`, after its closing quote, as libcurl's
+/// `curlx_str_quotedword`, or -1. A backslash keeps the next byte. `inner` gets the bytes
+/// between the quotes, backslashes included.
+fn quoted_end(s : &Vec<u8>, at : i32, max : i32, inner : &mut Vec<u8>) -> i32 {
+  if at >= s.len() || s.get(at) != 34u8 {
+    return -1;
+  }
+  let mut i = at + 1;
+  let mut len = 0;
+  while i < s.len() && s.get(i) != 34u8 {
+    if s.get(i) == 92u8 && i + 1 < s.len() {
+      i = i + 1;
+      len = len + 1;
+      if len > max {
+        return -1;
+      }
+    }
+    i = i + 1;
+    len = len + 1;
+    if len > max {
+      return -1;
+    }
+  }
+  if i >= s.len() {
+    return -1;
+  }
+  *inner = range_of(s, at + 1, i);
+  return i + 1;
+}
+
+fn is_newline(b : u8) -> bool {
+  return b == 10u8 || b == 13u8;
+}
+
+/// One line of the file, newline included, such as `.example.net "20391231 10:00:00"`, as
+/// libcurl's `hsts_add`. A line it cannot read changes nothing.
+fn add_line(h : &mut Hsts, line : &Vec<u8>) -> void {
+  let host_end = word_end(line, 0, MAX_HOSTLEN);
+  if host_end < 0 || host_end >= line.len() || line.get(host_end) != 32u8 {
+    return;
+  }
+  let mut date = Vec<u8>::new();
+  let date_end = quoted_end(line, host_end + 1, MAX_DATELEN, &mut date);
+  if date_end < 0 || date_end >= line.len() || !is_newline(line.get(date_end)) {
+    return;
+  }
+  add_host_expire(h, &range_of(line, 0, host_end), &date);
+}
+
+/// Read an HSTS file, as libcurl's `hsts_load`. Blank lines and those that start with `#` are
+/// skipped. False when it stopped at a line that is too long, where libcurl stops too and
+/// fails the transfer.
+pub fn load_hsts_text(h : &mut Hsts, text : &Vec<u8>) -> bool {
+  let mut start = 0;
+  while start < text.len() {
+    let mut end = find_byte(text, 10u8, start);
+    let mut line = Vec<u8>::new();
+    if end < 0 {
+      // libcurl adds a newline to the last line.
+      line = rest_from(text, start);
+      line.push(10u8);
+      end = text.len();
+    } else {
+      line = range_of(text, start, end + 1);
+    }
+    if line.len() + 1 > MAX_LINE {
+      return false;
+    }
+    // libcurl sees the line up to a zero byte.
+    let zero = find_byte(&line, 0u8, 0);
+    if zero >= 0 {
+      line = range_of(&line, 0, zero);
+    }
+    let mut at = 0;
+    while at < line.len() && is_blank(line.get(at)) {
+      at = at + 1;
+    }
+    let rest = rest_from(&line, at);
+    if rest.len() > 1 && rest.get(0) != 35u8 {
+      add_line(h, &rest);
+    }
+    start = end + 1;
+  }
+  return true;
+}
+
+/// The end of the run of bytes at `at` that are none of `stops`, as `strcspn`.
+fn span_until(s : &Vec<u8>, at : i32, stops : *const i8) -> i32 {
+  let reject = lit(stops);
+  let mut i = at;
+  while i < s.len() && find_byte(&reject, s.get(i), 0) < 0 {
+    i = i + 1;
+  }
+  return i;
+}
+
+fn skip_blanks(s : &Vec<u8>, at : i32) -> i32 {
+  let mut i = at;
+  while i < s.len() && is_blank(s.get(i)) {
+    i = i + 1;
+  }
+  return i;
+}
+
+/// The number at the start of `v`, as libcurl's `curlx_str_number` with `CAP_MAX_AGE`: the
+/// cap when it is larger, or -1 when `v` does not start with a digit.
+fn max_age_of(v : &Vec<u8>) -> i64 {
+  if v.len() == 0 || !is_digit(v.get(0)) {
+    return -1i64;
+  }
+  let mut n = 0i64;
+  let mut i = 0;
+  while i < v.len() && is_digit(v.get(i)) {
+    n = n * 10i64 + ((v.get(i) - 48u8) as i64);
+    if n > CAP_MAX_AGE {
+      return CAP_MAX_AGE;
+    }
+    i = i + 1;
+  }
+  return n;
+}
+
+/// Take the value of a `Strict-Transport-Security` header that `hostname` sent over HTTPS, as
+/// libcurl's `Curl_hsts_parse`. False when the header is not valid: a `max-age` that is
+/// missing, twice or not a number, or a second `includeSubDomains`. An IP address never gets
+/// an entry, and `max-age=0` removes the host.
+pub fn hsts_header(h : &mut Hsts, hostname : &Vec<u8>, value : &Vec<u8>) -> bool {
+  if host_is_ip(hostname) {
+    return true;
+  }
+  let mut expires = 0i64;
+  let mut got_max_age = false;
+  let mut got_subdomains = false;
+  let mut subdomains = false;
+  // The value may end with a newline; libcurl stops there.
+  let mut p = 0;
+  loop {
+    loop {
+      p = skip_blanks(value, p);
+      if p < value.len() && value.get(p) == 59u8 {
+        p = p + 1;
+      } else {
+        break;
+      }
+    }
+    let word_start = p;
+    p = span_until(value, p, ";=\r\n \t");
+    if p == word_start {
+      break;
+    }
+    let word = range_of(value, word_start, p);
+    p = skip_blanks(value, p);
+    let mut assign = false;
+    let mut val = Vec<u8>::new();
+    if p < value.len() && value.get(p) == 61u8 {
+      assign = true;
+      p = skip_blanks(value, p + 1);
+      if p < value.len() && value.get(p) == 34u8 {
+        let after = quoted_end(value, p, MAX_LINE, &mut val);
+        if after < 0 {
+          break;
+        }
+        p = after;
+      } else {
+        let val_start = p;
+        p = span_until(value, p, ", ;\r\n");
+        if p == val_start {
+          break;
+        }
+        val = range_of(value, val_start, p);
+      }
+    }
+    if assign && eq_lit_nocase(&word, "max-age") {
+      if got_max_age {
+        return false;
+      }
+      expires = max_age_of(&val);
+      if expires < 0i64 {
+        return false;
+      }
+      got_max_age = true;
+    } else {
+      if eq_lit_nocase(&word, "includesubdomains") {
+        if got_subdomains {
+          return false;
+        }
+        subdomains = true;
+        got_subdomains = true;
+      }
+    }
+    if p >= value.len() {
+      break;
+    }
+  }
+  if !got_max_age {
+    return false;
+  }
+  if expires == 0i64 {
+    let found = check(h, hostname, false);
+    if found >= 0 {
+      drop_entry(h, found);
+    }
+    return true;
+  }
+  expires = expires + now_seconds();
+  let found = check(h, hostname, false);
+  if found >= 0 {
+    update_entry(h, found, expires, subdomains);
+  } else {
+    create_entry(h, hostname, subdomains, expires);
+  }
+  return true;
+}
+
+/// The text of the HSTS file, as libcurl's `Curl_hsts_save` writes it.
+pub fn hsts_text(h : &Hsts) -> Vec<u8> {
+  let mut out = lit("# Your HSTS cache. https://curl.se/docs/hsts.html\n");
+  push_lit(&mut out, "# This file was generated by libcurl! Edit at your own risk.\n");
+  for e in h.entries.iter() {
+    if e.live {
+      if e.subdomains {
+        out.push(46u8);
+      }
+      append(&mut out, &e.host);
+      push_lit(&mut out, " \"");
+      if e.expires == UNLIMITED {
+        push_lit(&mut out, "unlimited");
+      } else {
+        append(&mut out, &compact_date(e.expires));
+      }
+      push_lit(&mut out, "\"\n");
+    }
+  }
+  return out;
+}

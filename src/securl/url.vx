@@ -23,6 +23,8 @@ struct Url {
   // the URL that `-w` writes, but does not connect through the zone yet.
   zone : Vec<u8>,
   port : i32,
+  // The URL gave the port, even the default one, which then stays in its text as in curl.
+  port_given : bool,
   path : Vec<u8>,
 }
 
@@ -38,6 +40,7 @@ pub fn clone_url(u : &Url) -> Url {
     ipv6 : u.ipv6,
     zone : clone_bytes(&u.zone),
     port : u.port,
+    port_given : u.port_given,
     path : clone_bytes(&u.path)
   };
 }
@@ -307,6 +310,7 @@ pub fn parse_url(text : &Vec<u8>, path_as_is : bool) -> Result<Url, Failure> {
     ipv6 : ipv6,
     zone : zone,
     port : port,
+    port_given : has_port && port_text.len() > 0,
     path : path
   });
 }
@@ -468,7 +472,7 @@ pub fn url_text(u : &Url) -> Vec<u8> {
   } else {
     append(&mut out, &host_text(u));
   }
-  if u.port != default_port(&u.scheme) {
+  if u.port_given || u.port != default_port(&u.scheme) {
     push_lit(&mut out, ":");
     push_u64(&mut out, u.port as u64);
   }

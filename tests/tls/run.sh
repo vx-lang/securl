@@ -167,6 +167,30 @@ stderr_has "  with curl's message" "Connection timed out after"
 check "--connect-timeout leaves a slow body alone" 28 "" \
   -sS --connect-timeout 1 -m 2 -o "$work/stalled" "http://127.0.0.1:$http/stall"
 stderr_has "  and -m ends it" "Operation timed out after"
+# The head of the reply of a CONNECT proxy goes out with -i, as in curl.
+# first_line NAME EXPECTED CURL_ARGUMENTS...: the first line of the output, without its CR.
+first_line() {
+  name=$1
+  want=$2
+  shift 2
+  got=$(timeout 20 "$curl" "$@" 2> "$work/stderr" | head -n 1 | tr -d '\r')
+  if [ "$got" = "$want" ]; then
+    echo "ok   $name"
+  else
+    echo "FAIL $name: '$got' (want '$want')"
+    fail=1
+  fi
+}
+first_line "-i shows the reply of the proxy" "HTTP/1.1 200 Connection established" \
+  -si --cacert "$certs/ca.pem" -x "127.0.0.1:$proxy" "https://localhost:$https/"
+first_line "  unless --suppress-connect-headers" "HTTP/1.1 200 OK" -si \
+  --suppress-connect-headers --cacert "$certs/ca.pem" -x "127.0.0.1:$proxy" \
+  "https://localhost:$https/"
+check "a tunnel that the proxy refuses" 7 "" -sS -x "127.0.0.1:$proxy" "https://localhost:1/"
+stderr_has "  with curl's message" "CONNECT tunnel failed, response 403"
+first_line "  and -i shows the refusal" "HTTP/1.1 403 Forbidden" -si -x "127.0.0.1:$proxy" \
+  "https://localhost:1/"
+
 # Proxies from the environment, as libcurl reads them. The proxy of servers.py does only
 # CONNECT and answers 405 to anything else, so a request that went to it directly gives 405.
 p=http://127.0.0.1:$proxy
@@ -325,6 +349,64 @@ check "--tr-encoding decodes Transfer-Encoding: gzip" 0 "203890" -s --tr-encodin
   -w '%{size_delivered}' -o "$work/te" "http://127.0.0.1:$http/te-gzip"
 check "  and without it, curl refuses it" 61 "" -sS -o /dev/null "http://127.0.0.1:$http/te-gzip"
 stderr_has "  with curl's message" "Unsolicited Transfer-Encoding (gzip) found"
+
+# HSTS: the file of --hsts, the Strict-Transport-Security headers of HTTPS responses, and the
+# switch from http:// to https:// for the hosts in the file. /sts?VALUE sends VALUE as the
+# header.
+# hsts_is NAME FILE EXPECTED: the entries of the HSTS file FILE, one per line joined with '|',
+# with each date that starts with 20 shown as DATE.
+hsts_is() {
+  got=$(grep -v '^#' "$2" | sed 's/"20[0-9]\{6\} [0-9:]\{8\}"/"DATE"/' | tr '\n' '|')
+  if [ "$got" = "$3" ]; then
+    echo "ok   $1"
+  else
+    echo "FAIL $1: the file has '$got' (want '$3')"
+    fail=1
+  fi
+}
+hsts=$work/hsts
+rm -f "$hsts"
+check "an HTTPS response adds a host to the HSTS file" 0 "sts" -s --hsts "$hsts" \
+  --cacert "$certs/ca.pem" "https://localhost:$https/sts?max-age=1000;%20includeSubDomains"
+hsts_is "  with its subdomains" "$hsts" '.localhost "DATE"|'
+check "then http:// goes over HTTPS, on the port of the URL" 0 "https://localhost:$https/" -s \
+  --hsts "$hsts" --cacert "$certs/ca.pem" -o /dev/null -w '%{url_effective}' \
+  "http://localhost:$https/"
+check "  and so does a subdomain" 0 "hello over tls" -s -k --hsts "$hsts" \
+  --resolve "a.localhost:$https:127.0.0.1" "http://a.localhost:$https/"
+check "  and -v says so" 0 "hello over tls" -sv --hsts "$hsts" --cacert "$certs/ca.pem" \
+  "http://localhost:$https/"
+stderr_has "  with curl's message" \
+  "Switched from HTTP to HTTPS due to HSTS => https://localhost:$https/"
+check "a header without max-age" 0 "sts" -sv --hsts "$hsts" --cacert "$certs/ca.pem" \
+  "https://localhost:$https/sts?includeSubDomains"
+stderr_has "  is skipped" "Illegal STS header skipped"
+check "max-age=0 removes the host" 0 "sts" -s --hsts "$hsts" --cacert "$certs/ca.pem" \
+  "https://localhost:$https/sts?max-age=0"
+hsts_is "  from the file" "$hsts" ''
+check "a longer max-age than two years" 0 "sts" -s --hsts "$hsts" --cacert "$certs/ca.pem" \
+  "https://localhost:$https/sts?max-age=99999999999999999999"
+two_years=$(date -u -d "@$(($(date +%s) + 63072000))" +%Y%m%d)
+if grep -q "^localhost \"$two_years " "$hsts"; then
+  echo "ok     is cut to two years"
+else
+  echo "FAIL  is cut to two years: the file has '$(grep -v '^#' "$hsts")' (want $two_years)"
+  fail=1
+fi
+rm -f "$hsts"
+check "an HTTP response cannot add a host" 0 "sts" -s --hsts "$hsts" \
+  --resolve "localhost:$http:127.0.0.1" "http://localhost:$http/sts?max-age=1000"
+hsts_is "  to the file" "$hsts" ''
+check "an IP address gets no entry" 0 "sts" -s --hsts "$hsts" --cacert "$certs/ca.pem" \
+  "https://127.0.0.1:$https/sts?max-age=1000"
+hsts_is "  in the file" "$hsts" ''
+printf 'old.example "20101001 04:47:41"\nlocalhost "unlimited"\n' > "$hsts"
+check "a host that never expires" 0 "hello over tls" -s --hsts "$hsts" \
+  --cacert "$certs/ca.pem" "http://localhost:$https/"
+hsts_is "  stays, and an expired one goes" "$hsts" 'localhost "unlimited"|'
+python3 -c 'print("a.example \"20391001 04:47:41\"\n" + "x" * 4094)' > "$hsts"
+check "a line of 4095 bytes in the HSTS file" 100 "" -s --hsts "$hsts" "http://127.0.0.1:$http/"
+hsts_is "  ends the file there" "$hsts" 'a.example "DATE"|'
 
 # The TCP options of libcurl, in its order: TCP_NODELAY, then keepalive after 60 seconds, every
 # 60 seconds, 9 times.

@@ -196,6 +196,10 @@ fn header_json(headers : &Vec<Vec<u8>>, out : &mut Vec<u8>) -> void {
 
 fn variable(name : &Vec<u8>, info : &TransferInfo, ctx : &WriteOutContext, out : &mut Vec<u8>)
 -> bool {
+  if eq_lit(name, "http_connect") {
+    push_three_digits(out, info.http_connect);
+    return true;
+  }
   if eq_lit(name, "http_code") || eq_lit(name, "response_code") {
     push_three_digits(out, info.http_code);
     return true;

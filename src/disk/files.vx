@@ -49,6 +49,11 @@ pub fn read_file(files : &Files, name : &Vec<u8>) -> Result<Vec<u8>, Failure> {
   if eq_lit(name, "-") {
     return Result<Vec<u8>, Failure>::Ok(read_stdin());
   }
+  return read_path(files, name);
+}
+
+/// All bytes of the file `name`, where `-` is a file too.
+pub fn read_path(files : &Files, name : &Vec<u8>) -> Result<Vec<u8>, Failure> {
   let failure = fail_lit(READ_ERROR, "Failed to open/read local data from file/application");
   match path_string(name) {
     Option<String>::Some(path) => {

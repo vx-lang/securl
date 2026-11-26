@@ -10,6 +10,7 @@ It starts six servers on free ports of 127.0.0.1 and writes their ports to PORT_
   answers 1 MiB in chunks, so that TLS reads have to wait for more data.
 - a plain HTTP server whose `/to-https` redirects to the HTTPS server.
 - an HTTP proxy that only does CONNECT. It writes the first line of each request to PROXY_LOG.
+  It refuses a tunnel to port 1 with 403.
 - a server that accepts connections and never sends a byte, for the time limits of TLS.
 - a SOCKS4, SOCKS4a, SOCKS5 and SOCKS5h proxy. It writes what each client asked for to
   PROXY_LOG, such as "SOCKS5 atyp=3 localhost:443 user=". For SOCKS5 it asks for a user name
@@ -22,7 +23,8 @@ On both HTTP servers, `/stall` sends 10 of the 100 bytes of its body and then wa
 time limits of reads, and `/huge-chunk` sends a chunk size too large for 64 bits. The paths of
 `ENDLESS` send a status line, a header, a chunk-size line or a trailer that never ends, and
 `/chunk-junk` a chunk with no CRLF after its data. The paths of `ENCODED` send a body with a
-Content-Encoding for `--compressed`.
+Content-Encoding for `--compressed`. `/sts?VALUE` sends a Strict-Transport-Security header with
+the decoded VALUE, for `--hsts`.
 
 It runs until it is killed.
 """
@@ -35,6 +37,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.parse
 import zlib
 
 CERT_DIR, PORT_FILE, PROXY_LOG = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -105,6 +108,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+        elif self.path.startswith("/sts?"):
+            # The query, decoded, is the value of a Strict-Transport-Security header.
+            self.send_response(200)
+            self.send_header("Strict-Transport-Security", urllib.parse.unquote(self.path[5:]))
+            self.send_header("Content-Length", "3")
+            self.end_headers()
+            self.wfile.write(b"sts")
         elif self.path == "/":
             self.send_body(b"hello over tls\n")
         elif self.path == "/whoami":
@@ -216,6 +226,9 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             self.request.sendall(b"HTTP/1.1 405 Only CONNECT\r\nContent-Length: 0\r\n\r\n")
             return
         host, port = parts[1].rsplit(b":", 1)
+        if port == b"1":
+            self.request.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\n\r\nno\r\n")
+            return
         upstream = socket.create_connection((host.decode(), int(port)))
         self.request.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
         t = threading.Thread(target=pipe, args=(upstream, self.request), daemon=True)

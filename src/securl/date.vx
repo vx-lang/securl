@@ -404,3 +404,51 @@ pub fn parse_date(text : &Vec<u8>) -> Option<i64> {
   }
   return Option<i64>::Some(seconds);
 }
+
+fn push_two(out : &mut Vec<u8>, v : i64) -> void {
+  if v < 10i64 {
+    out.push(48u8);
+  }
+  push_i64(out, v);
+}
+
+/// The time `t`, in seconds since 1970, in UTC as libcurl writes it to an HSTS file:
+/// `YYYYMMDD hh:mm:ss`.
+pub fn compact_date(t : i64) -> Vec<u8> {
+  let mut days = t / 86400i64;
+  let mut secs = t % 86400i64;
+  if secs < 0i64 {
+    secs = secs + 86400i64;
+    days = days - 1i64;
+  }
+  // The civil date of a day number, by Howard Hinnant's method.
+  let z = days + 719468i64;
+  let mut era = z / 146097i64;
+  if z < 0i64 {
+    era = (z - 146096i64) / 146097i64;
+  }
+  let doe = z - era * 146097i64;
+  let yoe = (doe - doe / 1460i64 + doe / 36524i64 - doe / 146096i64) / 365i64;
+  let doy = doe - (365i64 * yoe + yoe / 4i64 - yoe / 100i64);
+  let mp = (5i64 * doy + 2i64) / 153i64;
+  let day = doy - (153i64 * mp + 2i64) / 5i64 + 1i64;
+  let mut month = mp + 3i64;
+  if mp >= 10i64 {
+    month = mp - 9i64;
+  }
+  let mut year = yoe + era * 400i64;
+  if month <= 2i64 {
+    year = year + 1i64;
+  }
+  let mut out = Vec<u8>::new();
+  push_i64(&mut out, year);
+  push_two(&mut out, month);
+  push_two(&mut out, day);
+  out.push(32u8);
+  push_two(&mut out, secs / 3600i64);
+  out.push(58u8);
+  push_two(&mut out, (secs / 60i64) % 60i64);
+  out.push(58u8);
+  push_two(&mut out, secs % 60i64);
+  return out;
+}

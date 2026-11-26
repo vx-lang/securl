@@ -152,6 +152,11 @@ struct Config {
   key_type : Vec<u8>,
   has_pass : bool,
   pass : Vec<u8>,
+  // `--hsts`: the HSTS cache is on, and its file, which may be empty for none.
+  has_hsts : bool,
+  // `--suppress-connect-headers`: `-i` and `-D` leave out the reply of a CONNECT proxy.
+  suppress_connect_headers : bool,
+  hsts : Vec<u8>,
   // The proxy variables of the environment that are set, such as `https_proxy`. The tool
   // reads them. This package gets their values, and not the right to read the environment.
   proxy_env : Vec<EnvVar>,
@@ -243,6 +248,9 @@ pub fn default_config() -> Config {
     key_type : Vec<u8>::new(),
     has_pass : false,
     pass : Vec<u8>::new(),
+    has_hsts : false,
+    suppress_connect_headers : false,
+    hsts : Vec<u8>::new(),
     proxy_env : Vec<EnvVar>::new()
   };
 }
@@ -332,6 +340,8 @@ const OPT_KEY : i32 = 82;
 const OPT_KEY_TYPE : i32 = 83;
 const OPT_PASS : i32 = 84;
 const OPT_TR_ENCODING : i32 = 85;
+const OPT_HSTS : i32 = 86;
+const OPT_SUPPRESS_CONNECT_HEADERS : i32 = 87;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -424,6 +434,8 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "key-type") { return OPT_KEY_TYPE; }
   if eq_lit(name, "pass") { return OPT_PASS; }
   if eq_lit(name, "tr-encoding") { return OPT_TR_ENCODING; }
+  if eq_lit(name, "hsts") { return OPT_HSTS; }
+  if eq_lit(name, "suppress-connect-headers") { return OPT_SUPPRESS_CONNECT_HEADERS; }
   return OPT_UNKNOWN;
 }
 
@@ -474,7 +486,7 @@ fn takes_value(id : i32) -> bool {
   return (id >= OPT_USER_AGENT && id <= OPT_OUTPUT_DIR) || id == OPT_CACERT || id == OPT_CAPATH
     || id == OPT_FORM || id == OPT_FORM_STRING || id == OPT_COOKIE_JAR
     || id == OPT_KEEPALIVE_TIME || id == OPT_KEEPALIVE_CNT
-    || (id >= OPT_SOCKS4 && id <= OPT_PASS);
+    || (id >= OPT_SOCKS4 && id <= OPT_PASS) || id == OPT_HSTS;
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -635,6 +647,11 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
       cfg.has_cookie = true;
       cfg.cookie = clone_bytes(value);
     }
+    return done();
+  }
+  if id == OPT_HSTS {
+    cfg.has_hsts = true;
+    cfg.hsts = clone_bytes(value);
     return done();
   }
   if id == OPT_COOKIE_JAR {
@@ -998,6 +1015,10 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
   }
   if id == OPT_TR_ENCODING {
     cfg.tr_encoding = enable;
+    return done();
+  }
+  if id == OPT_SUPPRESS_CONNECT_HEADERS {
+    cfg.suppress_connect_headers = enable;
     return done();
   }
   // OPT_DISABLE,
