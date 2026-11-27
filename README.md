@@ -63,8 +63,8 @@ Vx main 98e8df6d5.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 594 of 762 (77%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 535 of 569 (94%) |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 597 of 762 (78%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 538 of 569 (94%) |
 | TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 286 of 286 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 13 of 13 |
@@ -95,8 +95,8 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 17,908 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 1,681 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 17,944 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 1,725 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 14 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,355 | 48 `extern` functions, 87 `unsafe` blocks |
 
@@ -371,7 +371,7 @@ missing options that block the most tests.
 `-X` `-x` `-U` `-p` `--proxytunnel` `--suppress-connect-headers` `--proxy-insecure`
 `--proxy-cacert` `--proxy-capath` `--socks4` `--socks4a` `--socks5` `--socks5-hostname` `--hsts`
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
-`--unix-socket` `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
+`--unix-socket` `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` (with `@FILE`) `-m`
 `--connect-timeout` `--compressed` `--tr-encoding` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay`
 `--limit-rate` `--max-filesize` `--remove-on-error` `--next` (`-:`) `-K` (`--config`) `--stderr`
 `--retry` `--retry-delay` `--retry-max-time` `--retry-connrefused` `--retry-all-errors` `-C`
@@ -388,7 +388,9 @@ with `#1` for the first one, or `#<name>` for one written `{<name>a,b}`, and `-g
 globbing off. `src/securl/glob.vx` is a port of curl's `src/tool_urlglob.c`, with its error
 messages and their columns. As in curl, each URL goes with the `-o` or `-O`, and with the `-T`,
 of the same position on the command line, so `-T a URL1 -T b URL2` uploads `a` to `URL1` and `b`
-to `URL2`.
+to `URL2`. `--url @FILE` reads URLs from FILE, or from standard input with `@-`, one on each
+line, each as with `-O` and with no globbing, as curl does. The parser stops there, as at `-K`,
+and the tool reads the file.
 
 `--next` starts a new group of options and URLs. As in curl, `-v`, `-s`, `-S` and the trace
 options hold for every group wherever they come, the groups share the cookies and the HSTS
@@ -497,7 +499,7 @@ In order of how much users need them:
 
 1. Reuse of HTTP/2 connections (and with it, multiplexing), the `Upgrade: h2c` of `--http2`
    on plain HTTP, and HTTP/2 through an HTTP proxy.
-1. `--url @FILE`, `--variable`, `--no-clobber`, `-R`, resume of a
+1. `--variable`, `--no-clobber`, `-R`, resume of a
    retry (`--retry` with `-C -`),
    `--netrc`, a default `.curlrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
    encoders, `--preproxy`, `--abstract-unix-socket`, the progress meter and `-#` (securl

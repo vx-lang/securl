@@ -186,6 +186,14 @@ stdin : &mut Stdin, console : &mut Console, columns : i32) -> Result<i32, Failur
     if stop.has_stderr {
       redirect_stderr(console, parser, files, &stop.stderr_file, columns);
     }
+    if stop.has_url_file {
+      if !read_url_file(parser, &stop.url_file, files, stdin) {
+        let mut m = lit("option ");
+        append(&mut m, &stop.config_option);
+        push_lit(&mut m, ": error encountered when reading a file");
+        return Result<i32, Failure>::Err(fail_with(READ_ERROR, m));
+      }
+    }
     if stop.has_config {
       match read_config(parser, &stop.config_file, files, stdin, console, columns,
         CONFIG_MAX_LEVELS - 1) {
@@ -247,6 +255,36 @@ fn error_line(console : &mut Console, parser : &ArgParser, text : &Vec<u8>, colu
 /// Read the config file `name` of `-K` (`-` for standard input) into `parser`, as curl's
 /// `parseconfig`. `levels` is how many more files deep it may go. On an error, it prints curl's
 /// line about it, and gives the reason for the option that read the file.
+/// Read the URLs of the file `name` of `--url @name`, or of standard input for `-`, one on each
+/// line, as curl's `my_get_line`: it skips empty lines and the lines whose first byte that is
+/// not a blank is `#`. False when the file cannot be read.
+fn read_url_file(parser : &mut ArgParser, name : &Vec<u8>, files : &Files, stdin : &mut Stdin)
+-> bool {
+  let text = match read_file(files, stdin, name) {
+    Result<Vec<u8>, Failure>::Ok(bytes) => { bytes },
+    Result<Vec<u8>, Failure>::Err(_f) => {
+      return false;
+    }
+  };
+  let mut start = 0;
+  while start < text.len() {
+    let mut end = find_byte(&text, 10u8, start);
+    if end < 0 {
+      end = text.len();
+    }
+    let line = trim_newline(&range_of(&text, start, end));
+    start = end + 1;
+    let mut i = 0;
+    while i < line.len() && is_blank(line.get(i)) {
+      i = i + 1;
+    }
+    if i < line.len() && line.get(i) != 35u8 {
+      parser.add_file_url(&line);
+    }
+  }
+  return true;
+}
+
 fn read_config(parser : &mut ArgParser, name : &Vec<u8>, files : &Files, stdin : &mut Stdin,
 console : &mut Console, columns : i32, levels : i32) -> Result<i32, ConfigError> {
   let mut shown = clone_bytes(name);
@@ -279,6 +317,12 @@ console : &mut Console, columns : i32, levels : i32) -> Result<i32, ConfigError>
       Result<Step, ConfigError>::Ok(step) => {
         if step.has_stderr {
           redirect_stderr(console, parser, files, &step.stderr_file, columns);
+        }
+        if step.has_url_file && !read_url_file(parser, &step.url_file, files, stdin) {
+          let reason = lit("error encountered when reading a file");
+          let e = config_error(&shown, line.lineno, &line.option, &reason, &reason, READ_ERROR);
+          error_line(console, parser, &e.text, columns);
+          return Result<i32, ConfigError>::Err(e);
         }
         if step.has_config {
           let mut nested = Result<i32, ConfigError>::Ok(0);
@@ -1089,7 +1133,7 @@ other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first :
       }
       up_round = up_round + 1;
       let mut url_glob = no_glob();
-      if !cfg.globoff {
+      if !cfg.globoff && !node.noglob {
         match parse_glob(&node.url) {
           Result<Glob, GlobError>::Ok(g) => {
             url_glob = g;

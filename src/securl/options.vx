@@ -54,6 +54,8 @@ struct UrlNode {
   // `-T FILE` came for this node. `-T ""` uploads nothing.
   has_upload : bool,
   upload : Vec<u8>,
+  // The URL came from the file of `--url @FILE`, and has no globs.
+  noglob : bool,
   // The number of the node on the command line, from 0, for `%{urlnum}`.
   num : i32,
 }
@@ -1411,6 +1413,7 @@ fn new_node(remote : bool) -> UrlNode {
     remote : remote,
     has_upload : false,
     upload : Vec<u8>::new(),
+    noglob : false,
     num : 0
   };
 }
@@ -1501,6 +1504,10 @@ struct Step {
   // `--stderr FILE`: the caller sends standard error to FILE from here on.
   has_stderr : bool,
   stderr_file : Vec<u8>,
+  // `--url @FILE`: the caller reads the URLs of FILE, or of standard input for `-`, and gives
+  // each to `add_file_url`.
+  has_url_file : bool,
+  url_file : Vec<u8>,
   // `-h` or `-V`: curl stops reading the command line and shows the help or the version.
   stop : bool,
 }
@@ -1550,6 +1557,9 @@ struct WordsStop {
   // A `--stderr` option: where standard error goes from the next word on.
   has_stderr : bool,
   stderr_file : Vec<u8>,
+  // A `--url @FILE` option: the file of URLs to read before the next word.
+  has_url_file : bool,
+  url_file : Vec<u8>,
   // The words ended, or `-h` or `-V` stopped the reading.
   finished : bool,
 }
@@ -1562,6 +1572,8 @@ fn no_step() -> Step {
     config_file : Vec<u8>::new(),
     has_stderr : false,
     stderr_file : Vec<u8>::new(),
+    has_url_file : false,
+    url_file : Vec<u8>::new(),
     stop : false
   };
 }
@@ -1630,6 +1642,12 @@ impl ArgParser {
     if id == OPT_STDERR {
       step.has_stderr = true;
       step.stderr_file = clone_bytes(value);
+      return done();
+    }
+    if id == OPT_URL && value.len() > 0 && value.get(0) == 64u8 {
+      // As curl: the URLs of a file, each as with `-O` and with no globbing.
+      step.has_url_file = true;
+      step.url_file = rest_from(value, 1);
       return done();
     }
     let _applied = apply(&mut self.current, id, value, enable, shown)?;
@@ -1740,6 +1758,15 @@ impl ArgParser {
     return Result<Step, Failure>::Ok(step);
   }
 
+  /// Add a URL of the file of `--url @FILE`: as with `-O`, and with no globbing.
+  pub fn add_file_url(self : &mut ArgParser, url : &Vec<u8>) -> void {
+    let at = url_slot(&mut self.current);
+    self.current.nodes[at].has_url = true;
+    self.current.nodes[at].url = clone_bytes(url);
+    self.current.nodes[at].remote = true;
+    self.current.nodes[at].noglob = true;
+  }
+
   /// Start a new group after `--next`. False when the current group has no URL yet.
   fn next_group(self : &mut ArgParser) -> bool {
     if !has_url(&self.current) {
@@ -1802,6 +1829,13 @@ impl ArgParser {
           let mut stop = words_stop(i, false);
           stop.has_stderr = true;
           stop.stderr_file = step.stderr_file;
+          return Result<WordsStop, Failure>::Ok(stop);
+        }
+        if step.has_url_file {
+          let mut stop = words_stop(i, false);
+          stop.has_url_file = true;
+          stop.url_file = step.url_file;
+          stop.config_option = clone_bytes(word);
           return Result<WordsStop, Failure>::Ok(stop);
         }
       } else {
@@ -1874,6 +1908,8 @@ fn words_stop(at : i32, finished : bool) -> WordsStop {
     config_option : Vec<u8>::new(),
     has_stderr : false,
     stderr_file : Vec<u8>::new(),
+    has_url_file : false,
+    url_file : Vec<u8>::new(),
     finished : finished
   };
 }
