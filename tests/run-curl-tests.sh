@@ -4,7 +4,7 @@
 #   tests/run-curl-tests.sh CURL_SRC [TEST ...]
 #
 # CURL_SRC is a checkout of https://github.com/curl/curl, built with cmake into CURL_SRC/build,
-# so that its test servers exist (README.md has the commands). Without TEST arguments,
+# so that its test servers exist (docs/testing.md has the commands). Without TEST arguments,
 # it runs every test with the keyword HTTP. curl's runtests.pl skips the tests that need a
 # protocol or a feature that `securl --version` does not list.
 #

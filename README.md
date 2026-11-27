@@ -1,635 +1,73 @@
 # securl
 
-The curl command-line tool, rewritten in [Vx](https://github.com/vx-lang/Vx). It speaks HTTP/1.1,
-HTTP/2 and HTTPS, and it implements the options that curl users use most. TLS comes from OpenSSL,
-which is a git submodule. HTTP/2 is written in Vx.
+The curl command-line tool, rewritten in [Vx](https://github.com/vx-lang/Vx), for HTTP/1.1,
+HTTP/2 and HTTPS. TLS comes from OpenSSL, a git submodule. Everything else is Vx.
 
-The goal is to show what Vx's type system buys a network tool:
+## Why Vx
 
-- **No trusted code outside one small package, checked by the compiler.** The package `securl`
-  holds the URL parser, the command-line parser, the request builder, the response parser,
-  chunked decoding, redirects and proxies. The package `cli` holds the tool around it, and
-  `disk` its files. They are compiled with `--no-trusted-code`, so any `unsafe`, `extern`,
-  `mlir!`, `extern impl` or `unsafe impl` in them is a compile error. All trusted code is in
-  `sys`. `src/main.vx`, the one file outside a package, only hands `Root` and the command
-  line to `cli`.
-- **Capabilities.** Only `main` gets the rights of the program (`fn main(root : Root, args :
-  Vec<String>)`), and it hands them to `cli::tool_main`. That gives the network right (`&Network`) to the transfer and
-  keeps the file right (`&Files`) for itself. It also loads the certificate authorities for TLS,
-  because that reads files, and lends the result to the transfer. With the environment right
-  (`&Environment`) it reads the proxy variables, such as `https_proxy`, and gives the transfer
-  their values, not the right. The rights to write to standard output and error go into a
-  `securl::output::Console`, which the transfer gets for the response body and for `-v`, and
-  only the code that reads `-d @-` or `-T -` gets the right to read standard input. The
-  parsers get no right, so a bug in a parser cannot open a file or a socket, or even write to
-  the terminal: the compiler checks that the protocol code has no other way to the disk, the
-  network or the terminal. The form parser of `-F` gives its warnings back as text, and the
-  tool prints them.
-
-## Get it
-
-```sh
-git clone --recurse-submodules --shallow-submodules https://github.com/vx-lang/securl
-# or, in a clone without the submodule:
-git submodule update --init --depth 1
-```
+- **No trusted code outside `src/sys`.** The protocol code, the tool and its file access compile
+  with `--no-trusted-code`. `make audit` lists the 135 trusted items left, 129 of them OpenSSL.
+- **Capabilities.** Only `main` holds the rights to the network, the files, the environment and
+  the terminal, and it hands each to the code that needs it. The parsers get none.
+- **Types for curl's common bugs.** A connection is reused only when its whole `ConnKey`
+  matches, and a password goes only where its `Credential` is bound.
 
 ## Build
 
-You need a `vxc` built from Vx main (the capability types are recent), its runtime library
-`libvx_std_core`, a C compiler and Perl (for OpenSSL). Put the paths in `config.mk`, which git
-ignores:
-
-```make
-VXC       = /path/to/Vx/target/release/vxc
-VX_LIBDIR = /path/to/Vx/target/release
-LLVM_BIN  = /usr/lib/llvm-22/bin
-# SYSTEM_OPENSSL = 1    # link the OpenSSL of the system, not the submodule
-```
-
 ```sh
-make            # builds OpenSSL once (build/openssl), then build/securl
-make audit      # lists the trusted code, and checks that no code outside src/sys makes a raw pointer
-make unit       # unit tests
-make test-tls   # HTTPS and time-limit tests against local servers (needs python3)
-make test-h2    # HTTP/2 tests against a local server (makes a virtualenv with h2 from PyPI)
+git clone --recurse-submodules --shallow-submodules https://github.com/vx-lang/securl
+cd securl && make
+build/securl https://example.com/
 ```
 
-## Status (2026-11-27)
+You need a vxc built from Vx main 98e8df6d5, a C compiler and Perl. Set `VXC`, `VX_LIBDIR` and
+`LLVM_BIN` in `config.mk`. Only Linux on x86-64 is tested.
 
-Measured with curl's own test suite: curl's `runtests.pl` and its test servers, pointed at
-`build/securl` with `-c`. The tests come from curl commit 2f5c657, and the compiler is vxc from
-Vx main 98e8df6d5.
+## Status
 
-| Test set | Passed |
+| Tests | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 599 of 762 (78%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 539 of 569 (94%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 290 of 290 |
-| HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
-| Unit tests (`tests/unit`) | 13 of 13 |
-| Fuzzing with libFuzzer (`tests/fuzz`): 9 parsers, 2 minutes each, about 50 million inputs | no crash, hang or memory error |
-
-The GitHub workflow `.github/workflows/build.yml` builds vxc from the Vx commit above in Vx's
-build image, builds securl, and runs the audit, the unit, TLS and HTTP/2 tests, and each fuzz
-target for 30 seconds. A second job builds curl's test servers from the curl commit above and
-runs the supported tests, and fails when a test fails that `tests/supported-known-failures.txt`
-does not list.
-
-`CURL=/path/to/curl tests/tls/run.sh` runs the checks of `tests/tls` against another curl, and
-`tests/h2/run.sh` takes `CURL` too. curl 8.23.1-DEV, built from the same curl commit, passes all
-TLS checks but one, which it skips: curl reads the extension of a chunk-size line with no limit
-and waits for `-m`, while securl stops after 100 KiB. In about one run in six, curl gets exit 55
-instead of 56 when the server asks for a client certificate that it does not have, because the
-server's alert can come before curl's request is sent. curl 8.18 with nghttp2 passes all HTTP/2
-checks, with the same exit codes. It skips four that look for securl's own messages, where
-curl gives the error texts of nghttp2.
-
-Some HTTP tests have the keyword `libtest` or `unittest`. For those, runtests.pl runs a C
-program of the curl build, linked with curl's own libcurl, so they never run securl.
-`tests/run-curl-tests.sh` and `tests/scan-supported-tests.py` leave them out. Until 2026-11-26
-the counts above included them by mistake: 152 of them passed, and the table said 522 of 874.
-Test 1070 depends on timing: the test server closes the connection while securl sends the
-body. It passes in some runs, between one in four and one in twelve, with and without recent
-changes. It failed in both runs of the table above. Test 1849 (two HTTPS transfers through a
-proxy) fails in about one run in three, and did so before the latest changes too: the log of the
-test server sometimes lacks the second request. It passed in that run too.
-
-The C build of the test suite has OpenSSL, so that runtests.pl runs the Digest tests (see "Run
-curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tests too.
-
-`vxc --audit` (`make audit`) lists the trusted code of the program:
-
-| Part | Lines | Trusted code |
-|---|---|---|
-| `src/securl/` (the package with all protocol code) | 18,064 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 1,725 | none, and `--no-trusted-code` enforces this |
-| `src/main.vx` (hands `Root` and the command line to `cli`) | 14 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
-| `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,355 | 48 `extern` functions, 87 `unsafe` blocks |
-
-Of the trusted code in `src/sys/`, 129 of the 135 items are the OpenSSL bindings: TLS (with the
-ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
-`hash.vx`.
-`lit` and `push_lit` of `sys` are safe to call, and read a string literal through its raw
-pointer up to the NUL, in an `unsafe` block, because a Vx string literal that a function gets
-has no length yet ([Vx#532](https://github.com/vx-lang/Vx/issues/532)). They are correct for a
-literal. They used `core::fmt::Write::write_c_str`, a safe method that read the same way, until
-Vx #4148 took it out of `core` because it let safe code read past the end of a `Vec`. So that a
-literal stays the only pointer that the other packages can have, `tools/check-no-pointers.sh`
-refuses `as_mut_ptr`, `as_ptr`, pointer casts and `core::ptr` outside `src/sys`. Each build,
-`make audit` and the GitHub workflow in `.github/workflows/checks.yml` run it.
-
-`core` and `std` have trusted code too: the audit counts 1,023 `unsafe` blocks and 104 `extern`
-functions in the modules that the program uses. That is the trusted base of the language, as
-Rust's `std` is for a Rust program. OpenSSL itself is C.
-
-### A fair comparison with the Rust rewrite
-
-The Rust rewrite [kov/curl](https://github.com/kov/curl) counts 3,711 uses of `unsafe`, of which
-2,871 are `unsafe` blocks. Its own write-up says that its core, tool and backend crates have none.
-Most of them are in its C ABI shim (a drop-in `libcurl.so`) and in the wrappers of OpenSSL and
-other C libraries. securl has no C ABI, and it uses only the part of OpenSSL that a TLS client
-needs. So the counts do not compare one to one. Also, Rust's `#![forbid(unsafe_code)]` does what
-`--no-trusted-code` does.
-
-What Rust does not have is the capability check. In Rust, any function can call
-`std::fs::File::open` or `std::net::TcpStream::connect`. In securl, the type system keeps the
-parsers away from the disk and the network.
-
-## HTTPS
-
-`src/sys/tls.vx` calls OpenSSL. It checks the certificate of the server and its host name or IP
-address, as curl does, with TLS 1.2 at least, SNI and ALPN `http/1.1`. It trusts the certificate
-authorities of the system: the first bundle that it finds in the usual places of Linux and
-macOS, and the paths that OpenSSL knows, including `SSL_CERT_FILE` and `SSL_CERT_DIR`.
-`--cacert` and `--capath` name others, and `-k` turns the check off. `--cert` (with a password
-after a `:` as in curl), `--key` and `--pass` give a client certificate in PEM or DER, with
-libcurl's messages and exit codes (58, or 43 for a key that does not load). A TLS 1.3 server
-that wants a certificate refuses after the handshake; securl reads its alert, as curl does,
-and gives exit 56 with "tlsv13 alert certificate required". An `https://` URL through
-an HTTP proxy uses a CONNECT tunnel, and so does an `http://` URL with `-p`. As in curl 8.23,
-`-i` and `-D` show the reply of the proxy before the response, `--suppress-connect-headers`
-leaves it out, `%{http_connect}` gives its status, and a proxy that refuses the tunnel gives
-exit 7. The exit codes are curl's: 60 for a certificate problem, 35 for a failed handshake, and
-77 for a file of certificate authorities that cannot be read.
-
-A proxy URL with `https://`, from `-x` or a proxy variable, names an HTTPS proxy, on port 443
-unless the URL gives one. securl speaks TLS to it, with ALPN for HTTP/1.1 only, and checks its
-certificate against the certificate authorities of `--proxy-cacert` and `--proxy-capath` (or
-`--capath`), or else those of the system, as curl does: `--cacert` is for the server only, and
-`--proxy-insecure` turns the check off. An `http://` URL goes to the proxy as a plain proxy
-request over that TLS connection, or through a tunnel with `-p`. An `https://` URL goes through
-a CONNECT tunnel, and TLS to the server runs inside the TLS to the proxy, HTTP/2 included.
-OpenSSL cannot put one connection on another directly, so `src/sys/tls.vx` gives the inner
-connection two memory BIOs and moves their records through the outer connection.
-
-`--hsts FILE` turns on HSTS, a port of libcurl's `hsts.c` in `src/securl/hsts.vx`. The tool
-reads the file before the transfers and writes it after them, in libcurl's format. A
-`Strict-Transport-Security` header of an HTTPS response adds its host, with `max-age` capped at
-two years and `includeSubDomains`, and `max-age=0` removes it. An IP address never gets an
-entry, and a header over plain HTTP changes nothing. Before each request, redirects included,
-an `http://` URL for a host in the cache, or a subdomain of one that covers its subdomains,
-becomes `https://`. The port stays when the URL gives one, as in curl, and `-v` says
-`Switched from HTTP to HTTPS due to HSTS`. As in libcurl, a line of 4095 bytes or more stops
-the reading of the file and fails the first transfer with exit 100.
-
-## Time limits
-
-`-m` limits the whole transfer, redirects included. `--connect-timeout` limits the connect, the
-CONNECT of a proxy and the TLS handshake, and is 300 seconds by default, as in libcurl. Both
-give exit code 28 with curl's messages: `Connection timed out after N milliseconds`, or
-`Operation timed out after N milliseconds with B out of T bytes received`. The lookup of a host
-name has no time limit yet.
-
-The package `securl` turns each limit into a deadline (`std::time::Instant`) for the connection.
-Each socket call runs in `std::sync::wait::within` until that deadline, so the runtime of Vx
-ends the wait: the connect in `src/securl/conn.vx`, and the reads and writes of a plain
-connection in `src/sys/tls.vx`, which holds the TCP stream of a TLS connection too. The TLS code
-polls in slices of 20 ms and checks the clock between them.
-
-## HTTP/2
-
-securl speaks HTTP/2 (RFC 9113) over TLS when the server takes it with ALPN, as curl does by
-default, and over plain TCP with `--http2-prior-knowledge`. `--http1.1` turns it off. All of it
-is in `src/securl/`, with no trusted code; only the ALPN choice comes from OpenSSL:
-
-- `hpack.vx`: HPACK (RFC 7541) with the Huffman code and the dynamic table. Its tables come
-  from the text of the RFC (`tools/gen-hpack-tables.py`), and a unit test decodes all the
-  examples of its Appendix C.
-- `h2.vx`: the frames, SETTINGS, PING, GOAWAY, RST_STREAM, CONTINUATION, padding, trailers, and
-  flow control in both directions: a window of 1 MiB for the server, and the body of a request
-  within the windows of the server. The request is the HTTP/1.1 request of `http.vx` turned
-  into HTTP/2 fields, so authentication, cookies and `-H` work the same on both versions. The
-  response head looks like curl's: `HTTP/2 200 ` and the header names in lower case.
-
-curl's own HTTP/2 tests run through `nghttpx` (see "Run curl's test suite"). `tests/h2` tests
-more of the protocol against a server built on the `h2` package of python-hyper, an independent
-implementation. securl also fetches real sites over HTTP/2, such as Cloudflare's 1.3 MB home
-page.
-
-## Connection reuse
-
-A connection stays open after a response that ended where its head said, unless the server
-closes it (`Connection: close`, or HTTP/1.0 without `Connection: keep-alive`). A later request
-for the same place uses it, as in curl: the next request of an authentication or a redirect,
-the next URL, and the transfers of later `--next` groups. At most 5 wait, as in libcurl. Before
-securl uses one, it checks that the server has not closed it in the meantime, and when a request
-on a reused connection gets no response at all, securl sends it again on a new connection, as
-curl does. With `-v`, the messages are curl's.
-
-`src/securl/pool.vx` decides which connection a request may use. Each setting that matters is
-a field of one type, `ConnKey`: the scheme, the host and the port, the place of `--connect-to`,
-`--unix-socket`, the proxy with its kind and its credentials, the CONNECT tunnel,
-`--http2-prior-knowledge`, and the TLS settings for the server and for an HTTPS proxy (the
-check of the certificate, the certificate authorities, and the client certificate). A
-request uses a connection only when its whole key is the same as the key of the connection. A
-request that an HTTP proxy forwards has no host in its key, so it uses the connection to the
-proxy for any server, as in curl (test 1421). Left out, as in libcurl, are `-u`, whose Basic and
-Digest credentials go with each request, and `--resolve`, which only says where a new
-connection goes. `ConnKey` has an invariant, so only `pool.vx` can make one. A new setting
-then goes into `conn_key` or stays out of it in one place that a reviewer sees, where libcurl
-compares its settings in many functions. libcurl published 16 advisories in 2026 about a
-connection that was reused although such a setting differed.
-
-HTTP/2 connections do not stay open yet.
-
-## Compression
-
-`--compressed` asks for `deflate, gzip, br, zstd` and decodes them as the body arrives.
-`src/securl/inflate.vx` is a DEFLATE decoder in Vx with the gzip and zlib wrappers,
-`src/securl/brotli.vx` a brotli decoder (RFC 7932) and `src/securl/zstd.vx` a zstd decoder
-(RFC 8878), so this needs no zlib, no libbrotli, no libzstd and no trusted code. It follows libcurl and zlib: the CRC-32 and Adler-32 checks,
-zlib's error texts after "Error while processing content unencoding: ", raw DEFLATE for a
-`deflate` body that has no zlib header, a chain of up to five encodings, and exit 61 for a body
-that ends inside the compressed data. `-w %{size_delivered}` gives the decoded size.
-`--tr-encoding` sends `TE: gzip` and `Connection: TE`, and decodes the transfer codings of the
-response before its content codings, with libcurl's rules: at most five, and chunked last.
-`tests/unit/inflate.vx` feeds data from Python's zlib in one piece and one byte at a time, so
-that each block header and symbol is cut once. A curl 8.23.1-DEV built with zlib passes the
-compression checks of `tests/tls` too.
-
-The zstd decoder follows libzstd as libcurl uses it: frames one after another, with skippable
-frames between them, the XXH64 checksum, a window of at most 128 MiB, and failure for a frame
-that names a dictionary. It decodes a block (at most 128 KiB) once all of it has arrived. Like
-libcurl, it gives exit 61 with "Unrecognized or bad HTTP Content or Transfer-Encoding" for bad
-data, and "Zstd stream ended before completion" for a body that ends inside a frame.
-`tests/unit/zstd_decode.vx` (made by `tools/gen-zstd-test.py`) holds frames that libzstd made,
-with fast and slow levels, no checksum, no content size, random bytes and several frames, and
-frames that must fail; it feeds each whole, a byte at a time, and in pieces of 7 bytes. With
-Python 3.14, which has `compression.zstd`, `tests/tls` checks zstd bodies too. 5,600 frames of
-those cases with random changes gave the same result with securl as with libzstd, and none
-stopped securl.
-
-The brotli decoder reads in small units: a step of a meta-block header, one prefix code, the
-start of a command, one literal, one distance. A unit reads all of its bits or goes back to its
-start and waits for more of the body, and it writes output only after its bits are read. The
-static dictionary and its 121 transforms are in `src/securl/brotli_tables.vx`, which
-`tools/gen-brotli-tables.py` makes from the brotli library and checks against the SHA-256 of
-the dictionary of RFC 7932. The exit codes follow how libcurl maps libbrotli's errors: 61 with
-"Unrecognized or bad HTTP Content or Transfer-Encoding" for most bad data, 23 with "Failed
-writing received data to disk/application" for a reserved bit, a distance out of range and
-bytes after the end of the stream, and 61 with "Brotli stream ended before completion" for a
-body that ends inside the stream. `tests/unit/brotli_decode.vx` (made by
-`tools/gen-brotli-test.py`) holds streams that libbrotli made at qualities 0 to 11, with a 1 KiB
-window, English that uses the dictionary and its upper-case transforms, and streams that must
-fail; it feeds each whole, a byte at a time, and in pieces of 7 bytes. Of 157 streams from
-libbrotli, 86 use the dictionary, and all decode to the same bytes in pieces of 1, 9 and 16384
-bytes. 6,500 streams of those cases with random changes gave the same exit code as libcurl
-with libbrotli, the same output, and no crash. With libbrotlienc, `tests/tls` checks brotli
-bodies too.
-
-curl 8.18 does not check that a brotli or zstd stream ended, and exits with 0 for a cut one.
-curl 8.23 does, with tests 4271 and 4272, and securl does as 8.23.
-
-As in libcurl, `%{size_download}` counts a piece of the body only once the decoders and the
-output took it, so a piece that does not decode does not count. Test 4272 checks a cut gzip
-body and a cut zstd body, in two groups of `--next`.
-
-## Authentication
-
-`-u` sends Basic credentials, as curl does by default. With `--digest`, the first request goes
-without credentials, and a POST or a PUT goes with an empty body, as a probe. The 401 brings
-the challenge, and the request goes again with the Digest response: MD5, SHA-256 and
-SHA-512/256, their `-sess` variants, `qop=auth` and `auth-int`, `userhash`, and the nonce
-count. `--anyauth` takes Digest when the server offers it, and else Basic. `--proxy-digest`
-and `--proxy-anyauth` do the same with an HTTP proxy and its 407.
-
-`src/securl/auth.vx` holds all of it, as libcurl's `http.c` and `vauth/digest.c` do it, with no
-trusted code. Only the hash functions and the random client nonce come from OpenSSL, through
-`src/sys/hash.vx`. The unit tests check the examples of RFC 2617 and RFC 7616.
-
-### Where credentials may go
-
-Of the advisories that curl published in 2026, 15 are credentials or cookies that went to the
-wrong host or proxy. In libcurl, each path that sends them must ask `Curl_auth_allowed_to_host`,
-or compare the proxy, and an advisory follows when one path forgets.
-
-In securl, a user name and a password are a `Credential`, which is bound when it is made to the
-place that it may go to, as in curl 8.23. Those of `-u` are bound to the origin of the first
-URL of the transfer, its scheme, host and port, or with `--location-trusted` to any server.
-Those that a URL holds, as in `http://user:password@host/`, are bound to the origin of that
-URL, and go only with the request for it: not after a redirect to another URL, even with
-`--location-trusted`. Those of a proxy (`--proxy-user`, or the proxy URL) are bound to that
-proxy. The type has an invariant, so only `auth.vx` can make one
-or change its place. The functions of `auth.vx` that write a password, into Basic, Digest, the
-CONNECT request or the SOCKS login, first check the place of the request. They give an
-`AuthHeader`, which also has an invariant and names the origin that it was made for.
-`build_request`, the one function that writes the headers of a request, writes it only for
-the URL of its request line. It also decides there, from the same scope, whether the cookies
-of `-b` and the `Authorization` and `Cookie` headers of `-H` go.
-
-Vx has no private fields yet, so another file could still read the password of a
-`Credential`. `tools/check-secrets.sh` refuses the build when a file other than `auth.vx`, or
-`url.vx` and `options.vx`, which parse it, reads a field whose name ends with `password`. When
-Vx fields get levels, the field becomes private and the compiler checks this.
-
-## Cookies
-
-`-b` with a file name, or `-c`, turns on the cookie engine, a port of libcurl's `cookie.c` in
-`src/securl/cookie.vx`. It reads Netscape cookie files and `Set-Cookie:` lines, takes the
-`Set-Cookie` headers of each response, redirects included, and sends the cookies that match the
-host, the path and the security of each request, in libcurl's order. It follows libcurl's rules
-for `domain`, `path`, `secure`, `httponly`, `max-age` and `expires` (with a port of libcurl's
-date parser in `src/securl/date.vx`), the `__Secure-` and `__Host-` prefixes, and the limits.
-`-c` writes the jar in the Netscape format at the end. Without libpsl, as in a libcurl without
-it, a cookie for a domain with no dot is refused.
-
-## Run curl's test suite
-
-runtests.pl asks curl's own `curlinfo` program which hash functions the C build has, and skips
-the Digest tests when it has none. So the C build needs a crypto library. `make openssl-dev`
-installs the OpenSSL of the submodule for it:
-
-```sh
-make openssl-dev       # prints the -DOPENSSL_ROOT_DIR for cmake
-git clone --depth 1 https://github.com/curl/curl ~/curl-src
-cd ~/curl-src
-cmake -B build -DCURL_ENABLE_SSL=ON -DCURL_USE_OPENSSL=ON -DOPENSSL_USE_STATIC_LIBS=ON \
-  -DOPENSSL_ROOT_DIR=$HOME/securl/build/openssl-dev/usr/local \
-  -DCURL_USE_LIBPSL=OFF -DUSE_LIBIDN2=OFF -DCURL_ZLIB=OFF -DCURL_BROTLI=OFF -DCURL_ZSTD=OFF \
-  -DUSE_NGHTTP2=OFF -DCURL_USE_LIBSSH2=OFF -DCURL_DISABLE_LDAP=ON -DBUILD_TESTING=ON
-cmake --build build -j8 && cmake --build build --target testdeps -j8
-cd ~/securl
-tools/build-test-tools.sh                  # optional: nghttpx and stunnel, see below
-make test CURL_SRC=~/curl-src              # every HTTP test
-make test-supported CURL_SRC=~/curl-src    # the tests in tests/supported-tests.txt
-```
-
-runtests.pl runs its HTTP/2 tests through `nghttpx` and its HTTPS tests through `stunnel`.
-pip cannot install either, so `tools/build-test-tools.sh` builds them from source (with
-`libev` and `c-ares` for `nghttpx`) into the virtualenv `build/h2-venv`, against the OpenSSL of
-the submodule. It checks each download against a SHA-256, and puts nothing into the system.
-`tests/run-curl-tests.sh` finds them there.
-
-`securl --version` says `Protocols: http https`, so runtests.pl skips the tests of other
-protocols and of features such as compression.
-`tests/scan-supported-tests.py` lists the tests that use only options securl has, and the
-missing options that block the most tests.
-
-## Fuzzing
-
-`make fuzz` runs libFuzzer on the parsers that read bytes from the network or the command
-line: URLs and redirects, the lines of a response head, HPACK, cookies, dates, the globs of the
-tool, the gzip, deflate, brotli and zstd decoders, the challenges of Basic and Digest, and HSTS.
-Each target in `tests/fuzz` is a small Vx file that exports `vx_fuzz_one`, which libFuzzer
-calls with each input, and has its seeds in `tests/fuzz/corpus`. `FUZZ_TIME=600 make fuzz`
-runs each for 10 minutes.
-
-vxc has no fuzzer option, so `tools/build-fuzzers.sh` builds each target through LLVM: vxc
-writes the LLVM dialect of MLIR (`--action emit-llvm`), `mlir-translate` makes LLVM IR, and
-clang adds the coverage of libFuzzer (`-fsanitize=fuzzer`). In securl, a bug such as an index
-past the end of a `Vec` is a panic, which stops the program, so libFuzzer sees it as a crash
-and keeps the input in `build/fuzz`. A check with a target that reads past the end of a `Vec`
-showed that it does.
-
-## Options
-
-`-A` `-b` (a cookie string or a cookie file) `-c` `-j` `-d` `--data-ascii` `--data-raw`
-`--data-binary` `--data-urlencode`
-`--json` `-F` (with `@file`, `<file`, `type=`, `filename=` and `headers=`) `--form-string`
-`--form-escape` `-D` `-e` (with `;auto`) `-f` `--fail-with-body` `-G` `-H` (with the `name:` and
-`name;` forms) `-I` `-i` `-k` `--cacert` `--capath` `-E` (`--cert`) `--cert-type` `--key` `--key-type` `--pass` `-L` `--location-trusted` `--max-redirs`
-`-o` `-O` `--remote-name-all` `--output-dir` `-g` (`--globoff`) `-r` `-s` `-S` `-T` `-u` `--digest` `--basic`
-`--anyauth` `-v` `-w` (most variables, the `%{time_*}` timers, `%header{}`, `%{header_json}`, `%output{}`, `%{stderr}`)
-`-X` `-x` `-U` `-p` `--proxytunnel` `--suppress-connect-headers` `--proxy-insecure`
-`--proxy-cacert` `--proxy-capath` `--socks4` `--socks4a` `--socks5` `--socks5-hostname` `--hsts`
-`--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
-`--unix-socket` `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` (with `@FILE`) `-m`
-`--connect-timeout` `--compressed` `--tr-encoding` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay`
-`--limit-rate` `--max-filesize` `--remove-on-error` `--next` (`-:`) `-K` (`--config`) `--stderr`
-`--retry` `--retry-delay` `--retry-max-time` `--retry-connrefused` `--retry-all-errors` `-C`
-(`--continue-at`) `-J` (`--remote-header-name`) `-M` (`--manual`, which says that the manual
-is not built in) `-h`
-`-V`, and the options that runtests.pl adds: `-q` `--trace-ascii` `--trace-time`. As in curl,
-a long option may take its value in the same word, as `--max-time=2`, and `--` ends the
-options.
-
-A URL, and the file of `-T`, can hold globs, as in curl: sets such as `{one,two}` and ranges
-such as `[1-10]`, `[001-100:5]` and `[a-z]`, which make one transfer for each combination, the
-last glob changing fastest, and for each upload file each URL. `-o` takes the value of a glob
-with `#1` for the first one, or `#<name>` for one written `{<name>a,b}`, and `-g` turns
-globbing off. `src/securl/glob.vx` is a port of curl's `src/tool_urlglob.c`, with its error
-messages and their columns. As in curl, each URL goes with the `-o` or `-O`, and with the `-T`,
-of the same position on the command line, so `-T a URL1 -T b URL2` uploads `a` to `URL1` and `b`
-to `URL2`. `--url @FILE` reads URLs from FILE, or from standard input with `@-`, one on each
-line, each as with `-O` and with no globbing, as curl does. The parser stops there, as at `-K`,
-and the tool reads the file.
-
-`--next` starts a new group of options and URLs. As in curl, `-v`, `-s`, `-S` and the trace
-options hold for every group wherever they come, the groups share the cookies and the HSTS
-cache, and the exit code is the one of the last transfer (an error of the command line, exit
-2, stops the rest). `-K FILE` (or `-` for standard input) reads options from a config file
-with curl's syntax: one option on a line, with or without dashes, `=` or `:` or blanks before
-the value, double quotes with backslash escapes, `#` comments, `next` lines, and up to five
-files deep. The tool reads the file with its file right and hands each line to the parser of
-the command line, which cannot open a file. Errors and warnings name the file and the line as
-curl does, and wrap at the width of the terminal.
-
-`--stderr FILE` sends what would go to standard error to FILE, and `--stderr -` to standard
-output: the errors, the warnings, `-v` and `-w %{stderr}`. As in curl, it holds from where it
-comes, so a warning about an earlier option still goes to standard error, and a file that does
-not open leaves it there, with curl's "Warning: Warning: Failed to open FILE". The parser stops
-at it, as at `-K`, and the tool opens the file with its file right.
-
-`--retry N` tries a transfer again, as curl does, after a time-out, a host with no address, an
-HTTP response 408, 429, 500, 502, 503, 504, 522 or 524 (also with `-f`), a refused connection
-with `--retry-connrefused`, and any error with `--retry-all-errors`. It waits 1 second, then
-twice as long each time up to 10 minutes, or `--retry-delay`, or the Retry-After of the
-response, and gives up when `--retry-max-time` would pass. Each try prints its error and curl's
-warning, such as "Problem : HTTP error. Retrying in 1 second. 3 retries left.", `-w` and
-`--remove-on-error` act on the last try, and `%{num_retries}` counts the tries. An output file
-starts again empty when the try wrote body bytes to it, and else keeps what the try wrote, as
-in curl.
-
-`-C N` goes on with a download from byte N, and `-C -` from the size of the output file, which
-then grows from its end. As in libcurl, the request asks for `Range: bytes=N-`; a response
-whose Content-Range starts elsewhere, or a 200 that ignores the range, fails with exit 33
-("HTTP server does not seem to support byte ranges. Cannot resume."), unless its length is N,
-which means that the file is whole; a 416 is fine too, as the file is whole, unless its
-`*/size` says another size. A POST or an upload with `-C` fails with exit 43 ("HTTP upload
-cannot be resumed"), as in curl 8.23, and `-C` does not go with `-r` or `--remove-on-error`.
-
-As libcurl does, each connection sets TCP_NODELAY and TCP keepalive: the first probe after 60
-seconds with no traffic, then one each 60 seconds, and 9 probes with no answer drop the
-connection. `--keepalive-time` sets both times, `--keepalive-cnt` the probes, and
-`--no-keepalive` and `--no-tcp-nodelay` turn them off. `src/sys/socket.vx` calls `setsockopt`,
-because `std::net::TcpStream` has no socket options.
-
-Without `-x`, the proxy comes from the environment, as in libcurl: `https_proxy` or
-`HTTPS_PROXY` for HTTPS, `http_proxy` for HTTP, and then `all_proxy` or `ALL_PROXY`. As libcurl
-does, securl does not read `HTTP_PROXY` in upper case, which a CGI program gets from the
-`Proxy:` header of any request. `--noproxy`, or else `no_proxy` or `NO_PROXY`, lists the hosts
-that go direct, and `-x ""` turns the variables off. `-v` says which variable it used.
-
-A proxy URL with the scheme `socks4`, `socks4a`, `socks5` or `socks5h`, or the options
-`--socks4`, `--socks4a`, `--socks5` and `--socks5-hostname`, name a SOCKS proxy.
-`src/securl/socks.vx` speaks the protocols as libcurl does, with its messages and exit code 97,
-and the user name and password of RFC 1929 for SOCKS5. SOCKS4a and SOCKS5h send the host name to
-the proxy. SOCKS4 and SOCKS5 send its address, so securl looks the name up: with `--resolve`, or
-as libcurl does for `localhost` (::1 first, then 127.0.0.1), or else with `std::net::lookup`,
-which takes the network right. A name with no address gives exit 6 and "Could not resolve
-host", as curl 8.23 does.
-
-`--connect-to` sends the connection to another host and port, and the request still names the
-host of the URL. Through an HTTP proxy, curl then always makes a CONNECT tunnel to that place,
-and so does securl. `--connect-to` never changes where the proxy itself is. A connect that fails
-gives curl 8.23's message, such as `Failed to connect to example.com:443 via 10.0.0.2:8443 after
-3 ms` or `Failed to connect to example.com:443 over proxy 10.0.0.1 after 0 ms`, and a proxy name
-with no address gives exit 5 and "Could not resolve proxy". A proxy that is not a URL, such as
-`/server` or `host:99999`, gives exit 5 too, with curl's "Unsupported proxy syntax in '/server':
-No host present".
-
-`--unix-socket` sends the request to a Unix-domain socket, through `std::net::UnixStream`, which
-takes the network right. The request still names the host of the URL, and HTTPS checks the
-certificate against that name. As in curl, a proxy, `--connect-to` and `--resolve` do not apply,
-and a path longer than 107 bytes gives exit 6. A SOCKS proxy on the host `localhost` with a path,
-such as `socks5h://localhost/run/tor.sock`, is the Unix-domain socket at that path, as in curl.
-In `sys/tls.vx`, the socket of a connection is an enum of a `TcpStream` and a `UnixStream`, so
-plain HTTP, TLS and the time limits work the same way on both.
-
-`--limit-rate` takes curl's sizes, such as `500`, `2k` or `1.5M`, and holds each direction of
-the transfer to that many bytes per second after the connect, as curl does: a read waits until
-the rate allows the bytes so far, and a slow rate reads less at a time. `-m` still ends it.
-
-`--max-filesize` takes the same sizes and checks the body three times, as libcurl does: a
-Content-Length that is too large (or too large for 63 bits) fails before the body; the body is
-written up to the limit and then fails with "Exceeded the maximum allowed file size"; and the
-decoded body of `--compressed` goes in pieces of 16 KiB, each checked before it is written, so
-a small compressed body that decodes to a large one ("a compression bomb") fails with "Would
-have exceeded max file size". The body of a redirect that curl follows does not count.
-
-curl opens an `-o` or `-O` file only when the first bytes arrive, and with `-J` only once the
-response names it. The transfer code of securl cannot open files, so the tool gives it a
-closure that opens the one output file and nothing else, `|&Vec<u8>, bool| -> Result<File,
-Failure>`: the transfer calls it at the response that the output is for, with the name of its
-Content-Disposition (or of the Location of a redirect) for `-J`, and holds what comes before,
-such as the head of `-i`, until then. A transfer that fails before leaves an existing file
-alone, as curl does. With `-J -O`, the file is the Content-Disposition name in the output
-folder, and one that exists already stays as it is: the transfer fails with curl's "Failed to
-open the file NAME: File exists" and exit 23. `%{filename_effective}` gives the file. As in
-curl 8.23, `-O` of a URL whose path ends with `/` takes the last part before it, and one with
-no name takes `curl_response`, with curl's warning.
-`--remove-on-error` removes the file of a failed transfer, only when it is a regular file, with
-curl's note and warnings, with `std::fs::file_kind` and `std::fs::remove_file`.
-
-The 2025 curl user survey asked for each user's favourite option. securl accepts 19 of the top
-20 answers. It does not have `--libcurl`, and `-vv` and `-vvv` work as `-v`.
+| curl's HTTP tests, from curl 2f5c657 (`make test`) | 599 of 762 |
+| The ones that use only options securl has (`make test-supported`) | 539 of 569 |
+| TLS, proxy and limit tests (`make test-tls`) | 290 of 290 |
+| HTTP/2 tests (`make test-h2`) | 32 of 32 |
+| Unit tests (`make unit`) | 13 of 13 |
+| libFuzzer on 9 parsers (`make fuzz`) | no crash in 50 million inputs |
+
+[docs/testing.md](docs/testing.md) says how to run curl's test suite.
+
+## Features
+
+- **HTTPS:** OpenSSL 3.5, certificate checks, client certificates, and HTTPS proxies.
+- **HTTP/2:** over TLS with ALPN, or with `--http2-prior-knowledge`. HPACK is in Vx.
+- **Connection reuse:** as libcurl, with up to 5 idle connections.
+- **Compression:** gzip, deflate, brotli and zstd, all decoded in Vx.
+- **Authentication:** Basic and Digest, for servers and proxies.
+- **Cookies and HSTS:** libcurl's cookie engine, `-b`, `-c` and `--hsts`.
+- **Globbing:** `{a,b}` and `[1-9]` in URLs, and `#1` in `-o`.
+
+[docs/options.md](docs/options.md) lists every option.
 
 ## Not done yet
 
-In order of how much users need them:
-
-`-w %{time_namelookup}` is the time before the connect starts: the name lookup happens inside
-the connect of Vx's `std::net`, so `%{time_connect}` holds it. The other timers are libcurl's,
-and add up over the requests of a redirect as in libcurl.
-
-1. Reuse of HTTP/2 connections (and with it, multiplexing), the `Upgrade: h2c` of `--http2`
-   on plain HTTP, and HTTP/2 through an HTTP proxy.
-1. `--variable`, `--no-clobber`, `-R`, resume of a
-   retry (`--retry` with `-C -`),
-   `--netrc`, a default `.curlrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
-   encoders, `--preproxy`, `--abstract-unix-socket`, the progress meter and `-#` (securl
-   accepts them and shows no progress), SOCKS5 with GSS-API, `--proxy-http2` and client certificates for an
-   HTTPS proxy, Digest with the proxy of a
-   CONNECT tunnel, and client certificates in PKCS#12 files or from engines and providers.
-1. HTTP/3.
-
-## Vx issues found while writing securl
-
-The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #4026), #3999
-(with #4028) and #4092 (with #4094), and securl no longer works around them.
-
-- [#3998](https://github.com/vx-lang/Vx/issues/3998) Compile time grew about 2x with each link
-  of an `else if` chain. `options.vx` uses flat `if .. { return }` blocks. Vx #4024 fixed it,
-  and the flat blocks stay because they read as well.
-- [#4005](https://github.com/vx-lang/Vx/issues/4005) No safe way to make a `String` from bytes,
-  to write a `Vec<u8>` to standard output, to copy the bytes of a string literal, or to read an
-  environment variable. Vx main has since added `String::to_bytes` (#4122), the command line
-  as a parameter of `main` (#4123), and rights to standard input and output (#4130). securl
-  uses all three, so it reads its command line, the environment and standard input, and
-  writes to the terminal, with no trusted code. `src/sys/text.vx` still copies string
-  literals.
-- [#4001](https://github.com/vx-lang/Vx/issues/4001) The flat code generator declines `?` on a
-  `Result` of a struct with an `Option` field, so securl compiles through the older AST path.
-- [#4002](https://github.com/vx-lang/Vx/issues/4002), [#4003](https://github.com/vx-lang/Vx/issues/4003),
-  [#4004](https://github.com/vx-lang/Vx/issues/4004): a reference cannot be pointed at another
-  field, `assert(false, ..)` fails at compile time on a path that never runs, and there is no
-  `ref mut` pattern or `Option::as_mut`.
-- [#4118](https://github.com/vx-lang/Vx/issues/4118) A move of a field out of `&mut self` got
-  no E4008 in the full securl build, and the program freed the field twice, in a package with
-  `--no-trusted-code`. A small program with the same function gets E4008. `output.vx` now
-  borrows the field instead. Vx #4121 fixed it: the checker skipped the body of a function
-  that a `?` checked first. With it, the old securl tree gets E4008, and the current one
-  builds with no new error.
-- [#4119](https://github.com/vx-lang/Vx/issues/4119) `main` cannot get a command-line word that
-  is not UTF-8, so securl cannot either.
-- [#4120](https://github.com/vx-lang/Vx/issues/4120) `std::net` had no name lookup, so
-  `src/sys/socket.vx` called `getaddrinfo` for SOCKS4 and SOCKS5. Vx #4154 added
-  `std::net::lookup`, and securl uses it.
-- [#4131](https://github.com/vx-lang/Vx/issues/4131) `std::net` had no Unix-domain socket, so
-  securl had no `--unix-socket`. Vx #4155 added `UnixStream`, and securl uses it. Its path is a
-  C string, so it cannot name an abstract socket, whose name starts with a NUL byte, and
-  securl has no `--abstract-unix-socket`.
-- [#4132](https://github.com/vx-lang/Vx/issues/4132) `std::fs` could not remove a file, tell its
-  kind, or give the right to open one file later, so `src/sys/files.vx` called `unlink` and
-  `statx`. Vx #4156 added `remove_file`, `file_kind` and `PendingFile`, and securl uses the first
-  two. `-J` picks its file name from the response, so the tool gives the transfer a closure that
-  opens it rather than a `PendingFile` of one path.
-- [#4142](https://github.com/vx-lang/Vx/issues/4142) A `return` from inside an `if` that moves a
-  field out of a local, such as `return step.file;`, freed that field twice. The new parser of
-  `-K` hit it and copied the field instead, until Vx #4149 fixed it.
-- [#4172](https://github.com/vx-lang/Vx/issues/4172) The AST code generator panicked with
-  "Undefined variable" on a `match` of `f()?` whose arm binds a name, and `fetch.vx` gave the
-  value a name first, in two places. Vx #4173 fixed it, and securl no longer works around it.
-- [#4181](https://github.com/vx-lang/Vx/issues/4181) `TcpStream` gave no file descriptor, so
-  `src/sys/tls.vx` and `src/sys/socket.vx` read it with `vx_tcp_stream_fd` in three `unsafe`
-  blocks, for OpenSSL, `poll` and the socket options. Vx #4183 added `TcpStream::fd`, and
-  securl uses it.
-
-## License
-
-securl uses curl's license (SPDX `curl`), an MIT-style license, as curl does. See `LICENSE`.
-It keeps curl's copyright notice, because securl takes its help text, its messages and its
-behavior from curl.
-
-A securl binary also holds code under other licenses:
-
-- OpenSSL, under the Apache License 2.0 (`third_party/openssl/LICENSE.txt`). By default the
-  Makefile links it statically, so a copy of the binary must come with that license.
-- The Vx runtime `libvx_std_core`, under the Apache License 2.0 with LLVM Exceptions.
-- The static dictionary and the transforms of brotli in `src/securl/brotli_tables.vx`, from
-  Google's brotli, under the MIT license. They are also in RFC 7932.
+- HTTP/2 connection reuse, `Upgrade: h2c`, HTTP/2 through a proxy, and HTTP/3.
+- `--netrc`, `--variable`, `-4` and `-6`, the progress meter, and PKCS#12 certificates.
+- `%{time_namelookup}` holds no DNS time: Vx's `std::net` resolves inside its connect.
 
 ## Layout
 
 ```
-src/main.vx          gets `Root`, and hands it to cli::tool_main
-src/cli/tool.vx      the tool: the command line, the transfers, opening files, the TLS settings
-src/disk/files.vx    reads and creates files; each function takes `&Files`
-src/sys/             trusted code: OpenSSL (tls.vx), arguments, standard output, literals
-src/securl/          the protocol code; no trusted code
-  options.vx           the command line
-  glob.vx              the URL globs of the tool: {a,b}, [1-9], and #1 in -o
-  url.vx               URLs and redirects
-  auth.vx              credentials and where they may go; Basic and Digest
-  hsts.vx              the HSTS cache of --hsts
-  cookie.vx date.vx    the cookie engine, and libcurl's date parser
-  http.vx              the request bytes, in libcurl's header order; the response head
-  fetch.vx             one transfer: connect, TLS, send, read, redirects, proxies
-  conn.vx              a connection with a read buffer; needs `&Network`
-  pool.vx              the connections that stay open, and the key that decides reuse
-  body.vx encode.vx    request bodies, Base64, URL encoding
-  output.vx            standard output or a file that main opened
-  decoder.vx           the decoders of --compressed: inflate.vx, brotli.vx, zstd.vx
-  writeout.vx          -w
-third_party/openssl  OpenSSL 3.5.9 (LTS), a shallow git submodule
-LICENSE              curl's license, with the copyright of securl and of curl
-CHANGELOG.md         what each release brings
-tests/unit/          unit tests of the parsers
-tests/tls/           HTTPS tests against local servers, with test certificates
-tests/run-curl-tests.sh   runs curl's runtests.pl against build/securl
-tests/fuzz/          libFuzzer targets of the parsers, with their seeds
-tools/check-no-pointers.sh  refuses code that makes a raw pointer outside src/sys
-tools/check-secrets.sh      refuses code that reads a password outside auth.vx
-tools/build-fuzzers.sh      builds the targets of tests/fuzz; tools/run-fuzzers.sh runs them
+src/securl/   the protocol code, with no trusted code
+src/cli/      the tool, and src/disk/ its files
+src/sys/      the trusted code: OpenSSL, socket options, string literals
+tests/        unit, TLS, HTTP/2 and fuzz tests, and the curl test runner
+tools/        build checks and fuzz scripts
 ```
+
+[docs/vx-issues.md](docs/vx-issues.md) lists the Vx issues found on the way, and
+[CHANGELOG.md](CHANGELOG.md) the releases.
+
+## License
+
+curl's license (SPDX `curl`), in `LICENSE`. A binary also holds OpenSSL (Apache 2.0), the Vx
+runtime (Apache 2.0 with LLVM Exceptions), and brotli's dictionary (MIT).

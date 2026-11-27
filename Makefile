@@ -3,7 +3,7 @@
 #   make            build build/securl
 #   make audit      list each use of trusted code (unsafe, extern) in the program
 #   make unit       run the unit tests in tests/unit
-#   make test       run curl's own test suite against build/securl (see README.md)
+#   make test       run curl's own test suite against build/securl (see docs/testing.md)
 #   make test-supported   only the curl tests that use options securl has
 #   make test-tls   the HTTPS tests against local servers (needs python3)
 #   make test-h2    the HTTP/2 tests against a local server (needs python3 and the h2 package)
@@ -105,7 +105,7 @@ $(OPENSSL_STAMP):
 openssl: $(TLS_DEPS)
 
 # The headers and static libraries of the OpenSSL build, installed under build/openssl-dev, for
-# building curl's own test suite with a crypto library (README.md, "Run curl's test suite").
+# building curl's own test suite with a crypto library (docs/testing.md).
 OPENSSL_DEV = build/openssl-dev
 openssl-dev: $(OPENSSL_STAMP)
 	$(MAKE) -C $(OPENSSL_BUILD) install_dev DESTDIR=$(CURDIR)/$(OPENSSL_DEV) > $(OPENSSL_BUILD)/install.log
