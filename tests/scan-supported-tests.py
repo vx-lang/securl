@@ -28,11 +28,11 @@ http2 http2-prior-knowledge tcp-nodelay keepalive keepalive-time keepalive-cnt p
 socks4 socks4a socks5 socks5-hostname cert cert-type key key-type pass compressed tr-encoding hsts
 suppress-connect-headers proxy-insecure proxy-cacert proxy-capath remove-on-error limit-rate
 max-filesize next config retry retry-delay retry-max-time retry-connrefused
-retry-all-errors
+retry-all-errors continue-at manual
 """.split())
-SUPPORTED_SHORT = set("AbcdDeFHjmorTuwXxU0fGiIkLOqsSvVhg#NpE:K")
+SUPPORTED_SHORT = set("AbcdDeFHjmorTuwXxU0fGiIkLOqsSvVhg#NpE:KCM")
 # The short options that take a value: the rest of the word is that value.
-SHORT_WITH_VALUE = set("AbcdDeFHmorTuwXxUEK")
+SHORT_WITH_VALUE = set("AbcdDeFHmorTuwXxUEKC")
 
 
 def http_tests(data):

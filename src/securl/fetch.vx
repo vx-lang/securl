@@ -119,6 +119,8 @@ struct Sinks {
   body : Output,
   headers : Output,
   has_headers : bool,
+  // `-C`: the body goes on from this byte of the file, or -1 for an upload that asks for it.
+  resume_from : i64,
 }
 
 /// Write the header lines `raw` to the output when `to_body` (`-i`), and to the file of `-D`.
@@ -599,6 +601,10 @@ referer : &Vec<u8>, deadline : Instant, form_boundary : &Vec<u8>, auth : &mut Au
 session : &mut Session, console : &mut Console, sinks : &mut Sinks, info : &mut TransferInfo)
 -> Result<Hop, Failure> {
   let secure = eq_lit(&u.scheme, "https");
+  let resume = sinks.resume_from;
+  if resume != 0i64 && (req_kind == REQ_POST || req_kind == REQ_PUT) {
+    return Result<Hop, Failure>::Err(fail_lit(BAD_FUNCTION_ARGUMENT, "HTTP upload cannot be resumed"));
+  }
   let mut method = lit("GET");
   if cfg.has_method {
     method = clone_bytes(&cfg.method);
@@ -680,8 +686,8 @@ session : &mut Session, console : &mut Console, sinks : &mut Sinks, info : &mut 
     user_agent : clone_bytes(&cfg.user_agent),
     has_referer : has_referer,
     referer : clone_bytes(referer),
-    has_range : cfg.has_range,
-    range : clone_bytes(&cfg.range),
+    has_range : cfg.has_range || resume > 0i64,
+    range : range_of_request(cfg, resume),
     has_cookie : cookies.len() > 0,
     cookie : cookies,
     via_proxy : via_proxy,
@@ -837,8 +843,17 @@ session : &mut Session, console : &mut Console, sinks : &mut Sinks, info : &mut 
     }
   }
 
-  let failed = !retry && auth_should_fail(head.status, cfg.fail || cfg.fail_with_body, allowed,
-    proxy_allowed, auth.problem);
+  // `-C`: as libcurl, a 416 to a resumed GET is no error (the file is complete), and the
+  // Content-Range of the response must start at the offset.
+  let resumed_get = resume > 0i64 && req_kind == REQ_GET;
+  let range = content_range_of(&head.headers);
+  if resumed_get && head.status == 416 && range.total >= 0i64 && range.total != resume {
+    return Result<Hop, Failure>::Err(fail_lit(RANGE_ERROR,
+      "Cannot resume: remote file size differs from offset"));
+  }
+  let failed = !retry && !(resumed_get && head.status == 416)
+    && auth_should_fail(head.status, cfg.fail || cfg.fail_with_body, allowed, proxy_allowed,
+    auth.problem);
   // As libcurl, the head goes to the output before `-f` fails, for `-i` and `-D`.
   let _w = write_head(console, sinks, cfg.include || cfg.head, &head.raw)?;
   if failed && !cfg.fail_with_body {
@@ -853,7 +868,22 @@ session : &mut Session, console : &mut Console, sinks : &mut Sinks, info : &mut 
   let unknown_end = (head.content_length < 0i64 || head.has_transfer_encoding) && !head.chunked;
   // The same goes for a response to a request that goes again for authentication.
   let again = follow || retry;
-  let skip_body = again && (head.close || unknown_end);
+  let mut skip_body = again && (head.close || unknown_end);
+  if resumed_get && !again && !has_no_body(head.status, req_kind) {
+    let get_everything = range.other && head.status < 300;
+    if head.status == 416 {
+      // libcurl ignores the body of the 416.
+      skip_body = true;
+    } else if range.offset != resume && !get_everything {
+      if head.content_length == resume {
+        // "The entire document is already downloaded."
+        skip_body = true;
+      } else {
+        return Result<Hop, Failure>::Err(fail_lit(RANGE_ERROR,
+          "HTTP server does not seem to support byte ranges. Cannot resume."));
+      }
+    }
+  }
   if !has_no_body(head.status, req_kind) && !skip_body {
     if again {
       let mut discard = null_output();
@@ -1629,4 +1659,71 @@ fn retry_after_of(headers : &Vec<Vec<u8>>) -> i64 {
     }
   }
   return out;
+}
+
+/// The range of a request: `N-` for `-C N`, or else the one of `-r`.
+fn range_of_request(cfg : &Config, resume : i64) -> Vec<u8> {
+  if resume > 0i64 {
+    let mut r = Vec<u8>::new();
+    push_i64(&mut r, resume);
+    r.push(45u8);
+    return r;
+  }
+  return clone_bytes(&cfg.range);
+}
+
+/// The Content-Range header of a response, as libcurl reads it: the first byte of the range
+/// (`offset`), or the total of `*/total` (`total`), or a value with neither (`other`).
+struct ContentRange {
+  offset : i64,
+  total : i64,
+  other : bool,
+}
+
+fn content_range_of(headers : &Vec<Vec<u8>>) -> ContentRange {
+  let mut out = ContentRange {
+    offset : -1i64,
+    total : -1i64,
+    other : false
+  };
+  for line in headers.iter() {
+    if !starts_lit_nocase(line, "Content-Range:") {
+      continue;
+    }
+    let v = rest_from(line, 14);
+    let mut i = 0;
+    while i < v.len() && !is_digit(v.get(i)) && v.get(i) != 42u8 {
+      i = i + 1;
+    }
+    if i < v.len() && is_digit(v.get(i)) {
+      out.offset = leading_number(&v, i);
+    } else if i + 1 < v.len() && v.get(i) == 42u8 && v.get(i + 1) == 47u8 {
+      let start = i + 2;
+      let mut end = start;
+      while end < v.len() && is_digit(v.get(end)) {
+        end = end + 1;
+      }
+      let mut k = end;
+      while k < v.len() && is_blank(v.get(k)) {
+        k = k + 1;
+      }
+      if end > start && (k == v.len() || v.get(k) == 13u8 || v.get(k) == 10u8) {
+        out.total = leading_number(&v, start);
+      }
+    } else {
+      out.other = true;
+    }
+  }
+  return out;
+}
+
+/// The decimal number at `at` of `v`, up to the first byte that is not a digit.
+fn leading_number(v : &Vec<u8>, at : i32) -> i64 {
+  let mut n = 0i64;
+  let mut i = at;
+  while i < v.len() && is_digit(v.get(i)) && n < 922337203685477580i64 {
+    n = n * 10i64 + ((v.get(i) - 48u8) as i64);
+    i = i + 1;
+  }
+  return n;
 }

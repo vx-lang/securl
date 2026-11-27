@@ -142,7 +142,7 @@ pub fn tool_main(root : Root, command_line : Vec<String>) -> i32 {
   // As curl does while it reads the command line: a `--cacert` or `--proxy-cacert` file must
   // exist.
   for cfg in groups.iter() {
-    if !cfg.show_help && !cfg.show_version
+    if !cfg.show_help && !cfg.show_version && !cfg.show_manual
        && (!file_given_exists(&mut console, &root.files, &cfg.cacert, "cacert")
          || !file_given_exists(&mut console, &root.files, &cfg.proxy_cacert, "proxy-cacert")) {
       return FAILED_INIT;
@@ -409,6 +409,9 @@ struct OutputState {
   // instead of making it empty. A try of `--retry` adds to the file of `-D` in any case.
   keep : bool,
   retrying : bool,
+  // `-C`: the offset that the transfer goes on from, and whether it is the size of the file.
+  resume : i64,
+  resume_current : bool,
 }
 
 fn empty_output_state() -> OutputState {
@@ -418,7 +421,9 @@ fn empty_output_state() -> OutputState {
     written : false,
     bytes : 0i64,
     keep : false,
-    retrying : false
+    retrying : false,
+    resume : 0i64,
+    resume_current : false
   };
 }
 
@@ -511,8 +516,16 @@ info : &TransferInfo, sleep : &mut i64, left : i64, elapsed : i64) -> i64 {
 fn create_output_file(files : &Files, path : &Vec<u8>, state : &mut OutputState)
 -> Result<File, Failure> {
   state.created = !file_exists(files, path);
+  if state.resume_current {
+    // `-C -`: go on from the size of the file as it is.
+    let size = file_size(files, path);
+    state.resume = 0i64;
+    if size > 0i64 {
+      state.resume = size;
+    }
+  }
   let mut file = Option<File>::None();
-  if state.keep {
+  if state.keep || state.resume > 0i64 {
     file = Option<File>::Some(open_to_append(files, path)?);
   } else {
     file = Option<File>::Some(create_file(files, path)?);
@@ -631,6 +644,12 @@ groups : &Vec<Config>) -> i32 {
   }
   if first.show_version {
     print_version(console);
+    return 0;
+  }
+  if first.show_manual {
+    if !first.silent {
+      console.to_stderr(&lit("Warning: built-in manual was disabled at build-time\n"));
+    }
     return 0;
   }
   // curl checks the request method of each group while it reads the command line.
@@ -1090,12 +1109,29 @@ headers : &Vec<Vec<u8>>,
 url_text : &Vec<u8>, request_body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>,
 session : &mut Session, index : i32, info : &mut TransferInfo, state : &mut OutputState)
 -> Result<i32, Failure> {
+  // curl refuses to resume a POST of `-d` or `-F` before it starts.
+  if kind == REQ_POST && cfg.use_resume && (cfg.resume_from != 0i64 || cfg.resume_current) {
+    return Result<i32, Failure>::Err(fail_lit(BAD_FUNCTION_ARGUMENT, "HTTP upload cannot be resumed"));
+  }
+  // `-C N` goes on from byte N; `-C -` from the size of the output file, which `open_output`
+  // finds, and asks for a resumed upload, which libcurl refuses.
+  state.resume = 0i64;
+  state.resume_current = false;
+  if cfg.use_resume {
+    state.resume = cfg.resume_from;
+    state.resume_current = cfg.resume_current;
+    if cfg.resume_current && (kind == REQ_PUT || cfg.has_upload) {
+      state.resume = -1i64;
+      state.resume_current = false;
+    }
+  }
   let body_output = open_output(files, cfg, index, url_text, state)?;
   let header_output = open_header_output(files, cfg, state.retrying)?;
   let mut sinks = Sinks {
     body : body_output,
     headers : header_output,
-    has_headers : cfg.has_dump_header
+    has_headers : cfg.has_dump_header,
+    resume_from : state.resume
   };
   let result = run_transfer(network, tls, cfg, headers, url_text, request_body, kind,
     form_boundary, session, console, &mut sinks, info);

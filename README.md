@@ -63,9 +63,9 @@ Vx main 12f3786c8.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 490 of 757 (64%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 440 of 524 (83%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 192 of 192 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 510 of 757 (67%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 460 of 545 (84%) |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 199 of 199 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 12 of 12 |
 
@@ -91,8 +91,8 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 15,445 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 1,124 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 15,740 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 1,367 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 13 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,451 | 52 `extern` functions, 100 `unsafe` blocks |
 
@@ -317,7 +317,8 @@ missing options that block the most tests.
 `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
 `--connect-timeout` `--compressed` `--tr-encoding` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay`
 `--limit-rate` `--max-filesize` `--remove-on-error` `--next` (`-:`) `-K` (`--config`)
-`--retry` `--retry-delay` `--retry-max-time` `--retry-connrefused` `--retry-all-errors` `-h`
+`--retry` `--retry-delay` `--retry-max-time` `--retry-connrefused` `--retry-all-errors` `-C`
+(`--continue-at`) `-M` (`--manual`, which says that the manual is not built in) `-h`
 `-V`, and the options that runtests.pl adds: `-q` `--trace-ascii` `--trace-time`. As in curl,
 a long option may take its value in the same word, as `--max-time=2`, and `--` ends the
 options.
@@ -341,6 +342,14 @@ warning, such as "Problem : HTTP error. Retrying in 1 second. 3 retries left.", 
 `--remove-on-error` act on the last try, and `%{num_retries}` counts the tries. An output file
 starts again empty when the try wrote body bytes to it, and else keeps what the try wrote, as
 in curl.
+
+`-C N` goes on with a download from byte N, and `-C -` from the size of the output file, which
+then grows from its end. As in libcurl, the request asks for `Range: bytes=N-`; a response
+whose Content-Range starts elsewhere, or a 200 that ignores the range, fails with exit 33
+("HTTP server does not seem to support byte ranges. Cannot resume."), unless its length is N,
+which means that the file is whole; a 416 is fine too, as the file is whole, unless its
+`*/size` says another size. A POST or an upload with `-C` fails with exit 43 ("HTTP upload
+cannot be resumed"), as in curl 8.23, and `-C` does not go with `-r` or `--remove-on-error`.
 
 As libcurl does, each connection sets TCP_NODELAY and TCP keepalive: the first probe after 60
 seconds with no traffic, then one each 60 seconds, and 9 probes with no answer drop the
@@ -393,7 +402,8 @@ In order of how much users need them:
 1. Connection reuse (and with it, HTTP/2 multiplexing),
    `--unix-socket`, the
    `Upgrade: h2c` of `--http2` on plain HTTP, and HTTP/2 through an HTTP proxy.
-1. URL globbing (`{a,b}` and `[1-9]`), `-J`, `-C` resume, `--variable`,
+1. URL globbing (`{a,b}` and `[1-9]`), `-J`, `--variable`, `--no-clobber`, resume of a
+   retry (`--retry` with `-C -`),
    `--netrc`, a default `.curlrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
    encoders, `--preproxy`, SOCKS5 with GSS-API, `--proxy-http2` and client certificates for an
    HTTPS proxy, Digest with the proxy of a

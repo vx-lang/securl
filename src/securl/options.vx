@@ -91,6 +91,7 @@ struct Config {
   raw : bool,
   show_help : bool,
   show_version : bool,
+  show_manual : bool,
   has_proxy : bool,
   proxy : Vec<u8>,
   has_proxy_user : bool,
@@ -177,6 +178,11 @@ struct Config {
   retry_max_time_ms : i64,
   retry_connrefused : bool,
   retry_all_errors : bool,
+  // `-C`: go on from byte `resume_from` of the output, or (`-C -`) from the size of the output
+  // file.
+  use_resume : bool,
+  resume_from : i64,
+  resume_current : bool,
   hsts : Vec<u8>,
   // The proxy variables of the environment that are set, such as `https_proxy`. The tool
   // reads them. This package gets their values, and not the right to read the environment.
@@ -233,6 +239,7 @@ pub fn default_config() -> Config {
     raw : false,
     show_help : false,
     show_version : false,
+    show_manual : false,
     has_proxy : false,
     proxy : Vec<u8>::new(),
     has_proxy_user : false,
@@ -283,6 +290,9 @@ pub fn default_config() -> Config {
     retry_max_time_ms : 0i64,
     retry_connrefused : false,
     retry_all_errors : false,
+    use_resume : false,
+    resume_from : 0i64,
+    resume_current : false,
     hsts : Vec<u8>::new(),
     proxy_env : Vec<EnvVar>::new()
   };
@@ -389,6 +399,8 @@ const OPT_RETRY_DELAY : i32 = 97;
 const OPT_RETRY_MAX_TIME : i32 = 98;
 const OPT_RETRY_CONNREFUSED : i32 = 99;
 const OPT_RETRY_ALL_ERRORS : i32 = 100;
+const OPT_CONTINUE_AT : i32 = 101;
+const OPT_MANUAL : i32 = 102;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -496,6 +508,8 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "retry-max-time") { return OPT_RETRY_MAX_TIME; }
   if eq_lit(name, "retry-connrefused") { return OPT_RETRY_CONNREFUSED; }
   if eq_lit(name, "retry-all-errors") { return OPT_RETRY_ALL_ERRORS; }
+  if eq_lit(name, "continue-at") { return OPT_CONTINUE_AT; }
+  if eq_lit(name, "manual") { return OPT_MANUAL; }
   return OPT_UNKNOWN;
 }
 
@@ -513,6 +527,8 @@ fn short_option(letter : u8) -> i32 {
   if letter == 109u8 { return OPT_MAX_TIME; }       // m
   if letter == 111u8 { return OPT_OUTPUT; }         // o
   if letter == 114u8 { return OPT_RANGE; }          // r
+  if letter == 67u8 { return OPT_CONTINUE_AT; }     // C
+  if letter == 77u8 { return OPT_MANUAL; }          // M
   if letter == 84u8 { return OPT_UPLOAD_FILE; }     // T
   if letter == 117u8 { return OPT_USER; }           // u
   if letter == 119u8 { return OPT_WRITE_OUT; }      // w
@@ -550,7 +566,7 @@ fn takes_value(id : i32) -> bool {
     || id == OPT_KEEPALIVE_TIME || id == OPT_KEEPALIVE_CNT
     || (id >= OPT_SOCKS4 && id <= OPT_PASS) || id == OPT_HSTS || id == OPT_PROXY_CACERT
     || id == OPT_PROXY_CAPATH || id == OPT_LIMIT_RATE || id == OPT_MAX_FILESIZE || id == OPT_CONFIG
-    || (id >= OPT_RETRY && id <= OPT_RETRY_MAX_TIME);
+    || (id >= OPT_RETRY && id <= OPT_RETRY_MAX_TIME) || id == OPT_CONTINUE_AT;
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -593,6 +609,25 @@ pub fn seconds_to_ms(text : &Vec<u8>) -> Option<i64> {
 
 fn done() -> Result<i32, Failure> {
   return Result<i32, Failure>::Ok(0);
+}
+
+/// curl's error for an option that does not go with another one: its `errorf` line, and then
+/// "is badly used here".
+fn bad_use(name : &Vec<u8>, why : *const i8) -> Failure {
+  let mut m = lit(why);
+  push_lit(&mut m, "\ncurl: option ");
+  append(&mut m, name);
+  push_lit(&mut m, ": is badly used here");
+  return fail_with(FAILED_INIT, m);
+}
+
+fn all_digits(v : &Vec<u8>) -> bool {
+  for b in v.iter() {
+    if !is_digit(*b) {
+      return false;
+    }
+  }
+  return true;
 }
 
 fn option_error(name : &Vec<u8>, what : *const i8) -> Failure {
@@ -913,6 +948,9 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     return done();
   }
   if id == OPT_RANGE {
+    if cfg.use_resume {
+      return Result<i32, Failure>::Err(bad_use(shown, "--continue-at is mutually exclusive with --range"));
+    }
     cfg.has_range = true;
     cfg.range = clone_bytes(value);
     return done();
@@ -1113,6 +1151,36 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     cfg.max_filesize = size_arg(value, shown)?;
     return done();
   }
+  if id == OPT_CONTINUE_AT {
+    if cfg.has_range {
+      return Result<i32, Failure>::Err(bad_use(shown, "--continue-at is mutually exclusive with --range"));
+    }
+    if cfg.remove_on_error {
+      return Result<i32, Failure>::Err(bad_use(shown,
+        "--continue-at is mutually exclusive with --remove-on-error"));
+    }
+    if eq_lit(value, "-") {
+      cfg.resume_current = true;
+      cfg.resume_from = 0i64;
+    } else {
+      // curl's `str2offset`: digits only.
+      let digits = value.len() > 0 && all_digits(value);
+      match parse_u64(value) {
+        Option<u64>::Some(n) => {
+          if !digits || n > 9223372036854775807u64 {
+            return Result<i32, Failure>::Err(option_error(shown, "expected a proper numerical parameter"));
+          }
+          cfg.resume_from = n as i64;
+        },
+        Option<u64>::None() => {
+          return Result<i32, Failure>::Err(option_error(shown, "expected a proper numerical parameter"));
+        }
+      }
+      cfg.resume_current = false;
+    }
+    cfg.use_resume = true;
+    return done();
+  }
   if id == OPT_RETRY {
     cfg.retry = unsigned_arg(value, shown)?;
     return done();
@@ -1250,6 +1318,10 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     return done();
   }
   if id == OPT_REMOVE_ON_ERROR {
+    if cfg.use_resume && enable {
+      return Result<i32, Failure>::Err(bad_use(shown,
+        "--continue-at is mutually exclusive with --remove-on-error"));
+    }
     cfg.remove_on_error = enable;
     return done();
   }
@@ -1299,6 +1371,7 @@ struct ArgParser {
   still_flags : bool,
   show_help : bool,
   show_version : bool,
+  show_manual : bool,
   // Warnings of curl about the options so far, for the caller to print.
   warnings : Vec<Vec<u8>>,
 }
@@ -1318,6 +1391,7 @@ pub fn new_arg_parser() -> ArgParser {
     still_flags : true,
     show_help : false,
     show_version : false,
+    show_manual : false,
     warnings : Vec<Vec<u8>>::new()
   };
 }
@@ -1386,6 +1460,12 @@ impl ArgParser {
     }
     if id == OPT_NEXT {
       step.next_group = true;
+      return done();
+    }
+    if id == OPT_MANUAL {
+      // securl has no built-in manual, as a curl built without one.
+      self.show_manual = true;
+      step.stop = true;
       return done();
     }
     if id == OPT_CONFIG {
@@ -1610,6 +1690,7 @@ impl ArgParser {
       g.trace = clone_bytes(&self.globals.trace);
       g.show_help = self.show_help;
       g.show_version = self.show_version;
+      g.show_manual = self.show_manual;
     }
     return groups;
   }

@@ -452,6 +452,24 @@ stderr_has "  with curl's warning" "Warning: Problem : HTTP error. Retrying in 0
 check "  and with -f" 0 "fine" -sS -f --retry 1 --retry-delay 0.1 "http://127.0.0.1:$http/flaky/b"
 check "no --retry, no second try" 22 "" -sS -f "http://127.0.0.1:$http/flaky/c"
 
+# -C: go on with a file. The full text is in $work/gz, 203890 bytes.
+head -c 1000 "$work/gz" > "$work/part"
+check "-C - goes on from the size of the file" 0 "206 202890" -s -C - -o "$work/part" \
+  -w '%{http_code} %{size_download}' "http://127.0.0.1:$http/ranged"
+if cmp -s "$work/part" "$work/gz"; then
+  echo "ok     and the file is whole"
+else
+  echo "FAIL   the file is not the text"
+  fail=1
+fi
+check "  and a whole file gets 416, which is fine" 0 "416" -s -C - -o "$work/part" -w '%{http_code}' \
+  "http://127.0.0.1:$http/ranged"
+check "a server that ignores the range" 33 "" -sS -C 100 -o "$work/part2" \
+  "http://127.0.0.1:$http/no-ranges"
+stderr_has "  with curl's message" "HTTP server does not seem to support byte ranges. Cannot resume."
+check "-C with -d" 43 "" -sS -C 5 -d x "http://127.0.0.1:$http/ranged"
+stderr_has "  with curl's message" "HTTP upload cannot be resumed"
+
 # --tr-encoding: gzip as a transfer coding. Without it, curl refuses one that it did not ask for.
 check "--tr-encoding decodes Transfer-Encoding: gzip" 0 "203890" -s --tr-encoding \
   -w '%{size_delivered}' -o "$work/te" "http://127.0.0.1:$http/te-gzip"

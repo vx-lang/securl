@@ -28,7 +28,8 @@ Content-Encoding for `--compressed`; with Python 3.14 or later, which has `compr
 they include zstd bodies, and with the brotli library of the system (libbrotlienc), brotli bodies.
 `/sts?VALUE` sends a Strict-Transport-Security header with
 the decoded VALUE, for `--hsts`. A path under `/flaky/` answers 503 the first time and 200 after
-that, for `--retry`.
+that, for `--retry`. `/ranged` and `/no-ranges` send the text of `ENCODED` with and without
+Range requests, for `-C`.
 
 It runs until it is killed.
 """
@@ -163,6 +164,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+        elif self.path in ("/ranged", "/no-ranges"):
+            # TEXT, with Range requests on /ranged and without them on /no-ranges, for -C.
+            rng = self.headers.get("Range", "")
+            if self.path == "/ranged" and rng.startswith("bytes=") and rng.endswith("-"):
+                start = int(rng[6:-1])
+                if start >= len(TEXT):
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */%d" % len(TEXT))
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self.send_response(206)
+                self.send_header("Content-Range", "bytes %d-%d/%d" % (start, len(TEXT) - 1, len(TEXT)))
+                self.send_header("Content-Length", str(len(TEXT) - start))
+                self.end_headers()
+                self.wfile.write(TEXT[start:])
+            else:
+                self.send_body(TEXT)
         elif self.path.startswith("/flaky/"):
             # 503 the first time for each path, then 200, for --retry.
             if self.path in FLAKY_SEEN:
