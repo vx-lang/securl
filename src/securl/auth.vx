@@ -11,12 +11,288 @@
 //    method that fits, or after a probe that needed no authentication.
 //
 // The hashes and the random client nonce come from OpenSSL, through `sys::hash`.
+//
+// A user name and a password are a `Credential`, which is bound when it is made to the place
+// that it may go to: the first URL of the transfer for the server, or the proxy. Only this file
+// can make one, or change where it goes (`invariant true`), and each function here that writes
+// the password into a header or a SOCKS message checks the place of the request first. Of the
+// advisories that curl published in 2026, 15 are credentials or cookies that went to the wrong
+// host or proxy, after a check that a path of the code forgot.
+//
+// Vx has no private fields yet (docs/lang/visibility.md in Vx, section 7), so another file
+// could still read `password`. Until then, tools/check-secrets.sh refuses to build securl when a
+// file other than this one, url.vx and options.vx, where the password is parsed, reads it.
 import core::option;
+import core::result;
 import std::vec;
 import sys::hash;
 import sys::text;
 import securl::bytes;
 import securl::encode;
+import securl::failure;
+import securl::url;
+
+/// The scheme, the host and the port of a URL, in lower case.
+struct Origin {
+  scheme : Vec<u8>,
+  host : Vec<u8>,
+  port : i32,
+
+  invariant true,
+}
+
+/// The origin of `u`.
+pub fn origin_of(u : &Url) -> Origin {
+  return Origin {
+    scheme : to_lower(&u.scheme),
+    host : to_lower(&u.host),
+    port : u.port
+  };
+}
+
+fn same_origin(a : &Origin, b : &Origin) -> bool {
+  return same_bytes(&a.scheme, &b.scheme) && same_bytes(&a.host, &b.host) && a.port == b.port;
+}
+
+fn clone_origin(o : &Origin) -> Origin {
+  return Origin {
+    scheme : clone_bytes(&o.scheme),
+    host : clone_bytes(&o.host),
+    port : o.port
+  };
+}
+
+/// `scheme://host:port`: the server that a Digest state belongs to.
+fn origin_text(u : &Url) -> Vec<u8> {
+  let o = origin_of(u);
+  let mut out = clone_bytes(&o.scheme);
+  push_lit(&mut out, "://");
+  append(&mut out, &o.host);
+  push_lit(&mut out, ":");
+  push_u64(&mut out, o.port as u64);
+  return out;
+}
+
+/// Where the credentials of a transfer may go. Those of the server, the cookies of `-b` and the
+/// `Authorization` and `Cookie` headers of `-H` go to the origin of the first URL, or with
+/// `--location-trusted` to each server that a redirect leads to (libcurl's
+/// `Curl_auth_allowed_to_host`). Those of a proxy go only to that proxy.
+struct Scope {
+  origin : Origin,
+  any_origin : bool,
+
+  invariant true,
+}
+
+/// The scope of a transfer that starts with the URL `first`.
+pub fn transfer_scope(first : &Url, location_trusted : bool) -> Scope {
+  return Scope {
+    origin : origin_of(first),
+    any_origin : location_trusted
+  };
+}
+
+pub fn clone_scope(s : &Scope) -> Scope {
+  return Scope {
+    origin : clone_origin(&s.origin),
+    any_origin : s.any_origin
+  };
+}
+
+/// Whether what has the scope `s` may go to `to`.
+pub fn allows(s : &Scope, to : &Url) -> bool {
+  return s.any_origin || same_origin(&s.origin, &origin_of(to));
+}
+
+fn same_scope(a : &Scope, b : &Scope) -> bool {
+  return a.any_origin == b.any_origin && same_origin(&a.origin, &b.origin);
+}
+
+/// A user name and a password, and the place that they may go to.
+struct Credential {
+  // False when there are none.
+  present : bool,
+  scope : Scope,
+  user : Vec<u8>,
+  password : Vec<u8>,
+
+  invariant true,
+}
+
+/// No credentials. `u` is any URL: nothing goes to it.
+pub fn no_credential(u : &Url) -> Credential {
+  return Credential {
+    present : false,
+    scope : transfer_scope(u, false),
+    user : Vec<u8>::new(),
+    password : Vec<u8>::new()
+  };
+}
+
+/// The credentials `user:password` of an option, split at the first colon. With no colon, the
+/// password is empty.
+fn login_of(scope : Scope, login : &Vec<u8>) -> Credential {
+  let colon = find_byte(login, 58u8, 0);
+  if colon < 0 {
+    return Credential {
+      present : true,
+      scope : scope,
+      user : clone_bytes(login),
+      password : Vec<u8>::new()
+    };
+  }
+  return Credential {
+    present : true,
+    scope : scope,
+    user : range_of(login, 0, colon),
+    password : rest_from(login, colon + 1)
+  };
+}
+
+/// The credentials for the request to `u`, in a transfer with the scope `scope`, as libcurl
+/// chooses them (`url_set_data_creds`). Those of `-u` (`login` when `has_login`) belong to the
+/// transfer, and go where its scope allows. Else those that `u` itself holds go, and only to
+/// the origin of `u`: they do not follow a redirect to another URL, even with
+/// `--location-trusted` (curl's test 998).
+pub fn server_credential(scope : &Scope, has_login : bool, login : &Vec<u8>, u : &Url)
+-> Credential {
+  if has_login && allows(scope, u) {
+    return login_of(clone_scope(scope), login);
+  }
+  return Credential {
+    present : u.has_user,
+    scope : transfer_scope(u, false),
+    user : clone_bytes(&u.user),
+    password : clone_bytes(&u.password)
+  };
+}
+
+/// The credentials for the proxy `proxy`: those of `--proxy-user` (`login` when `has_login`),
+/// or else those of the URL of the proxy. They go only to that proxy.
+pub fn proxy_credential(proxy : &Url, has_login : bool, login : &Vec<u8>) -> Credential {
+  if has_login {
+    return login_of(transfer_scope(proxy, false), login);
+  }
+  return Credential {
+    present : proxy.has_user,
+    scope : transfer_scope(proxy, false),
+    user : clone_bytes(&proxy.user),
+    password : clone_bytes(&proxy.password)
+  };
+}
+
+pub fn clone_credential(c : &Credential) -> Credential {
+  return Credential {
+    present : c.present,
+    scope : clone_scope(&c.scope),
+    user : clone_bytes(&c.user),
+    password : clone_bytes(&c.password)
+  };
+}
+
+/// Whether there are credentials, and they may go to `to`.
+pub fn may_send(c : &Credential, to : &Url) -> bool {
+  return c.present && allows(&c.scope, to);
+}
+
+/// Whether two credentials are the same, for the reuse of a connection.
+pub fn same_credential(a : &Credential, b : &Credential) -> bool {
+  if !a.present || !b.present {
+    return a.present == b.present;
+  }
+  return same_scope(&a.scope, &b.scope) && same_bytes(&a.user, &b.user)
+    && same_bytes(&a.password, &b.password);
+}
+
+/// Whether Basic has something to send: libcurl sends no Basic header when the user name and
+/// the password are both empty, as for the URL `http://@host/` (curl's test 2208).
+fn has_user_or_password(c : &Credential) -> bool {
+  return c.user.len() > 0 || c.password.len() > 0;
+}
+
+/// `Basic ` and `user:password` in base64.
+fn basic_value(c : &Credential) -> Vec<u8> {
+  let mut pair = clone_bytes(&c.user);
+  push_lit(&mut pair, ":");
+  append(&mut pair, &c.password);
+  let mut out = lit("Basic ");
+  append(&mut out, &base64(&pair));
+  return out;
+}
+
+/// The value of an Authorization or a Proxy-Authorization header, and the origin that it was
+/// made for. Only this file makes one, after it checked that the credentials may go there.
+struct AuthHeader {
+  present : bool,
+  origin : Origin,
+  value : Vec<u8>,
+
+  invariant true,
+}
+
+fn no_header(to : &Url) -> AuthHeader {
+  return AuthHeader {
+    present : false,
+    origin : origin_of(to),
+    value : Vec<u8>::new()
+  };
+}
+
+/// Whether `h` is a header for a request to `to`.
+pub fn header_fits(h : &AuthHeader, to : &Url) -> bool {
+  return h.present && same_origin(&h.origin, &origin_of(to));
+}
+
+/// The Proxy-Authorization header of a CONNECT to the proxy `proxy`. libcurl sends Basic there
+/// before the proxy asks for it.
+pub fn connect_auth(c : &Credential, proxy : &Url) -> AuthHeader {
+  if !may_send(c, proxy) || !has_user_or_password(c) {
+    return no_header(proxy);
+  }
+  return AuthHeader {
+    present : true,
+    origin : origin_of(proxy),
+    value : basic_value(c)
+  };
+}
+
+/// The user ID of a SOCKS4 request to the proxy `proxy`: the user name, or else empty.
+pub fn socks4_user_id(c : &Credential, proxy : &Url) -> Result<Vec<u8>, Failure> {
+  if !may_send(c, proxy) {
+    return Result<Vec<u8>, Failure>::Ok(Vec<u8>::new());
+  }
+  // The protocol has no limit, but libcurl has the limit of SOCKS5.
+  if c.user.len() > 255 {
+    return Result<Vec<u8>, Failure>::Err(fail_lit(PROXY_ERROR, "Too long SOCKS proxy username"));
+  }
+  return Result<Vec<u8>, Failure>::Ok(clone_bytes(&c.user));
+}
+
+/// The user name and password message of RFC 1929, for the SOCKS5 proxy `proxy`. With no
+/// credentials for it, both are empty.
+pub fn socks5_login_message(c : &Credential, proxy : &Url) -> Result<Vec<u8>, Failure> {
+  let mut user = Vec<u8>::new();
+  let mut password = Vec<u8>::new();
+  if may_send(c, proxy) {
+    user = clone_bytes(&c.user);
+    password = clone_bytes(&c.password);
+  }
+  if user.len() > 255 {
+    return Result<Vec<u8>, Failure>::Err(fail_lit(PROXY_ERROR,
+      "Excessive username length for proxy auth"));
+  }
+  if password.len() > 255 {
+    return Result<Vec<u8>, Failure>::Err(fail_lit(PROXY_ERROR,
+      "Excessive password length for proxy auth"));
+  }
+  let mut out = Vec<u8>::new();
+  out.push(1u8);
+  out.push(user.len() as u8);
+  append(&mut out, &user);
+  out.push(password.len() as u8);
+  append(&mut out, &password);
+  return Result<Vec<u8>, Failure>::Ok(out);
+}
 
 // Authentication methods, as bits. The values are libcurl's CURLAUTH_ values.
 const AUTH_NONE : i32 = 0;
@@ -498,15 +774,16 @@ method : &Vec<u8>, uri : &Vec<u8>) -> Vec<u8> {
   return out;
 }
 
-/// Take the value of one `WWW-Authenticate` header of a 401 from the server `origin`
+/// Take the value of one `WWW-Authenticate` header of a 401 from the server `from`
 /// (libcurl's `Curl_http_input_auth`). It notes the methods that the server offers in `a`, and
 /// a Digest challenge in `d`. `problem` turns true when the server refused the credentials.
 pub fn take_challenge(value : &Vec<u8>, a : &mut AuthState, d : &mut DigestState,
-origin : &Vec<u8>, problem : &mut bool) -> void {
+from : &Url, problem : &mut bool) -> void {
+  let origin = origin_text(from);
   let mut at = skip_blanks(value, 0);
   while at < value.len() {
     if method_at(value, at, "Digest") {
-      take_digest(value, at, a, d, origin, problem);
+      take_digest(value, at, a, d, &origin, problem);
     }
     if method_at(value, at, "Basic") {
       a.avail = a.avail | AUTH_BASIC;
@@ -569,23 +846,14 @@ pub fn pick_one(a : &mut AuthState, has_credentials : bool) -> bool {
   return picked;
 }
 
-/// The Authorization header of a request, without its name.
-struct AuthHeader {
-  present : bool,
-  value : Vec<u8>,
-}
-
-/// The Authorization header of the next request to `origin` (libcurl's
-/// `Curl_http_output_auth` for the server). `allowed` says that credentials may go to this
-/// server. `custom` says that a `-H` gives an Authorization header, which replaces Basic.
-pub fn output_auth(a : &mut AuthState, d : &mut DigestState, allowed : bool, user : &Vec<u8>,
-password : &Vec<u8>, custom : bool, method : &Vec<u8>, uri : &Vec<u8>, origin : &Vec<u8>)
--> AuthHeader {
-  let mut header = AuthHeader {
-    present : false,
-    value : Vec<u8>::new()
-  };
-  if !allowed {
+/// The Authorization header of the next request to `to`, a server or an HTTP proxy, with the
+/// credentials `c` (libcurl's `Curl_http_output_auth`). The credentials go only when their
+/// scope allows `to`. `uri` is the path of the request, for Digest. `custom` says that a `-H`
+/// gives the header, which replaces Basic.
+pub fn output_auth(a : &mut AuthState, d : &mut DigestState, c : &Credential, to : &Url,
+uri : &Vec<u8>, custom : bool, method : &Vec<u8>) -> AuthHeader {
+  let mut header = no_header(to);
+  if !may_send(c, to) {
     a.done = true;
     a.multipass = false;
     return header;
@@ -597,33 +865,31 @@ password : &Vec<u8>, custom : bool, method : &Vec<u8>, uri : &Vec<u8>, origin : 
   if a.picked == AUTH_DIGEST {
     used = true;
     // A Digest state belongs to one server and one set of credentials.
-    let same_creds = same_bytes(&d.creds_user, user) && same_bytes(&d.creds_password, password);
-    if !d.has_origin || !same_bytes(&d.origin, origin) || (d.has_creds && !same_creds) {
+    let origin = origin_text(to);
+    let same_creds = same_bytes(&d.creds_user, &c.user)
+      && same_bytes(&d.creds_password, &c.password);
+    if !d.has_origin || !same_bytes(&d.origin, &origin) || (d.has_creds && !same_creds) {
       reset_digest(d);
     }
     d.has_origin = true;
-    d.origin = clone_bytes(origin);
+    d.origin = origin;
     d.has_creds = true;
-    d.creds_user = clone_bytes(user);
-    d.creds_password = clone_bytes(password);
+    d.creds_user = clone_bytes(&c.user);
+    d.creds_password = clone_bytes(&c.password);
     if d.has_nonce {
       header.present = true;
       header.value = lit("Digest ");
-      append(&mut header.value, &digest_response(d, user, password, method, uri));
+      append(&mut header.value, &digest_response(d, &c.user, &c.password, method, uri));
       a.done = true;
     } else {
       a.done = false;
     }
   }
   if a.picked == AUTH_BASIC {
-    if !custom {
+    if !custom && has_user_or_password(c) {
       used = true;
-      let mut pair = clone_bytes(user);
-      push_lit(&mut pair, ":");
-      append(&mut pair, password);
       header.present = true;
-      header.value = lit("Basic ");
-      append(&mut header.value, &base64(&pair));
+      header.value = basic_value(c);
     }
     a.done = true;
   }

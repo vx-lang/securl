@@ -800,4 +800,46 @@ check "a reused connection that dies is tried again" 0 "$(two 1 1)" -s -v -o /de
   -w "$nc" "http://127.0.0.1:$http/die-next" --next -o /dev/null -w "$nc" \
   "http://127.0.0.1:$http/"
 stderr_has "  with curl's message" "Connection died, retrying a fresh connect (retry count: 1)"
+# Where the credentials and the cookies of the user go. /secrets shows the Authorization and
+# Cookie headers that arrive, and /to?URL redirects to URL. The credentials of -u, the cookies
+# of -b and the Authorization and Cookie headers of -H go only to the scheme, host and port of
+# the first URL, unless --location-trusted. The credentials that a URL holds go only to the
+# origin of that URL, with the request for it, as in curl 8.23.
+to="http://127.0.0.1:$http/to?"
+here_s="http://127.0.0.1:$http/secrets"
+other_host="http://localhost:$http/secrets"
+other_port="https://127.0.0.1:$https/secrets"
+sent="auth=Basic YTpi cookie=c=1"
+none="auth= cookie="
+check "credentials: go to the server" 0 "$sent" -s -u a:b -b c=1 "$here_s"
+check "credentials: a redirect on the same server keeps them" 0 "$sent" -s -L -u a:b -b c=1 \
+  "$to$here_s"
+check "credentials: not after a redirect to another host" 0 "$none" -s -L -u a:b -b c=1 \
+  "$to$other_host"
+check "credentials: not after a redirect to another scheme and port" 0 "$none" -s -k -L \
+  -u a:b -b c=1 "$to$other_port"
+check "credentials: --location-trusted sends them to another host" 0 "$sent" -s -L \
+  --location-trusted -u a:b -b c=1 "$to$other_host"
+check "credentials: those of the URL, not after a redirect to another host" 0 "$none" -s -L \
+  -b c=1 "http://a:b@127.0.0.1:$http/to?$other_host"
+check "credentials: those of the URL, not with --location-trusted either" 0 "$none" -s -L \
+  --location-trusted "http://a:b@127.0.0.1:$http/to?$other_host"
+check "credentials: those of the URL, not after a redirect to a URL without them" 0 "$none" \
+  -s -L "http://a:b@127.0.0.1:$http/to?$here_s"
+check "credentials: those of the URL, after a relative redirect" 0 "auth=Basic YTpi cookie=" \
+  -s -L "http://a:b@127.0.0.1:$http/to?/secrets"
+check "credentials: those of a redirect URL go to its host" 0 "auth=Basic eDp5 cookie=" -s -L \
+  "${to}http://x:y@localhost:$http/secrets"
+check "credentials: those of a redirect URL, not to the host after it" 0 "$none" -s -L \
+  "${to}http://x:y@localhost:$http/to?$here_s"
+check "credentials: those of a redirect URL to another host, not those of -u" 0 \
+  "auth=Basic eDp5 cookie=" -s -L -u a:b "${to}http://x:y@localhost:$http/secrets"
+check "credentials: -u on the same server, not those of the redirect URL" 0 "$sent" -s -L \
+  -u a:b -b c=1 "${to}http://x:y@127.0.0.1:$http/secrets"
+check "credentials: -H Authorization and Cookie on the same server" 0 "auth=Bearer t cookie=k=v" \
+  -s -L -H "Authorization: Bearer t" -H "Cookie: k=v" "$to$here_s"
+check "credentials: -H Authorization and Cookie, not to another host" 0 "$none" -s -L \
+  -H "Authorization: Bearer t" -H "Cookie: k=v" "$to$other_host"
+check "credentials: those of a proxy do not go to the server" 0 "$none" -s -p \
+  -x "http://u:p@127.0.0.1:$proxy" "$here_s"
 exit $fail

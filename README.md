@@ -63,9 +63,9 @@ Vx main 95a733384.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 556 of 762 (72%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 499 of 569 (87%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 270 of 270 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 557 of 762 (73%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 500 of 569 (87%) |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 286 of 286 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 12 of 12 |
 
@@ -95,7 +95,7 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 16,835 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 17,031 | none, and `--no-trusted-code` enforces this |
 | `src/cli/` (the tool) and `src/disk/` (its files) | 1,519 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 14 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,355 | 48 `extern` functions, 90 `unsafe` blocks |
@@ -290,6 +290,31 @@ and `--proxy-anyauth` do the same with an HTTP proxy and its 407.
 `src/securl/auth.vx` holds all of it, as libcurl's `http.c` and `vauth/digest.c` do it, with no
 trusted code. Only the hash functions and the random client nonce come from OpenSSL, through
 `src/sys/hash.vx`. The unit tests check the examples of RFC 2617 and RFC 7616.
+
+### Where credentials may go
+
+Of the advisories that curl published in 2026, 15 are credentials or cookies that went to the
+wrong host or proxy. In libcurl, each path that sends them must ask `Curl_auth_allowed_to_host`,
+or compare the proxy, and an advisory follows when one path forgets.
+
+In securl, a user name and a password are a `Credential`, which is bound when it is made to the
+place that it may go to, as in curl 8.23. Those of `-u` are bound to the origin of the first
+URL of the transfer, its scheme, host and port, or with `--location-trusted` to any server.
+Those that a URL holds, as in `http://user:password@host/`, are bound to the origin of that
+URL, and go only with the request for it: not after a redirect to another URL, even with
+`--location-trusted`. Those of a proxy (`--proxy-user`, or the proxy URL) are bound to that
+proxy. The type has an invariant, so only `auth.vx` can make one
+or change its place. The functions of `auth.vx` that write a password, into Basic, Digest, the
+CONNECT request or the SOCKS login, first check the place of the request. They give an
+`AuthHeader`, which also has an invariant and names the origin that it was made for.
+`build_request`, the one function that writes the headers of a request, writes it only for
+the URL of its request line. It also decides there, from the same scope, whether the cookies
+of `-b` and the `Authorization` and `Cookie` headers of `-H` go.
+
+Vx has no private fields yet, so another file could still read the password of a
+`Credential`. `tools/check-secrets.sh` refuses the build when a file other than `auth.vx`, or
+`url.vx` and `options.vx`, which parse it, reads a field whose name ends with `password`. When
+Vx fields get levels, the field becomes private and the compiler checks this.
 
 ## Cookies
 
@@ -544,6 +569,7 @@ src/sys/             trusted code: OpenSSL (tls.vx), arguments, standard output,
 src/securl/          the protocol code; no trusted code
   options.vx           the command line
   url.vx               URLs and redirects
+  auth.vx              credentials and where they may go; Basic and Digest
   hsts.vx              the HSTS cache of --hsts
   cookie.vx date.vx    the cookie engine, and libcurl's date parser
   http.vx              the request bytes, in libcurl's header order; the response head
@@ -560,4 +586,5 @@ tests/unit/          unit tests of the parsers
 tests/tls/           HTTPS tests against local servers, with test certificates
 tests/run-curl-tests.sh   runs curl's runtests.pl against build/securl
 tools/check-no-pointers.sh  refuses code that makes a raw pointer outside src/sys
+tools/check-secrets.sh      refuses code that reads a password outside auth.vx
 ```

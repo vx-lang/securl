@@ -293,6 +293,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # The connection stays open, but the next request on it gets no response.
             self.send_body(b"die next\n")
             self.die_next = True
+        elif self.path == "/secrets":
+            # The credentials and the cookies that arrived.
+            auth = self.headers.get("Authorization", "")
+            cookie = self.headers.get("Cookie", "")
+            self.send_body(f"auth={auth} cookie={cookie}\n".encode())
+        elif self.path.startswith("/to?"):
+            # A redirect to the URL after the "?".
+            self.send_response(302)
+            self.send_header("Location", self.path[4:])
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         elif self.path == "/to-https":
             https_port = self.server.https_port
             self.send_response(302)

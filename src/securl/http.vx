@@ -6,6 +6,7 @@
 import core::option;
 import std::vec;
 import sys::text;
+import securl::auth;
 import securl::bytes;
 import securl::encode;
 import securl::failure;
@@ -135,11 +136,11 @@ struct RequestInfo {
   http10 : bool,
   // The `-H` headers, with the ones that `--json` adds.
   headers : Vec<Vec<u8>>,
-  // The value of the Authorization header (Basic or Digest), which `auth.vx` makes.
-  has_auth_header : bool,
-  auth_header : Vec<u8>,
-  // Credentials and cookies may go to this host: it is the first host, or `--location-trusted`.
-  trusted_host : bool,
+  // The Authorization header (Basic or Digest), which `auth.vx` makes for one origin. It goes
+  // only to that origin.
+  auth : AuthHeader,
+  // Where the cookies of `-b` and the `Authorization` and `Cookie` headers of `-H` may go.
+  scope : Scope,
   // A custom Host header may go to this host: it is the first host.
   first_host : bool,
   has_user_agent : bool,
@@ -148,14 +149,16 @@ struct RequestInfo {
   referer : Vec<u8>,
   has_range : bool,
   range : Vec<u8>,
-  has_cookie : bool,
+  // The cookies of the cookie engine that match the request, or empty.
   cookie : Vec<u8>,
-  // The request goes to an HTTP proxy, so the request line holds the whole URL.
+  // The cookies of `-b NAME=VALUE`.
+  has_cookie_option : bool,
+  cookie_option : Vec<u8>,
+  // The request goes to the HTTP proxy `proxy`, so the request line holds the whole URL.
   via_proxy : bool,
-  // The value of the Proxy-Authorization header (Basic or Digest), for a request that goes to
-  // an HTTP proxy.
-  has_proxy_auth_header : bool,
-  proxy_auth_header : Vec<u8>,
+  proxy : Url,
+  // The Proxy-Authorization header (Basic or Digest) that `auth.vx` made for that proxy.
+  proxy_auth : AuthHeader,
   // The body goes in chunks, with no Content-Length.
   chunked : bool,
   // curl adds `Transfer-Encoding: chunked` itself, because the length of the body is unknown.
@@ -181,7 +184,13 @@ fn add_line(out : &mut Vec<u8>, name : *const i8, value : &Vec<u8>) -> void {
 
 /// The bytes of the request line and the headers of a request for `u`, up to and with the
 /// empty line that ends them.
+///
+/// This is the one place that writes the credentials and the cookies of the user into a
+/// request, so it decides here, from the URL of the request line, whether they may go: the
+/// Authorization header only to the origin that `auth.vx` made it for, and the cookies of `-b`
+/// and the `Authorization` and `Cookie` headers of `-H` only where the scope allows.
 pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
+  let trusted = allows(&info.scope, u);
   let mut out = clone_bytes(&info.method);
   push_lit(&mut out, " ");
   if info.via_proxy {
@@ -221,12 +230,12 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
     add_line(&mut out, "Host: ", &host_header_value(u));
   }
 
-  if info.via_proxy && info.has_proxy_auth_header {
-    add_line(&mut out, "Proxy-Authorization: ", &info.proxy_auth_header);
+  if info.via_proxy && header_fits(&info.proxy_auth, &info.proxy) {
+    add_line(&mut out, "Proxy-Authorization: ", &info.proxy_auth.value);
   }
 
-  if info.has_auth_header {
-    add_line(&mut out, "Authorization: ", &info.auth_header);
+  if header_fits(&info.auth, u) {
+    add_line(&mut out, "Authorization: ", &info.auth.value);
   }
 
   if info.has_range {
@@ -280,9 +289,17 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
     push_lit(&mut out, "Transfer-Encoding: chunked\r\n");
   }
 
-  // The cookies of the cookie engine and of `-b name=value`, which `fetch.vx` puts together.
-  if info.has_cookie {
-    add_line(&mut out, "Cookie: ", &info.cookie);
+  // The cookies of the cookie engine, and then those of `-b NAME=VALUE`, unless a `-H` gives
+  // the Cookie header.
+  let mut cookie = clone_bytes(&info.cookie);
+  if info.has_cookie_option && trusted && !has_custom(&info.headers, "Cookie") {
+    if cookie.len() > 0 {
+      push_lit(&mut cookie, "; ");
+    }
+    append(&mut cookie, &info.cookie_option);
+  }
+  if cookie.len() > 0 {
+    add_line(&mut out, "Cookie: ", &cookie);
   }
 
   for line in info.headers.iter() {
@@ -292,7 +309,7 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
       || (info.probe && eq_lit_nocase(&h.name, "Content-Length"))
       || (info.form_boundary.len() > 0 && eq_lit_nocase(&h.name, "Content-Type"))
       || ((eq_lit_nocase(&h.name, "Authorization") || eq_lit_nocase(&h.name, "Cookie"))
-          && !info.trusted_host);
+          && !trusted);
     if !skip {
       if h.empty {
         append(&mut out, &h.name);
@@ -372,18 +389,16 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
   return out;
 }
 
-/// The CONNECT request that asks an HTTP proxy for a tunnel to the host of `u`.
-pub fn build_connect_request(target : &Vec<u8>, has_credentials : bool, user : &Vec<u8>,
-password : &Vec<u8>, has_user_agent : bool, user_agent : &Vec<u8>) -> Vec<u8> {
+/// The CONNECT request that asks the HTTP proxy `proxy` for a tunnel to `target`. `auth` is
+/// the Proxy-Authorization header that `auth.vx` made for that proxy.
+pub fn build_connect_request(target : &Vec<u8>, proxy : &Url, auth : &AuthHeader,
+has_user_agent : bool, user_agent : &Vec<u8>) -> Vec<u8> {
   let mut out = lit("CONNECT ");
   append(&mut out, target);
   push_lit(&mut out, " HTTP/1.1\r\n");
   add_line(&mut out, "Host: ", target);
-  if has_credentials {
-    let mut pair = clone_bytes(user);
-    push_lit(&mut pair, ":");
-    append(&mut pair, password);
-    add_line(&mut out, "Proxy-Authorization: Basic ", &base64(&pair));
+  if header_fits(auth, proxy) {
+    add_line(&mut out, "Proxy-Authorization: ", &auth.value);
   }
   if has_user_agent {
     if user_agent.len() > 0 {

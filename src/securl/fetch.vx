@@ -416,9 +416,8 @@ fn socks_request(network : &Network, cfg : &Config, u : &Url, proxy : &Proxy)
     port : target.port,
     addresses : addresses,
     lookup_failed : lookup_failed,
-    has_credentials : proxy.has_credentials,
-    user : clone_bytes(&proxy.user),
-    password : clone_bytes(&proxy.password)
+    proxy : clone_url(&proxy.url),
+    credential : clone_credential(&proxy.credential)
   });
 }
 
@@ -619,13 +618,6 @@ trailers : &mut Vec<u8>, raw : bool) -> Result<i32, Failure> {
   }
 }
 
-/// The credentials of a transfer, from `-u` or from the URL.
-struct Credentials {
-  present : bool,
-  user : Vec<u8>,
-  password : Vec<u8>,
-}
-
 /// What one request and its response decided.
 struct Hop {
   // The same request must go again, for authentication.
@@ -639,7 +631,8 @@ struct Hop {
 /// Send one request for `u` and read its response. The body of the response goes to
 /// `sinks`, unless curl follows the redirect that the response gives.
 fn one_hop(network : &Network, tls : &TlsSettings, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
-req_kind : i32, body : &Vec<u8>, creds : &Credentials, same_host : bool, has_referer : bool,
+req_kind : i32, body : &Vec<u8>, creds : &Credential, scope : &Scope, same_host : bool,
+has_referer : bool,
 referer : &Vec<u8>, deadline : Instant, form_boundary : &Vec<u8>, auth : &mut AuthContext,
 session : &mut Session, console : &mut Console, sinks : &mut Sinks, info : &mut TransferInfo,
 opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
@@ -680,34 +673,30 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
       "Chunky upload is not supported by HTTP 1.0"));
   }
   let chunked_upload = custom_chunked || (unknown_length && !cfg.http10);
-  // Credentials go only to the first host, unless `--location-trusted`.
-  let trusted_host = same_host || cfg.location_trusted;
-  let allowed = creds.present && trusted_host;
-  let auth_header = output_auth(&mut auth.host, &mut auth.digest, allowed, &creds.user,
-    &creds.password, has_custom(headers, "Authorization"), &method, &u.path, &origin_of(u));
+  // The credentials go only where their scope allows (`server_credential`).
+  let allowed = may_send(creds, u);
+  let auth_header = output_auth(&mut auth.host, &mut auth.digest, creds, u, &u.path,
+    has_custom(headers, "Authorization"), &method);
   // The credentials of an HTTP proxy go with each request that goes through it. The CONNECT of
   // a tunnel sends its own.
   let tunnel = tunnels(cfg, u, &proxy, secure)?;
   let via_proxy = proxy.used && is_http_proxy(proxy.kind) && !tunnel;
-  let proxy_allowed = via_proxy && proxy.has_credentials;
-  let proxy_header = output_auth(&mut auth.proxy, &mut auth.proxy_digest, proxy_allowed,
-    &proxy.user, &proxy.password, has_custom(headers, "Proxy-Authorization"), &method, &u.path,
-    &origin_of(&proxy.url));
+  let mut proxy_creds = no_credential(&proxy.url);
+  if via_proxy {
+    proxy_creds = clone_credential(&proxy.credential);
+  }
+  let proxy_allowed = may_send(&proxy_creds, &proxy.url);
+  let proxy_header = output_auth(&mut auth.proxy, &mut auth.proxy_digest, &proxy_creds,
+    &proxy.url, &u.path, has_custom(headers, "Proxy-Authorization"), &method);
   // Before Digest has its nonce, a POST or a PUT goes with an empty body, as a probe.
   let probe = needs_probe(auth) && sends_body;
-  // The cookies: those of the engine that match the host and the path, and the `-b` string,
-  // which goes only where credentials go.
+  // The cookies of the engine that match the host and the path. `build_request` adds those of
+  // `-b`, where the scope allows.
   let cookie_host = cookie_host_of(headers, u, same_host);
   let cookie_path = path_of(&u.path);
   let secure_context = secure || (!proxy.used && (eq_lit_nocase(&cookie_host, "localhost")
     || eq_lit(&cookie_host, "127.0.0.1") || eq_lit(&cookie_host, "::1")));
-  let mut cookies = cookie_header(&session.jar, &cookie_host, &cookie_path, secure_context);
-  if cfg.has_cookie && trusted_host && !has_custom(headers, "Cookie") {
-    if cookies.len() > 0 {
-      push_lit(&mut cookies, "; ");
-    }
-    append(&mut cookies, &cfg.cookie);
-  }
+  let cookies = cookie_header(&session.jar, &cookie_host, &cookie_path, secure_context);
   let sends_body_now = sends_body && !probe;
   let mut body_length = -1i64;
   if sends_body {
@@ -722,9 +711,8 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
     body_length : body_length,
     http10 : cfg.http10 || info.received_http10,
     headers : clone_lines(headers),
-    has_auth_header : auth_header.present,
-    auth_header : auth_header.value,
-    trusted_host : trusted_host,
+    auth : auth_header,
+    scope : clone_scope(scope),
     first_host : same_host,
     has_user_agent : cfg.has_user_agent,
     user_agent : clone_bytes(&cfg.user_agent),
@@ -732,11 +720,12 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
     referer : clone_bytes(referer),
     has_range : cfg.has_range || resume > 0i64,
     range : range_of_request(cfg, resume),
-    has_cookie : cookies.len() > 0,
     cookie : cookies,
+    has_cookie_option : cfg.has_cookie,
+    cookie_option : clone_bytes(&cfg.cookie),
     via_proxy : via_proxy,
-    has_proxy_auth_header : proxy_header.present,
-    proxy_auth_header : proxy_header.value,
+    proxy : clone_url(&proxy.url),
+    proxy_auth : proxy_header,
     chunked : sends_body_now && chunked_upload,
     add_chunked_header : sends_body_now && chunked_upload
       && !has_custom(headers, "Transfer-Encoding"),
@@ -839,12 +828,11 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
         let name = range_of(line, 0, colon);
         let value = trim_blanks(&rest_from(line, colon + 1));
         if head.status == 401 && eq_lit_nocase(&name, "WWW-Authenticate") {
-          take_challenge(&value, &mut auth.host, &mut auth.digest, &origin_of(u),
-            &mut auth.problem);
+          take_challenge(&value, &mut auth.host, &mut auth.digest, u, &mut auth.problem);
         }
         if head.status == 407 && eq_lit_nocase(&name, "Proxy-Authenticate") {
-          take_challenge(&value, &mut auth.proxy, &mut auth.proxy_digest,
-            &origin_of(&proxy.url), &mut auth.problem);
+          take_challenge(&value, &mut auth.proxy, &mut auth.proxy_digest, &proxy.url,
+            &mut auth.problem);
         }
       }
     }
@@ -1081,16 +1069,6 @@ fn hsts_upgrade(console : &mut Console, cfg : &Config, hsts : &mut Hsts, u : Url
 
 // How many times one transfer sends a request again for authentication.
 const MAX_AUTH_ROUNDS : i32 = 50;
-
-/// `scheme://host:port` of `u`: the server that a Digest state belongs to.
-fn origin_of(u : &Url) -> Vec<u8> {
-  let mut out = clone_bytes(&u.scheme);
-  push_lit(&mut out, "://");
-  append(&mut out, &u.host);
-  push_lit(&mut out, ":");
-  push_u64(&mut out, u.port as u64);
-  return out;
-}
 
 /// The time limit of the connect phase: `--connect-timeout`, or the 300 seconds of libcurl.
 fn connect_limit_ms(cfg : &Config) -> i64 {
@@ -1587,9 +1565,7 @@ fn proxy_for(console : &mut Console, cfg : &Config, u : &Url) -> Result<Proxy, F
     used : false,
     kind : PROXY_HTTP,
     url : clone_url(u),
-    has_credentials : false,
-    user : Vec<u8>::new(),
-    password : Vec<u8>::new(),
+    credential : no_credential(u),
     unix_path : Vec<u8>::new()
   };
   // A Unix-domain socket goes to no proxy, and curl reads no proxy variables for it.
@@ -1653,20 +1629,7 @@ fn proxy_for(console : &mut Console, cfg : &Config, u : &Url) -> Result<Proxy, F
       url.port = 443;
     }
   }
-  let mut has_credentials = url.has_user;
-  let mut user = clone_bytes(&url.user);
-  let mut password = clone_bytes(&url.password);
-  if cfg.has_proxy_user {
-    has_credentials = true;
-    let colon = find_byte(&cfg.proxy_user, 58u8, 0);
-    if colon >= 0 {
-      user = range_of(&cfg.proxy_user, 0, colon);
-      password = rest_from(&cfg.proxy_user, colon + 1);
-    } else {
-      user = clone_bytes(&cfg.proxy_user);
-      password = Vec<u8>::new();
-    }
-  }
+  let credential = proxy_credential(&url, cfg.has_proxy_user, &cfg.proxy_user);
   // A SOCKS proxy on the host `localhost` with a path is the Unix-domain socket at that path.
   let mut unix_path = Vec<u8>::new();
   if is_socks(kind) && eq_lit_nocase(&url.host, "localhost") {
@@ -1679,9 +1642,7 @@ fn proxy_for(console : &mut Console, cfg : &Config, u : &Url) -> Result<Proxy, F
     used : true,
     kind : kind,
     url : url,
-    has_credentials : has_credentials,
-    user : user,
-    password : password,
+    credential : credential,
     unix_path : unix_path
   });
 }
@@ -1727,8 +1688,8 @@ console : &mut Console, sinks : &mut Sinks) -> Result<i32, Failure> {
     },
     Option<Target>::None() => {}
   }
-  let request = build_connect_request(&target, proxy.has_credentials, &proxy.user, &proxy.password,
-    cfg.has_user_agent, &cfg.user_agent);
+  let request = build_connect_request(&target, &proxy.url,
+    &connect_auth(&proxy.credential, &proxy.url), cfg.has_user_agent, &cfg.user_agent);
   if cfg.verbose {
     verbose_lines(console, "> ", &request);
   }
@@ -1773,30 +1734,6 @@ console : &mut Console, sinks : &mut Sinks) -> Result<i32, Failure> {
   }
   // A 2xx reply to CONNECT has no body.
   return Result<i32, Failure>::Ok(0);
-}
-
-/// The credentials of `-u user:password`, or else of the URL.
-fn credentials_of(cfg : &Config, u : &Url) -> Credentials {
-  if cfg.has_user {
-    let colon = find_byte(&cfg.user, 58u8, 0);
-    if colon >= 0 {
-      return Credentials {
-        present : true,
-        user : range_of(&cfg.user, 0, colon),
-        password : rest_from(&cfg.user, colon + 1)
-      };
-    }
-    return Credentials {
-      present : true,
-      user : clone_bytes(&cfg.user),
-      password : Vec<u8>::new()
-    };
-  }
-  return Credentials {
-    present : u.has_user,
-    user : clone_bytes(&u.user),
-    password : clone_bytes(&u.password)
-  };
 }
 
 /// Run the transfer of `url_text`. `body` is the request body for a POST or a PUT. `kind` is
@@ -1848,7 +1785,8 @@ info : &mut TransferInfo,
 opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<i32, Failure> {
   let parsed = parse_url(url_text, cfg.path_as_is)?;
   let first = hsts_upgrade(console, cfg, &mut session.hsts, parsed);
-  let mut creds = credentials_of(cfg, &first);
+  // Where the credentials of `-u` and the cookies of the user may go, for the whole transfer.
+  let scope = transfer_scope(&first, cfg.location_trusted);
   let mut auth = new_auth_context(cfg.auth_type, cfg.proxy_auth_type);
   // A server that asks for new credentials again and again does not keep securl forever.
   let mut auth_rounds = 0;
@@ -1868,15 +1806,12 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<i32, Failure> {
       push_lit(&mut m, "\" not supported");
       return Result<i32, Failure>::Err(fail_with(UNSUPPORTED_PROTOCOL, m));
     }
-    // Credentials go after a redirect only to the same host, port and scheme, as in libcurl's
-    // Curl_auth_allowed_to_host.
+    // A custom Host header goes only to the first host, with the same port and scheme.
     let same_host = eq_nocase(&u.host, &first_host) && u.port == first_port
       && eq_nocase(&u.scheme, &first_scheme);
-    if redirects > 0 && !cfg.has_user && u.has_user {
-      creds = credentials_of(cfg, &u);
-    }
-    let hop = one_hop(network, tls, cfg, headers, &u, req_kind, body, &creds, same_host, has_referer,
-      &referer, deadline, form_boundary, &mut auth, session, console, sinks,
+    let creds = server_credential(&scope, cfg.has_user, &cfg.user, &u);
+    let hop = one_hop(network, tls, cfg, headers, &u, req_kind, body, &creds, &scope, same_host,
+      has_referer, &referer, deadline, form_boundary, &mut auth, session, console, sinks,
       info, opener)?;
     if hop.retry && auth_rounds < MAX_AUTH_ROUNDS {
       auth_rounds = auth_rounds + 1;

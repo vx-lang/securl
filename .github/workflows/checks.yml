@@ -11,3 +11,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: No raw pointers in the code with no trusted code
         run: tools/check-no-pointers.sh
+      - name: Only auth.vx sends a password
+        run: tools/check-secrets.sh

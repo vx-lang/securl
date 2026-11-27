@@ -9,6 +9,7 @@
 import core::option;
 import std::vec;
 import sys::text;
+import securl::auth;
 import securl::bytes;
 import securl::conn;
 import securl::options;
@@ -31,9 +32,8 @@ struct Proxy {
   kind : i32,
   // The proxy as a URL: its host and port are where curl connects.
   url : Url,
-  has_credentials : bool,
-  user : Vec<u8>,
-  password : Vec<u8>,
+  // The user name and password for the proxy, bound to it.
+  credential : Credential,
   // The Unix-domain socket of a SOCKS proxy given as `socks5h://localhost/PATH`, as in curl,
   // or empty for a proxy on TCP.
   unix_path : Vec<u8>,
@@ -77,9 +77,7 @@ struct ConnKey {
   proxy_port : i32,
   proxy_unix_path : Vec<u8>,
   // The credentials for the proxy. A SOCKS5 proxy checked them when the connection opened.
-  proxy_has_credentials : bool,
-  proxy_user : Vec<u8>,
-  proxy_password : Vec<u8>,
+  proxy_credential : Credential,
   // The connection is a CONNECT tunnel through the proxy.
   tunnel : bool,
   // `--http2-prior-knowledge` on plain TCP: only an HTTP/2 connection fits.
@@ -166,9 +164,11 @@ pub fn conn_key(cfg : &Config, u : &Url, proxy : &Proxy, tunnel : bool, via : &O
   }
   let mut proxy_host = Vec<u8>::new();
   let mut proxy_port = 0;
+  let mut proxy_credential = no_credential(u);
   if proxy.used {
     proxy_host = to_lower(&proxy.url.host);
     proxy_port = proxy.url.port;
+    proxy_credential = clone_credential(&proxy.credential);
   }
   return ConnKey {
     scheme : to_lower(&u.scheme),
@@ -181,9 +181,7 @@ pub fn conn_key(cfg : &Config, u : &Url, proxy : &Proxy, tunnel : bool, via : &O
     proxy_host : proxy_host,
     proxy_port : proxy_port,
     proxy_unix_path : clone_bytes(&proxy.unix_path),
-    proxy_has_credentials : proxy.used && proxy.has_credentials,
-    proxy_user : clone_bytes(&proxy.user),
-    proxy_password : clone_bytes(&proxy.password),
+    proxy_credential : proxy_credential,
     tunnel : tunnel,
     h2_prior_knowledge : cfg.h2_prior_knowledge && !secure && !forwards,
     server_tls : server_tls,
@@ -207,9 +205,7 @@ fn same_key(a : &ConnKey, b : &ConnKey) -> bool {
     && a.has_proxy == b.has_proxy && a.proxy_kind == b.proxy_kind
     && same_bytes(&a.proxy_host, &b.proxy_host) && a.proxy_port == b.proxy_port
     && same_bytes(&a.proxy_unix_path, &b.proxy_unix_path)
-    && a.proxy_has_credentials == b.proxy_has_credentials
-    && same_bytes(&a.proxy_user, &b.proxy_user)
-    && same_bytes(&a.proxy_password, &b.proxy_password)
+    && same_credential(&a.proxy_credential, &b.proxy_credential)
     && a.tunnel == b.tunnel && a.h2_prior_knowledge == b.h2_prior_knowledge
     && same_tls(&a.server_tls, &b.server_tls) && same_tls(&a.proxy_tls, &b.proxy_tls);
 }

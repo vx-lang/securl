@@ -13,9 +13,11 @@ import core::result;
 import std::vec;
 import sys::text;
 import securl::address;
+import securl::auth;
 import securl::bytes;
 import securl::conn;
 import securl::failure;
+import securl::url;
 
 // The kinds of proxy. HTTP is libcurl's default.
 const PROXY_HTTP : i32 = 0;
@@ -63,10 +65,10 @@ struct SocksRequest {
   // lookup worked at all. An address in brackets or an IPv4 address needs no lookup.
   addresses : Vec<Vec<u8>>,
   lookup_failed : bool,
-  // The user name and password of the proxy, from its URL or `--proxy-user`.
-  has_credentials : bool,
-  user : Vec<u8>,
-  password : Vec<u8>,
+  // The proxy, and its user name and password, from its URL or `--proxy-user`. `auth.vx`
+  // writes them into the messages, when they are for this proxy.
+  proxy : Url,
+  credential : Credential,
 }
 
 fn socks_fail(message : Vec<u8>) -> Failure {
@@ -119,14 +121,7 @@ fn socks4_connect(c : &mut Conn, req : &SocksRequest) -> Result<i32, Failure> {
   out.push(4u8);
   out.push(1u8);
   push_port(&mut out, req.port);
-  let mut user = Vec<u8>::new();
-  if req.has_credentials {
-    // The protocol has no limit, but libcurl has the limit of SOCKS5.
-    if req.user.len() > 255 {
-      return Result<i32, Failure>::Err(socks_fail_lit("Too long SOCKS proxy username"));
-    }
-    user = clone_bytes(&req.user);
-  }
+  let user = socks4_user_id(&req.credential, &req.proxy)?;
   if req.kind == PROXY_SOCKS4A {
     // The address 0.0.0.1 says that the host name follows the user.
     if req.host.len() + 1 > 255 {
@@ -210,7 +205,7 @@ fn socks5_connect(c : &mut Conn, req : &SocksRequest) -> Result<i32, Failure> {
   // The methods: no authentication, and the user name and password when there are some.
   let mut hello = Vec<u8>::new();
   hello.push(5u8);
-  if req.has_credentials {
+  if may_send(&req.credential, &req.proxy) {
     hello.push(2u8);
     hello.push(0u8);
     hello.push(2u8);
@@ -336,18 +331,7 @@ fn socks5_connect(c : &mut Conn, req : &SocksRequest) -> Result<i32, Failure> {
 
 /// The user name and password of RFC 1929.
 fn socks5_login(c : &mut Conn, req : &SocksRequest) -> Result<i32, Failure> {
-  if req.user.len() > 255 {
-    return Result<i32, Failure>::Err(socks_fail_lit("Excessive username length for proxy auth"));
-  }
-  if req.password.len() > 255 {
-    return Result<i32, Failure>::Err(socks_fail_lit("Excessive password length for proxy auth"));
-  }
-  let mut out = Vec<u8>::new();
-  out.push(1u8);
-  out.push(req.user.len() as u8);
-  append(&mut out, &req.user);
-  out.push(req.password.len() as u8);
-  append(&mut out, &req.password);
+  let out = socks5_login_message(&req.credential, &req.proxy)?;
   let _sent = c.send(&out)?;
   let status = read_exact(c, 2)?;
   if status.get(1) != 0u8 {
