@@ -15,12 +15,13 @@ HTTP/2 and HTTPS. TLS comes from OpenSSL, a git submodule. Everything else is Vx
 ## Build
 
 ```sh
+curl -fsSL https://vxlang.org/install.sh | VX_VERSION=v0.0.6 sh    # Vx, into ~/.vx
 git clone --recurse-submodules --shallow-submodules https://github.com/vx-lang/securl
 cd securl && make
 build/securl https://example.com/
 ```
 
-You need a vxc built from Vx main 98e8df6d5, a C compiler and Perl. Set `VXC`, `VX_LIBDIR` and
+You also need a C compiler and Perl. For a vxc built from source, set `VXC`, `VX_LIBDIR` and
 `LLVM_BIN` in `config.mk`. Only Linux on x86-64 is tested.
 
 ## Status

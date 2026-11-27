@@ -1,62 +1,36 @@
-# Build securl with vxc from a pinned commit of Vx main, and run its tests.
+# Build securl with the Vx release in VX_VERSION, and run its tests.
 #
-# Each job installs LLVM 22, MLIR and z3 from apt.llvm.org with Vx's own setup_linux.sh. vxc
-# builds from the commit in VX_COMMIT once, and the cache keeps it in ~/vx, with its runtime
-# library and the stdlib that it reads beside it.
+# The Vx toolchain comes from its GitHub release (tools/install-vx.sh checks its SHA-256), and
+# the cache keeps it in ~/vx. It carries its own LLVM 22. The fuzz targets also need clang 22
+# with the runtime of libFuzzer, from apt.llvm.org.
 name: build
 on:
   push:
   pull_request:
 env:
-  VX_COMMIT: 98e8df6d5f85340e1c71ec8593384c3132b7b749
+  VX_VERSION: v0.0.6
   CURL_COMMIT: 2f5c65743b4af7f8cc0bd0305740237bd054774c
 jobs:
-  vxc:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Cache vxc
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: ~/vx
-          key: vxc-${{ env.VX_COMMIT }}
-      - name: Get Vx
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          git clone --filter=blob:none https://github.com/vx-lang/Vx ~/vx
-          git -C ~/vx checkout --detach "$VX_COMMIT"
-      - name: LLVM 22, MLIR and z3
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: ~/vx/scripts/provision/setup_linux.sh
-      - name: Build vxc
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          cd ~/vx
-          ./setup.sh
-          . ./config.local
-          cargo build --release
-          mkdir -p dist
-          cp target/release/vxc target/release/libvx_std_core.a target/release/libvx_std_core.so dist/
-          # Only dist/ and the stdlib that vxc reads from dist/../stdlib go in the cache.
-          rm -rf target
-
   test:
-    needs: vxc
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - name: Restore vxc
-        uses: actions/cache/restore@v4
+      - name: Cache Vx
+        id: vx
+        uses: actions/cache@v4
         with:
           path: ~/vx
-          key: vxc-${{ env.VX_COMMIT }}
-          fail-on-cache-miss: true
-      - name: LLVM 22 for vxc, and the runtime of libFuzzer
+          key: vx-${{ env.VX_VERSION }}-x86_64-linux
+      - name: Install Vx
+        if: steps.vx.outputs.cache-hit != 'true'
+        run: tools/install-vx.sh "$VX_VERSION" ~/vx
+      - name: z3, and clang 22 with the runtime of libFuzzer
         run: |
-          ~/vx/scripts/provision/setup_linux.sh
-          sudo apt-get install -y -qq libclang-rt-22-dev
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash /tmp/llvm.sh 22
+          sudo apt-get install -y -qq z3 mlir-22-tools libclang-rt-22-dev
       - name: Cache OpenSSL
         uses: actions/cache@v4
         with:
@@ -64,8 +38,8 @@ jobs:
           key: openssl-${{ hashFiles('.git/modules/third_party/openssl/HEAD', 'Makefile') }}
       - name: Settings
         run: |
-          echo "VXC = $HOME/vx/dist/vxc" > config.mk
-          echo "VX_LIBDIR = $HOME/vx/dist" >> config.mk
+          echo "VXC = $HOME/vx/bin/vxc" > config.mk
+          echo "VX_LIBDIR = $HOME/vx/lib" >> config.mk
           echo "JOBS = 4" >> config.mk
       - name: Build
         run: make
@@ -98,12 +72,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      # securl links the runtime of vxc, libvx_std_core, from ~/vx/dist.
-      - name: Restore vxc
+      # securl links the runtime of Vx, libvx_std_core, from ~/vx/lib.
+      - name: Restore Vx
         uses: actions/cache/restore@v4
         with:
           path: ~/vx
-          key: vxc-${{ env.VX_COMMIT }}
+          key: vx-${{ env.VX_VERSION }}-x86_64-linux
           fail-on-cache-miss: true
       - uses: actions/download-artifact@v4
         with:

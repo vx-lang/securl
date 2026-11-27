@@ -9,7 +9,8 @@
 #   make test-h2    the HTTP/2 tests against a local server (needs python3 and the h2 package)
 #   make fuzz       run the libFuzzer targets of tests/fuzz (needs clang with libFuzzer)
 #
-# securl needs a vxc built from Vx main. Put the settings of your machine in config.mk, which
+# securl builds with Vx v0.0.6. Vx's installer puts it in ~/.vx, where the defaults below find
+# it. For a vxc built from the Vx sources, put the settings of your machine in config.mk, which
 # git ignores. For example:
 #
 #   VXC       = /path/to/Vx/target/release/vxc
