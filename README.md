@@ -70,6 +70,12 @@ Vx main 98e8df6d5.
 | Unit tests (`tests/unit`) | 13 of 13 |
 | Fuzzing with libFuzzer (`tests/fuzz`): 9 parsers, 2 minutes each, about 50 million inputs | no crash, hang or memory error |
 
+The GitHub workflow `.github/workflows/build.yml` builds vxc from the Vx commit above in Vx's
+build image, builds securl, and runs the audit, the unit, TLS and HTTP/2 tests, and each fuzz
+target for 30 seconds. A second job builds curl's test servers from the curl commit above and
+runs the supported tests, and fails when a test fails that `tests/supported-known-failures.txt`
+does not list.
+
 `CURL=/path/to/curl tests/tls/run.sh` runs the checks of `tests/tls` against another curl, and
 `tests/h2/run.sh` takes `CURL` too. curl 8.23.1-DEV, built from the same curl commit, passes all
 TLS checks but one, which it skips: curl reads the extension of a chunk-size line with no limit

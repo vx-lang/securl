@@ -1,0 +1,33 @@
+# The tests of tests/supported-tests.txt that securl fails today, one on each line. CI runs the
+# supported tests and fails when a test that is not here fails. When a test here passes, take it
+# out. 1070 depends on timing and passes in some runs.
+60
+98
+206
+428
+429
+435
+448
+458
+471
+1029
+1060
+1061
+1070
+1133
+1138
+1141
+1143
+1147
+1158
+1186
+1261
+1293
+1315
+1489
+1741
+2081
+2093
+2824
+3030
+3229

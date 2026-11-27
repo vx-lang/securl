@@ -1,5 +1,5 @@
-# Checks that need no Vx compiler. The build and the tests need a vxc built from Vx main, which
-# this workflow does not have yet.
+# Checks that need no Vx compiler, which run in seconds. build.yml builds securl and runs its
+# tests.
 name: checks
 on:
   push:
