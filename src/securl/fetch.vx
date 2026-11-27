@@ -1211,10 +1211,7 @@ fn conn_names(cfg : &Config, u : &Url, proxy : &Proxy, tunnel : bool) -> Result<
       append(&mut label, &proxy.url.host);
     }
   } else {
-    // A `match` of `f()?` that binds a name panics the AST code generator (Vx #4172), so the
-    // value gets a name first.
-    let via = via_target(cfg, u)?;
-    match via {
+    match via_target(cfg, u)? {
       Option<Target>::Some(target) => {
         push_lit(&mut label, " via ");
         append(&mut label, &host_port(&target.host, target.port));
@@ -1602,9 +1599,7 @@ console : &mut Console, sinks : &mut Sinks) -> Result<i32, Failure> {
   let mut target = host_text(u);
   push_lit(&mut target, ":");
   push_u64(&mut target, u.port as u64);
-  // Named first, for Vx #4172.
-  let via = via_target(cfg, u)?;
-  match via {
+  match via_target(cfg, u)? {
     Option<Target>::Some(t) => {
       target = host_port_text(&t.host, t.port);
     },
