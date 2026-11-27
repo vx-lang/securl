@@ -750,4 +750,54 @@ stderr_has "  gets curl's warning" "Warning: Warning: Failed to open /no-such-di
 printf 'stderr = "%s"\nurl = "hej://moo"\n' "$work/stderr.txt" > "$work/stderr.cfg"
 check "--stderr in a config file" 1 "" -K "$work/stderr.cfg"
 file_is "  works too" "$work/stderr.txt" 'curl: (1) Protocol "hej" not supported'
+# Connection reuse: a connection stays open after a transfer, and a later request for the same
+# place uses it, as in curl. %{num_connects} counts the new connections of each transfer.
+nc='%{num_connects}\n'
+two() {
+  printf '%s\n%s' "$1" "$2"
+}
+check "reuse: a later --next group to the same server" 0 "$(two 1 0)" -s -o /dev/null \
+  -w "$nc" "http://127.0.0.1:$http/" --next -o /dev/null -w "$nc" "http://127.0.0.1:$http/"
+check "reuse: two URLs of one group" 0 "$(two 1 0)" -s -o /dev/null -o /dev/null -w "$nc" \
+  "http://127.0.0.1:$http/" "http://127.0.0.1:$http/"
+check "reuse: a redirect to the same server" 0 "1" -s -L -o /dev/null -w "$nc" \
+  "http://127.0.0.1:$http/to-host"
+check "reuse: HTTPS" 0 "$(two 1 0)" -s -k -o /dev/null -w "$nc" "https://localhost:$https/" \
+  --next -k -o /dev/null -w "$nc" "https://localhost:$https/"
+check "reuse: other credentials of the server" 0 "$(two 1 0)" -s -u a:b -o /dev/null -w "$nc" \
+  "http://127.0.0.1:$http/" --next -u c:d -o /dev/null -w "$nc" "http://127.0.0.1:$http/"
+check "reuse: the host name in another case" 0 "$(two 1 0)" -s -o /dev/null -w "$nc" \
+  "http://LOCALHOST:$http/" --next -o /dev/null -w "$nc" "http://localhost:$http/"
+check "reuse: a CONNECT tunnel" 0 "$(two 1 0)" -s -k -x "http://127.0.0.1:$proxy" \
+  -o /dev/null -w "$nc" "https://localhost:$https/" --next -k -x "http://127.0.0.1:$proxy" \
+  -o /dev/null -w "$nc" "https://localhost:$https/"
+check "reuse: a Unix-domain socket" 0 "$(two 1 0)" -s --unix-socket "$usock" -o /dev/null \
+  -w "$nc" "http://x/" --next --unix-socket "$usock" -o /dev/null -w "$nc" "http://x/"
+check "no reuse: another host name for the same server" 0 "$(two 1 1)" -s -o /dev/null \
+  -w "$nc" "http://localhost:$http/" --next -o /dev/null -w "$nc" "http://127.0.0.1:$http/"
+check "no reuse: other TLS settings" 0 "$(two 1 1)" -s -k -o /dev/null -w "$nc" \
+  "https://localhost:$https/" --next --cacert "$certs/ca.pem" -o /dev/null -w "$nc" \
+  "https://localhost:$https/"
+check "no reuse: other credentials of the proxy" 0 "$(two 1 1)" -s -k \
+  -x "http://127.0.0.1:$proxy" -U a:b -o /dev/null -w "$nc" "https://localhost:$https/" \
+  --next -k -x "http://127.0.0.1:$proxy" -U c:d -o /dev/null -w "$nc" "https://localhost:$https/"
+check "no reuse: --connect-to and then none" 0 "$(two 1 1)" -s \
+  --connect-to "a.test:$http:127.0.0.1:$http" -o /dev/null -w "$nc" "http://a.test:$http/" \
+  --next --resolve "a.test:$http:127.0.0.1" -o /dev/null -w "$nc" "http://a.test:$http/"
+check "no reuse: a Unix-domain socket and then TCP" 0 "$(two 1 1)" -s --unix-socket "$usock" \
+  -o /dev/null -w "$nc" "http://127.0.0.1:$http/" --next -o /dev/null -w "$nc" \
+  "http://127.0.0.1:$http/"
+check "no reuse: after Connection: close" 0 "$(two 1 1)" -s -o /dev/null -w "$nc" \
+  "http://127.0.0.1:$http/close-cut" --next -o /dev/null -w "$nc" "http://127.0.0.1:$http/"
+# /linger closes the connection after 0.3 seconds, during the second transfer, which waits for
+# the mute server for a second. The third finds the connection closed and opens a new one.
+check "no reuse: a connection that the server closed" 0 "$(two 1 1)" -s -o /dev/null \
+  -w "$nc" "http://127.0.0.1:$http/linger" --next -m 1 -o /dev/null "http://127.0.0.1:$mute/" \
+  --next -o /dev/null -w "$nc" "http://127.0.0.1:$http/"
+# After /die-next, the server closes the connection at the next request, with no response. As
+# curl, securl sends the request again on a new connection.
+check "a reused connection that dies is tried again" 0 "$(two 1 1)" -s -v -o /dev/null \
+  -w "$nc" "http://127.0.0.1:$http/die-next" --next -o /dev/null -w "$nc" \
+  "http://127.0.0.1:$http/"
+stderr_has "  with curl's message" "Connection died, retrying a fresh connect (retry count: 1)"
 exit $fail

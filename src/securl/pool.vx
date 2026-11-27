@@ -1,0 +1,318 @@
+// The connections that a run keeps open after a transfer, for a later request to the same
+// place, as libcurl's connection pool does.
+//
+// A connection carries a request only when the `ConnKey` of the request equals the key that
+// the connection was opened with. Only this file can build a `ConnKey`, in `conn_key`, so each
+// setting that decides about reuse is in that one function, or left out of it where a reviewer
+// sees that. libcurl compares the settings in many places of `url_match_conn`, and most of its
+// advisories of 2026 are a connection reused although such a setting differed.
+import core::option;
+import std::vec;
+import sys::text;
+import securl::bytes;
+import securl::conn;
+import securl::options;
+import securl::socks;
+import securl::url;
+
+// libcurl keeps at most 5 connections open, by default (CURLOPT_MAXCONNECTS).
+const MAX_IDLE : i32 = 5;
+
+/// A host and a port to connect to.
+struct Target {
+  host : Vec<u8>,
+  port : i32,
+}
+
+/// The proxy of a request, from `-x` or from the environment.
+struct Proxy {
+  used : bool,
+  // PROXY_HTTP, PROXY_HTTPS, or a kind of SOCKS proxy (securl::socks).
+  kind : i32,
+  // The proxy as a URL: its host and port are where curl connects.
+  url : Url,
+  has_credentials : bool,
+  user : Vec<u8>,
+  password : Vec<u8>,
+  // The Unix-domain socket of a SOCKS proxy given as `socks5h://localhost/PATH`, as in curl,
+  // or empty for a proxy on TCP.
+  unix_path : Vec<u8>,
+}
+
+/// The TLS settings of one side of a connection: whether it checks the certificate of the
+/// peer, the certificate authorities that it trusts, and the client certificate that it shows.
+struct TlsKey {
+  verify : bool,
+  ca_file : Vec<u8>,
+  ca_dir : Vec<u8>,
+  cert : Vec<u8>,
+  cert_type : Vec<u8>,
+  key : Vec<u8>,
+  key_type : Vec<u8>,
+  has_pass : bool,
+  pass : Vec<u8>,
+
+  invariant true,
+}
+
+/// Everything about a request that decides whether an open connection may carry it.
+///
+/// Left out, as in libcurl: the credentials of the server (`-u`), because Basic and Digest
+/// send them with each request, and `--resolve`, which only says where a new connection goes.
+struct ConnKey {
+  // "http" or "https".
+  scheme : Vec<u8>,
+  // The server, in lower case, and its port. Empty, with port 0, when an HTTP proxy forwards
+  // the request: the connection then goes to the proxy, which takes requests for any server.
+  host : Vec<u8>,
+  port : i32,
+  // `HOST:PORT` of `--connect-to` when it sends the request to another place, or empty.
+  via : Vec<u8>,
+  // The file of `--unix-socket`, or empty.
+  unix_socket : Vec<u8>,
+  // The proxy: its kind, its host in lower case and its port, or its Unix-domain socket.
+  has_proxy : bool,
+  proxy_kind : i32,
+  proxy_host : Vec<u8>,
+  proxy_port : i32,
+  proxy_unix_path : Vec<u8>,
+  // The credentials for the proxy. A SOCKS5 proxy checked them when the connection opened.
+  proxy_has_credentials : bool,
+  proxy_user : Vec<u8>,
+  proxy_password : Vec<u8>,
+  // The connection is a CONNECT tunnel through the proxy.
+  tunnel : bool,
+  // `--http2-prior-knowledge` on plain TCP: only an HTTP/2 connection fits.
+  h2_prior_knowledge : bool,
+  // TLS to the server, for HTTPS. The settings of a key without TLS are all empty.
+  server_tls : TlsKey,
+  // TLS to an HTTPS proxy.
+  proxy_tls : TlsKey,
+
+  invariant true,
+}
+
+fn no_tls() -> TlsKey {
+  return TlsKey {
+    verify : false,
+    ca_file : Vec<u8>::new(),
+    ca_dir : Vec<u8>::new(),
+    cert : Vec<u8>::new(),
+    cert_type : Vec<u8>::new(),
+    key : Vec<u8>::new(),
+    key_type : Vec<u8>::new(),
+    has_pass : false,
+    pass : Vec<u8>::new()
+  };
+}
+
+/// The key of a request for `u` through `proxy`, with `tunnel` when it goes through a CONNECT
+/// tunnel and `via` the place of `--connect-to`.
+pub fn conn_key(cfg : &Config, u : &Url, proxy : &Proxy, tunnel : bool, via : &Option<Target>)
+-> ConnKey {
+  let secure = eq_lit_nocase(&u.scheme, "https");
+  let forwards = proxy.used && is_http_proxy(proxy.kind) && !tunnel;
+  let mut host = Vec<u8>::new();
+  let mut port = 0;
+  if !forwards {
+    host = to_lower(&u.host);
+    port = u.port;
+  }
+  let mut via_text = Vec<u8>::new();
+  match via {
+    Option<Target>::Some(t) => {
+      via_text = to_lower(&t.host);
+      push_lit(&mut via_text, ":");
+      push_u64(&mut via_text, t.port as u64);
+    },
+    Option<Target>::None() => {}
+  }
+  let mut server_tls = no_tls();
+  if secure {
+    server_tls = TlsKey {
+      verify : !cfg.insecure,
+      ca_file : clone_bytes(&cfg.cacert),
+      ca_dir : clone_bytes(&cfg.capath),
+      cert : clone_bytes(&cfg.cert),
+      cert_type : clone_bytes(&cfg.cert_type),
+      key : clone_bytes(&cfg.key),
+      key_type : clone_bytes(&cfg.key_type),
+      has_pass : cfg.has_pass,
+      pass : clone_bytes(&cfg.pass)
+    };
+  }
+  let mut proxy_tls = no_tls();
+  if proxy.used && proxy.kind == PROXY_HTTPS {
+    // As the tool does, `--capath` counts for the proxy when there is no `--proxy-capath`.
+    let mut ca_dir = clone_bytes(&cfg.proxy_capath);
+    if ca_dir.len() == 0 {
+      ca_dir = clone_bytes(&cfg.capath);
+    }
+    proxy_tls = TlsKey {
+      verify : !cfg.proxy_insecure,
+      ca_file : clone_bytes(&cfg.proxy_cacert),
+      ca_dir : ca_dir,
+      cert : Vec<u8>::new(),
+      cert_type : Vec<u8>::new(),
+      key : Vec<u8>::new(),
+      key_type : Vec<u8>::new(),
+      has_pass : false,
+      pass : Vec<u8>::new()
+    };
+  }
+  let mut unix_socket = Vec<u8>::new();
+  if cfg.has_unix_socket {
+    unix_socket = clone_bytes(&cfg.unix_socket);
+  }
+  let mut proxy_host = Vec<u8>::new();
+  let mut proxy_port = 0;
+  if proxy.used {
+    proxy_host = to_lower(&proxy.url.host);
+    proxy_port = proxy.url.port;
+  }
+  return ConnKey {
+    scheme : to_lower(&u.scheme),
+    host : host,
+    port : port,
+    via : via_text,
+    unix_socket : unix_socket,
+    has_proxy : proxy.used,
+    proxy_kind : proxy.kind,
+    proxy_host : proxy_host,
+    proxy_port : proxy_port,
+    proxy_unix_path : clone_bytes(&proxy.unix_path),
+    proxy_has_credentials : proxy.used && proxy.has_credentials,
+    proxy_user : clone_bytes(&proxy.user),
+    proxy_password : clone_bytes(&proxy.password),
+    tunnel : tunnel,
+    h2_prior_knowledge : cfg.h2_prior_knowledge && !secure && !forwards,
+    server_tls : server_tls,
+    proxy_tls : proxy_tls
+  };
+}
+
+fn same_tls(a : &TlsKey, b : &TlsKey) -> bool {
+  return a.verify == b.verify && same_bytes(&a.ca_file, &b.ca_file)
+    && same_bytes(&a.ca_dir, &b.ca_dir) && same_bytes(&a.cert, &b.cert)
+    && same_bytes(&a.cert_type, &b.cert_type) && same_bytes(&a.key, &b.key)
+    && same_bytes(&a.key_type, &b.key_type) && a.has_pass == b.has_pass
+    && same_bytes(&a.pass, &b.pass);
+}
+
+/// Whether a connection opened for the key `a` may carry a request with the key `b`: each
+/// field is the same.
+fn same_key(a : &ConnKey, b : &ConnKey) -> bool {
+  return same_bytes(&a.scheme, &b.scheme) && same_bytes(&a.host, &b.host) && a.port == b.port
+    && same_bytes(&a.via, &b.via) && same_bytes(&a.unix_socket, &b.unix_socket)
+    && a.has_proxy == b.has_proxy && a.proxy_kind == b.proxy_kind
+    && same_bytes(&a.proxy_host, &b.proxy_host) && a.proxy_port == b.proxy_port
+    && same_bytes(&a.proxy_unix_path, &b.proxy_unix_path)
+    && a.proxy_has_credentials == b.proxy_has_credentials
+    && same_bytes(&a.proxy_user, &b.proxy_user)
+    && same_bytes(&a.proxy_password, &b.proxy_password)
+    && a.tunnel == b.tunnel && a.h2_prior_knowledge == b.h2_prior_knowledge
+    && same_tls(&a.server_tls, &b.server_tls) && same_tls(&a.proxy_tls, &b.proxy_tls);
+}
+
+/// The open connections that wait for another request, the oldest first: `conns[i]` was
+/// opened for `keys[i]`.
+struct Pool {
+  keys : Vec<ConnKey>,
+  conns : Vec<Conn>,
+  // curl's number for the next new connection, for `-v`.
+  next_id : i32,
+}
+
+pub fn new_pool() -> Pool {
+  return Pool {
+    keys : Vec<ConnKey>::new(),
+    conns : Vec<Conn>::new(),
+    next_id : 0
+  };
+}
+
+impl Pool {
+  /// The number for a new connection.
+  pub fn new_id(self : &mut Pool) -> i32 {
+    let id = self.next_id;
+    self.next_id = self.next_id + 1;
+    return id;
+  }
+
+  /// Take the oldest connection for `key` out of the pool.
+  pub fn take(self : &mut Pool, key : &ConnKey) -> Option<Conn> {
+    let mut at = -1;
+    let mut i = 0;
+    while i < self.keys.len() && at < 0 {
+      if same_key(self.keys.get_ref(i), key) {
+        at = i;
+      }
+      i = i + 1;
+    }
+    if at < 0 {
+      return Option<Conn>::None();
+    }
+    return self.remove(at);
+  }
+
+  /// Keep `c`, which was opened for `key`, for a later request. When the pool is full, the
+  /// oldest connection closes.
+  pub fn keep(self : &mut Pool, key : ConnKey, c : Conn) -> void {
+    self.keys.push(key);
+    self.conns.push(c);
+    if self.keys.len() > MAX_IDLE {
+      let _oldest = self.remove(0);
+    }
+  }
+
+  /// Remove the connection at `at`, and its key. The others keep their order.
+  fn remove(self : &mut Pool, at : i32) -> Option<Conn> {
+    let mut keys = Vec<ConnKey>::new();
+    let mut conns = Vec<Conn>::new();
+    let mut taken = Option<Conn>::None();
+    // `pop` gives them from the last, so they go back in the reverse order first.
+    let mut i = self.keys.len() - 1;
+    while i >= 0 {
+      match self.keys.pop() {
+        Option<ConnKey>::Some(k) => {
+          if i != at {
+            keys.push(k);
+          }
+        },
+        Option<ConnKey>::None() => {}
+      }
+      match self.conns.pop() {
+        Option<Conn>::Some(c) => {
+          if i == at {
+            taken = Option<Conn>::Some(c);
+          } else {
+            conns.push(c);
+          }
+        },
+        Option<Conn>::None() => {}
+      }
+      i = i - 1;
+    }
+    loop {
+      match keys.pop() {
+        Option<ConnKey>::Some(k) => {
+          self.keys.push(k);
+        },
+        Option<ConnKey>::None() => {
+          break;
+        }
+      }
+    }
+    loop {
+      match conns.pop() {
+        Option<Conn>::Some(c) => {
+          self.conns.push(c);
+        },
+        Option<Conn>::None() => {
+          break;
+        }
+      }
+    }
+    return taken;
+  }
+}

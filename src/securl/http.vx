@@ -412,7 +412,13 @@ struct ResponseHead {
   has_location : bool,
   location : Vec<u8>,
   content_type : Vec<u8>,
+  // The server closes the connection after the response: HTTP/1.0 without
+  // `Connection: keep-alive`, or `Connection: close`.
   close : bool,
+  // `Proxy-Connection: keep-alive` and `Proxy-Connection: close`, which count for a response
+  // that comes through an HTTP proxy.
+  proxy_keep_alive : bool,
+  proxy_close : bool,
   // A Content-Length header held a number too large for 63 bits. libcurl then reads to the end
   // of the connection, or fails with `--max-filesize`.
   length_overflow : bool,
@@ -444,6 +450,8 @@ pub fn empty_head() -> ResponseHead {
     location : Vec<u8>::new(),
     content_type : Vec<u8>::new(),
     close : false,
+    proxy_keep_alive : false,
+    proxy_close : false,
     length_overflow : false,
     bad_length : false,
     headers : Vec<Vec<u8>>::new(),
@@ -642,8 +650,22 @@ pub fn parse_header_line(line : &Vec<u8>, index : i32, raw : bool, head : &mut R
     head.content_type = value;
     return;
   }
-  if eq_lit_nocase(&name, "Connection") && find_seq(&to_lower(&value), &lit("close"), 0) >= 0 {
-    head.close = true;
+  if eq_lit_nocase(&name, "Connection") {
+    let words = to_lower(&value);
+    if find_seq(&words, &lit("close"), 0) >= 0 {
+      head.close = true;
+    } else if head.version == 10 && find_seq(&words, &lit("keep-alive"), 0) >= 0 {
+      head.close = false;
+    }
+    return;
+  }
+  if eq_lit_nocase(&name, "Proxy-Connection") {
+    let words = to_lower(&value);
+    if find_seq(&words, &lit("close"), 0) >= 0 {
+      head.proxy_close = true;
+    } else if find_seq(&words, &lit("keep-alive"), 0) >= 0 {
+      head.proxy_keep_alive = true;
+    }
   }
 }
 

@@ -25,6 +25,7 @@ import securl::hsts;
 import securl::http;
 import securl::options;
 import securl::output;
+import securl::pool;
 import securl::socks;
 import securl::url;
 
@@ -120,10 +121,12 @@ struct TlsSettings {
   proxy : TlsConfig,
 }
 
-/// What the transfers of a run share: the cookies and the HSTS cache.
+/// What the transfers of a run share: the cookies, the HSTS cache, and the connections that
+/// stay open for a later transfer.
 struct Session {
   jar : CookieJar,
   hsts : Hsts,
+  pool : Pool,
 }
 
 /// Where the bytes of one transfer go.
@@ -261,12 +264,6 @@ fn connect_address(cfg : &Config, u : &Url) -> Result<Vec<u8>, Failure> {
   return Result<Vec<u8>, Failure>::Ok(address_of(&host, target.port));
 }
 
-/// A host and a port to connect to.
-struct Target {
-  host : Vec<u8>,
-  port : i32,
-}
-
 /// The host and port of `u`, or the ones that `--connect-to` gives for them.
 fn connect_target(cfg : &Config, u : &Url) -> Result<Target, Failure> {
   let mut host = clone_bytes(&u.host);
@@ -317,7 +314,12 @@ fn resolve_rule(cfg : &Config, name : &Vec<u8>, port : i32) -> Result<Vec<u8>, F
   let mut host = clone_bytes(name);
   for rule in cfg.resolve.iter() {
     let mut text = clone_bytes(rule);
-    if text.len() > 0 && (text.get(0) == 43u8 || text.get(0) == 45u8) {
+    if text.len() > 0 && text.get(0) == 45u8 {
+      // `-HOST:PORT` takes an entry out of libcurl's DNS cache. securl keeps no entry from one
+      // `--next` group to the next, so there is nothing to take out.
+      continue;
+    }
+    if text.len() > 0 && text.get(0) == 43u8 {
       text = rest_from(&text, 1);
     }
     let f = colon_fields(&text);
@@ -754,59 +756,33 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
   } else if !cfg.has_unix_socket {
     address = connect_address(cfg, u)?;
   }
+  let via = via_target(cfg, u)?;
+  let key = conn_key(cfg, u, &proxy, tunnel, &via);
   info.hop_start_download = info.size_download;
   info.expected_size = -1i64;
-  // The connect, the CONNECT of a proxy and the TLS handshake end at the deadline of
-  // `--connect-timeout`, or at the deadline of `-m` when it is earlier.
-  let connect_started = Instant::now();
-  let connect_deadline = earliest(deadline,
-    deadline_after(Duration::from_millis(connect_limit_ms(cfg) as u64)));
-  let mut c = connected(connect_phase(network, tls, cfg, u, &proxy, &address, secure, tunnel,
-    connect_deadline, info, console, sinks), &connect_started)?;
-  c.set_deadline(deadline);
-  if cfg.limit_rate > 0i64 {
-    c.limit_rate(cfg.limit_rate);
-  }
-  // HTTP/2 when TLS chose it with ALPN, or with `--http2-prior-knowledge` on plain TCP.
-  let use_h2 = c.is_h2() || (cfg.h2_prior_knowledge && !secure && !via_proxy);
+  let mut c = pooled_or_new(network, tls, cfg, u, &proxy, &address, secure, tunnel, &key,
+    deadline, session, info, console, sinks)?;
   let mut h2 = new_h2();
-  if use_h2 {
-    req_info.h2 = true;
-    req_info.chunked = false;
-    req_info.add_chunked_header = false;
-  }
-  let request = build_request(u, &req_info);
-  if cfg.verbose {
-    let shown = shown_request(&request, use_h2);
-    verbose_lines(console, "> ", &shown);
-  }
-  info.size_request = info.size_request + (request.len() as i64);
-  // `%{size_upload}` is the body of this request. Chunks count with their framing, as in curl.
-  info.size_upload = 0i64;
-  if use_h2 {
-    let _start = h2_start(&mut h2, &mut c)?;
-    let _sent = h2_send_request(&mut h2, &mut c, &request, &u.scheme, body, sends_body_now)?;
-    if sends_body_now {
-      info.size_upload = body.len() as i64;
+  let mut use_h2 = false;
+  let request_size = info.size_request;
+  let header_total = info.size_header_total;
+  let mut first = send_request(&mut c, &mut h2, &mut use_h2, cfg, u, secure, via_proxy,
+    &mut req_info, body, sends_body_now, chunked_upload, deadline, info, console);
+  if c.reused && connection_died(&first) && info.size_header_total == header_total {
+    // The server closed the connection while it waited in the pool. As libcurl, send the
+    // request again on a new connection.
+    if cfg.verbose {
+      verbose_info(console, &lit("Connection died, retrying a fresh connect (retry count: 1)"));
     }
-  } else {
-    let _sent = c.send(&request)?;
-    if sends_body_now {
-      if chunked_upload {
-        let chunks = chunk_encode(body);
-        let _sent_body = c.send(&chunks)?;
-        info.size_upload = chunks.len() as i64;
-      } else {
-        let _sent_body = c.send(body)?;
-        info.size_upload = body.len() as i64;
-      }
-    }
+    info.size_request = request_size;
+    c = new_conn(network, tls, cfg, u, &proxy, &address, secure, tunnel, deadline, session,
+      info, console, sinks)?;
+    h2 = new_h2();
+    first = send_request(&mut c, &mut h2, &mut use_h2, cfg, u, secure, via_proxy,
+      &mut req_info, body, sends_body_now, chunked_upload, deadline, info, console);
   }
-  info.size_request = info.size_request + info.size_upload;
-
+  let mut head = first?;
   // Skip each informational response, such as `100 Continue`. With `-i`, curl shows it.
-  let mut head = next_head(&mut c, &mut h2, use_h2, cfg.raw, cfg.tr_encoding,
-    &mut info.size_header_total)?;
   let mut set_cookies = take_cookies(&mut session.jar, &head, &cookie_host, &cookie_path,
     secure_context, 0);
   take_hsts(console, cfg, &mut session.hsts, &head, u, secure);
@@ -968,13 +944,27 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
   if failed {
     return Result<Hop, Failure>::Err(http_error(head.status));
   }
-  if cfg.verbose && !follow {
-    let mut m = lit("Connection #0 to host ");
-    append(&mut m, &host_text(u));
-    push_lit(&mut m, ":");
-    push_u64(&mut m, u.port as u64);
-    push_lit(&mut m, " left intact");
-    verbose_info(console, &m);
+  // The connection stays open for the next request when the response ended where its head
+  // said, and the server does not close the connection after it. securl keeps no HTTP/2
+  // connection yet.
+  let ended = has_no_body(head.status, req_kind) || !skip_body;
+  let keep = !use_h2 && ended && !closes_after(&head, via_proxy) && c.is_idle();
+  if cfg.verbose {
+    if keep || use_h2 {
+      let mut m = lit("Connection #");
+      push_u64(&mut m, c.id as u64);
+      push_lit(&mut m, " to host ");
+      append(&mut m, &host_text(u));
+      push_lit(&mut m, ":");
+      push_u64(&mut m, u.port as u64);
+      push_lit(&mut m, " left intact");
+      verbose_info(console, &m);
+    } else {
+      verbose_info(console, &shutting_down(&c));
+    }
+  }
+  if keep {
+    session.pool.keep(key, c);
   }
   return Result<Hop, Failure>::Ok(Hop {
     retry : retry,
@@ -1326,6 +1316,153 @@ deadline : Instant, info : &mut TransferInfo, console : &mut Console) -> Result<
   return Result<Conn, Failure>::Ok(c);
 }
 
+/// A connection for a request with `key`: an open one from the pool, or else a new one.
+fn pooled_or_new(network : &Network, tls : &TlsSettings, cfg : &Config, u : &Url, proxy : &Proxy,
+address : &Vec<u8>, secure : bool, tunnel : bool, key : &ConnKey, deadline : Instant,
+session : &mut Session, info : &mut TransferInfo, console : &mut Console, sinks : &mut Sinks)
+-> Result<Conn, Failure> {
+  loop {
+    match session.pool.take(key) {
+      Option<Conn>::Some(pooled) => {
+        let mut c = pooled;
+        if c.seems_alive() {
+          c.reused = true;
+          info.remote_address = clone_bytes(&c.remote_address);
+          if cfg.verbose {
+            verbose_info(console, &reusing(u, proxy));
+          }
+          return Result<Conn, Failure>::Ok(c);
+        }
+        if cfg.verbose {
+          let mut m = lit("Connection ");
+          push_u64(&mut m, c.id as u64);
+          push_lit(&mut m, " seems to be dead, terminating");
+          verbose_info(console, &m);
+          verbose_info(console, &shutting_down(&c));
+        }
+      },
+      Option<Conn>::None() => {
+        return new_conn(network, tls, cfg, u, proxy, address, secure, tunnel, deadline, session,
+          info, console, sinks);
+      }
+    }
+  }
+}
+
+/// Open a new connection for the request.
+fn new_conn(network : &Network, tls : &TlsSettings, cfg : &Config, u : &Url, proxy : &Proxy,
+address : &Vec<u8>, secure : bool, tunnel : bool, deadline : Instant, session : &mut Session,
+info : &mut TransferInfo, console : &mut Console, sinks : &mut Sinks) -> Result<Conn, Failure> {
+  // The connect, the CONNECT of a proxy and the TLS handshake end at the deadline of
+  // `--connect-timeout`, or at the deadline of `-m` when it is earlier.
+  let started = Instant::now();
+  let connect_deadline = earliest(deadline,
+    deadline_after(Duration::from_millis(connect_limit_ms(cfg) as u64)));
+  let mut c = connected(connect_phase(network, tls, cfg, u, proxy, address, secure, tunnel,
+    connect_deadline, info, console, sinks), &started)?;
+  c.id = session.pool.new_id();
+  c.remote_address = clone_bytes(&info.remote_address);
+  return Result<Conn, Failure>::Ok(c);
+}
+
+/// curl's line for `-v` when it reuses a connection.
+fn reusing(u : &Url, proxy : &Proxy) -> Vec<u8> {
+  let mut m = lit("Reusing existing ");
+  append(&mut m, &u.scheme);
+  push_lit(&mut m, ": connection with ");
+  if proxy.used {
+    push_lit(&mut m, "proxy ");
+    append(&mut m, &proxy.url.host);
+  } else {
+    push_lit(&mut m, "host ");
+    append(&mut m, &u.host);
+  }
+  return m;
+}
+
+/// curl's line for `-v` when a connection closes.
+fn shutting_down(c : &Conn) -> Vec<u8> {
+  let mut m = lit("shutting down connection #");
+  push_u64(&mut m, c.id as u64);
+  return m;
+}
+
+/// Send the request of `req_info` on `c`, with its body when `sends_body_now`, and read the
+/// head of the first response. `use_h2` becomes whether the request went with HTTP/2.
+fn send_request(c : &mut Conn, h2 : &mut H2, use_h2 : &mut bool, cfg : &Config, u : &Url,
+secure : bool, via_proxy : bool, req_info : &mut RequestInfo, body : &Vec<u8>,
+sends_body_now : bool, chunked_upload : bool, deadline : Instant, info : &mut TransferInfo,
+console : &mut Console) -> Result<ResponseHead, Failure> {
+  c.set_deadline(deadline);
+  c.renew();
+  if cfg.limit_rate > 0i64 {
+    c.limit_rate(cfg.limit_rate);
+  }
+  // HTTP/2 when TLS chose it with ALPN, or with `--http2-prior-knowledge` on plain TCP.
+  *use_h2 = c.is_h2() || (cfg.h2_prior_knowledge && !secure && !via_proxy);
+  if *use_h2 {
+    req_info.h2 = true;
+    req_info.chunked = false;
+    req_info.add_chunked_header = false;
+  }
+  let request = build_request(u, req_info);
+  if cfg.verbose {
+    let shown = shown_request(&request, *use_h2);
+    verbose_lines(console, "> ", &shown);
+  }
+  info.size_request = info.size_request + (request.len() as i64);
+  // `%{size_upload}` is the body of this request. Chunks count with their framing, as in curl.
+  info.size_upload = 0i64;
+  if *use_h2 {
+    let _start = h2_start(h2, c)?;
+    let _sent = h2_send_request(h2, c, &request, &u.scheme, body, sends_body_now)?;
+    if sends_body_now {
+      info.size_upload = body.len() as i64;
+    }
+  } else {
+    let _sent = c.send(&request)?;
+    if sends_body_now {
+      if chunked_upload {
+        let chunks = chunk_encode(body);
+        let _sent_body = c.send(&chunks)?;
+        info.size_upload = chunks.len() as i64;
+      } else {
+        let _sent_body = c.send(body)?;
+        info.size_upload = body.len() as i64;
+      }
+    }
+  }
+  info.size_request = info.size_request + info.size_upload;
+  return next_head(c, h2, *use_h2, cfg.raw, cfg.tr_encoding, &mut info.size_header_total);
+}
+
+/// Whether a request on a reused connection failed as when the server closed the connection
+/// before the request: libcurl then sends the request again on a new connection.
+fn connection_died(r : &Result<ResponseHead, Failure>) -> bool {
+  match r {
+    Result<ResponseHead, Failure>::Ok(_head) => {
+      return false;
+    },
+    Result<ResponseHead, Failure>::Err(f) => {
+      return f.code == GOT_NOTHING || f.code == SEND_ERROR || f.code == RECV_ERROR;
+    }
+  }
+}
+
+/// Whether the server closes the connection after the response `head`, as libcurl reads it:
+/// HTTP/1.0 closes unless `Connection: keep-alive` says otherwise, and HTTP/1.1 closes after
+/// `Connection: close`. A response through an HTTP proxy can say the same with
+/// `Proxy-Connection`.
+fn closes_after(head : &ResponseHead, via_proxy : bool) -> bool {
+  if via_proxy && head.version == 10 && head.proxy_keep_alive {
+    return false;
+  }
+  if via_proxy && head.version == 11 && head.proxy_close {
+    return true;
+  }
+  return head.close;
+}
+
 /// The result of `connect_phase`, with curl's message for a timeout in it.
 fn connected(opened : Result<Conn, Failure>, started : &Instant) -> Result<Conn, Failure> {
   match opened {
@@ -1383,21 +1520,6 @@ fn http_error(status : i32) -> Failure {
   let mut m = lit("The requested URL returned error: ");
   push_u64(&mut m, status as u64);
   return fail_with(HTTP_RETURNED_ERROR, m);
-}
-
-/// The HTTP proxy of a request, from `-x`.
-struct Proxy {
-  used : bool,
-  // PROXY_HTTP, PROXY_HTTPS, or a kind of SOCKS proxy (securl::socks).
-  kind : i32,
-  // The proxy as a URL: its host and port are where curl connects.
-  url : Url,
-  has_credentials : bool,
-  user : Vec<u8>,
-  password : Vec<u8>,
-  // The Unix-domain socket of a SOCKS proxy given as `socks5h://localhost/PATH`, as in curl,
-  // or empty for a proxy on TCP.
-  unix_path : Vec<u8>,
 }
 
 /// Whether `--noproxy` names `host`: `*`, the host itself, or a domain that it ends with.

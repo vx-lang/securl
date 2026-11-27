@@ -31,6 +31,7 @@ import securl::hsts;
 import securl::http;
 import securl::options;
 import securl::output;
+import securl::pool;
 import securl::fetch;
 import securl::url;
 import securl::writeout;
@@ -731,7 +732,8 @@ groups : &Vec<Config>) -> i32 {
   }
   let mut session = Session {
     jar : new_jar(false),
-    hsts : new_hsts(false)
+    hsts : new_hsts(false),
+    pool : new_pool()
   };
   let mut code = 0;
   for cfg in groups.iter() {

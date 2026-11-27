@@ -144,6 +144,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if getattr(self, "die_next", False):
+            # /die-next came before on this connection: close it with no response.
+            self.close_connection = True
+            return
         if self.path == "/te-gzip":
             # gzip as a transfer coding, in chunks.
             self.send_response(200)
@@ -275,6 +279,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"0123456789")
             self.wfile.flush()
             time.sleep(10)
+        elif self.path == "/to-host":
+            # A redirect to /host on the same server.
+            self.send_response(302)
+            self.send_header("Location", "/host")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path == "/linger":
+            # The connection stays open, until it is idle for 0.3 seconds.
+            self.send_body(b"linger\n")
+            self.connection.settimeout(0.3)
+        elif self.path == "/die-next":
+            # The connection stays open, but the next request on it gets no response.
+            self.send_body(b"die next\n")
+            self.die_next = True
         elif self.path == "/to-https":
             https_port = self.server.https_port
             self.send_response(302)

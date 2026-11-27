@@ -63,9 +63,9 @@ Vx main 95a733384.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 547 of 762 (71%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 490 of 569 (86%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 253 of 253 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 556 of 762 (72%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 499 of 569 (87%) |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 270 of 270 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 12 of 12 |
 
@@ -84,7 +84,7 @@ program of the curl build, linked with curl's own libcurl, so they never run sec
 the counts above included them by mistake: 152 of them passed, and the table said 522 of 874.
 Test 1070 depends on timing: the test server closes the connection while securl sends the
 body. It passes in some runs, between one in four and one in twelve, with and without recent
-changes. In the runs of the table above, it passed in the first and failed in the second. Test 1849 (two HTTPS transfers through a
+changes. It failed in both runs of the table above. Test 1849 (two HTTPS transfers through a
 proxy) fails in about one run in three, and did so before the latest changes too: the log of the
 test server sometimes lacks the second request. It passed in that run too.
 
@@ -95,10 +95,10 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 16,323 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 1,517 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 16,835 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 1,519 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 14 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
-| `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,354 | 48 `extern` functions, 90 `unsafe` blocks |
+| `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,355 | 48 `extern` functions, 90 `unsafe` blocks |
 
 Of the trusted code in `src/sys/`, 130 of the 138 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
@@ -199,6 +199,32 @@ curl's own HTTP/2 tests run through `nghttpx` (see "Run curl's test suite"). `te
 more of the protocol against a server built on the `h2` package of python-hyper, an independent
 implementation. securl also fetches real sites over HTTP/2, such as Cloudflare's 1.3 MB home
 page.
+
+## Connection reuse
+
+A connection stays open after a response that ended where its head said, unless the server
+closes it (`Connection: close`, or HTTP/1.0 without `Connection: keep-alive`). A later request
+for the same place uses it, as in curl: the next request of an authentication or a redirect,
+the next URL, and the transfers of later `--next` groups. At most 5 wait, as in libcurl. Before
+securl uses one, it checks that the server has not closed it in the meantime, and when a request
+on a reused connection gets no response at all, securl sends it again on a new connection, as
+curl does. With `-v`, the messages are curl's.
+
+`src/securl/pool.vx` decides which connection a request may use. Each setting that matters is
+a field of one type, `ConnKey`: the scheme, the host and the port, the place of `--connect-to`,
+`--unix-socket`, the proxy with its kind and its credentials, the CONNECT tunnel,
+`--http2-prior-knowledge`, and the TLS settings for the server and for an HTTPS proxy (the
+check of the certificate, the certificate authorities, and the client certificate). A
+request uses a connection only when its whole key is the same as the key of the connection. A
+request that an HTTP proxy forwards has no host in its key, so it uses the connection to the
+proxy for any server, as in curl (test 1421). Left out, as in libcurl, are `-u`, whose Basic and
+Digest credentials go with each request, and `--resolve`, which only says where a new
+connection goes. `ConnKey` has an invariant, so only `pool.vx` can make one. A new setting
+then goes into `conn_key` or stays out of it in one place that a reviewer sees, where libcurl
+compares its settings in many functions. libcurl published 16 advisories in 2026 about a
+connection that was reused although such a setting differed.
+
+HTTP/2 connections do not stay open yet.
 
 ## Compression
 
@@ -435,8 +461,8 @@ time variables yet.
 
 In order of how much users need them:
 
-1. Connection reuse (and with it, HTTP/2 multiplexing), the
-   `Upgrade: h2c` of `--http2` on plain HTTP, and HTTP/2 through an HTTP proxy.
+1. Reuse of HTTP/2 connections (and with it, multiplexing), the `Upgrade: h2c` of `--http2`
+   on plain HTTP, and HTTP/2 through an HTTP proxy.
 1. URL globbing (`{a,b}` and `[1-9]`), `--variable`, `--no-clobber`, `-R`, resume of a
    retry (`--retry` with `-C -`),
    `--netrc`, a default `.curlrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
@@ -523,6 +549,7 @@ src/securl/          the protocol code; no trusted code
   http.vx              the request bytes, in libcurl's header order; the response head
   fetch.vx             one transfer: connect, TLS, send, read, redirects, proxies
   conn.vx              a connection with a read buffer; needs `&Network`
+  pool.vx              the connections that stay open, and the key that decides reuse
   body.vx encode.vx    request bodies, Base64, URL encoding
   output.vx            standard output or a file that main opened
   decoder.vx           the decoders of --compressed: inflate.vx, brotli.vx, zstd.vx

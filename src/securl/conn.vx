@@ -30,6 +30,12 @@ struct Conn {
   // `--limit-rate`, for the bytes that arrive and for those that go.
   recv_limit : RateLimit,
   send_limit : RateLimit,
+  // curl's number of the connection, for `-v`.
+  id : i32,
+  // The address and port of the peer, for `%{remote_ip}` and `%{remote_port}`.
+  remote_address : Vec<u8>,
+  // An earlier request used the connection, which then waited in the pool (securl::pool).
+  reused : bool,
 }
 
 /// A limit of bytes per second for one direction of a connection.
@@ -237,30 +243,79 @@ fn unix_connect_by(network : &Network, path : &String, deadline : Instant)
 
 /// A connection over `net`, whose waits give up at `deadline`, with an empty read buffer.
 fn conn_of(net : NetStream, deadline : Instant) -> Conn {
+  let mut stream = net;
+  stream.set_deadline(deadline);
+  return Conn {
+    stream : stream,
+    buffer : full_buffer(),
+    start : 0,
+    end : 0,
+    closed : false,
+    deadline : deadline,
+    recv_limit : no_limit(),
+    send_limit : no_limit(),
+    id : 0,
+    remote_address : Vec<u8>::new(),
+    reused : false
+  };
+}
+
+/// A read buffer of the full size.
+fn full_buffer() -> Vec<u8> {
   let mut buffer = Vec<u8>::new();
   let mut i = 0;
   while i < READ_BUFFER_SIZE {
     buffer.push(0u8);
     i = i + 1;
   }
-  let mut stream = net;
-  stream.set_deadline(deadline);
-  return Conn {
-    stream : stream,
-    buffer : buffer,
-    start : 0,
-    end : 0,
-    closed : false,
-    deadline : deadline,
-    recv_limit : no_limit(),
-    send_limit : no_limit()
-  };
+  return buffer;
 }
 
 impl Conn {
   /// Whether TLS chose HTTP/2 for the connection.
   pub fn is_h2(self : &Conn) -> bool {
     return self.stream.is_h2();
+  }
+
+  /// Whether the connection can carry another request: the peer did not close it, and no byte
+  /// of the last response is left in the buffer.
+  pub fn is_idle(self : &Conn) -> bool {
+    return !self.closed && self.start == self.end;
+  }
+
+  /// Whether a connection that waited in the pool is still open, as libcurl checks before it
+  /// reuses one: the peer neither closed it nor sent anything. It waits at most a millisecond.
+  pub fn seems_alive(self : &mut Conn) -> bool {
+    if !self.is_idle() {
+      return false;
+    }
+    self.stream.set_deadline(deadline_after(Duration::from_millis(1u64)));
+    let mut alive = false;
+    match self.stream.read(&mut self.buffer) {
+      Result<u64, TlsError>::Ok(_n) => {
+        // The end of the connection, or bytes that no request asked for.
+        self.closed = true;
+      },
+      Result<u64, TlsError>::Err(e) => {
+        // Nothing arrived in the time.
+        alive = e.code == OPERATION_TIMEDOUT;
+      }
+    }
+    self.stream.set_deadline(self.deadline);
+    return alive;
+  }
+
+  /// Make a connection from the pool ready for the next transfer: no `--limit-rate` until
+  /// `limit_rate` sets one, and a read buffer of the full size.
+  pub fn renew(self : &mut Conn) -> void {
+    assert(self.start == self.end, "renew with bytes in the read buffer");
+    self.recv_limit = no_limit();
+    self.send_limit = no_limit();
+    if self.buffer.len() < READ_BUFFER_SIZE {
+      self.buffer = full_buffer();
+      self.start = 0;
+      self.end = 0;
+    }
   }
 
   /// Make each wait of the connection from now on give up at `at`.
