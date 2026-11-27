@@ -63,8 +63,8 @@ Vx main 12f3786c8.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 451 of 757 (59%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 405 of 477 (84%) |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 476 of 757 (62%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 427 of 513 (83%) |
 | TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 188 of 188 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 12 of 12 |
@@ -91,8 +91,8 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 14,978 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 964 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 15,445 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 1,124 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 13 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,451 | 52 `extern` functions, 100 `unsafe` blocks |
 
@@ -244,8 +244,7 @@ curl 8.23 does, with tests 4271 and 4272, and securl does as 8.23.
 
 As in libcurl, `%{size_download}` counts a piece of the body only once the decoders and the
 output took it, so a piece that does not decode does not count. Test 4272 checks a cut gzip
-body and a cut zstd body, but its second transfer needs `--next`, which securl does not have
-yet, so it now fails where it passed while securl had no zstd.
+body and a cut zstd body, in two groups of `--next`.
 
 ## Authentication
 
@@ -317,9 +316,20 @@ missing options that block the most tests.
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
 `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
 `--connect-timeout` `--compressed` `--tr-encoding` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay`
-`--limit-rate` `--max-filesize` `--remove-on-error` `-h`
+`--limit-rate` `--max-filesize` `--remove-on-error` `--next` (`-:`) `-K` (`--config`) `-h`
 `-V`, and the options that runtests.pl adds: `-q` `--trace-ascii` `--trace-time`. As in curl,
-a long option may take its value in the same word, as `--max-time=2`.
+a long option may take its value in the same word, as `--max-time=2`, and `--` ends the
+options.
+
+`--next` starts a new group of options and URLs. As in curl, `-v`, `-s`, `-S` and the trace
+options hold for every group wherever they come, the groups share the cookies and the HSTS
+cache, and the exit code is the one of the last transfer (an error of the command line, exit
+2, stops the rest). `-K FILE` (or `-` for standard input) reads options from a config file
+with curl's syntax: one option on a line, with or without dashes, `=` or `:` or blanks before
+the value, double quotes with backslash escapes, `#` comments, `next` lines, and up to five
+files deep. The tool reads the file with its file right and hands each line to the parser of
+the command line, which cannot open a file. Errors and warnings name the file and the line as
+curl does, and wrap at the width of the terminal.
 
 As libcurl does, each connection sets TCP_NODELAY and TCP keepalive: the first probe after 60
 seconds with no traffic, then one each 60 seconds, and 9 probes with no answer drop the
@@ -372,8 +382,8 @@ In order of how much users need them:
 1. Connection reuse (and with it, HTTP/2 multiplexing),
    `--unix-socket`, the
    `Upgrade: h2c` of `--http2` on plain HTTP, and HTTP/2 through an HTTP proxy.
-1. URL globbing (`{a,b}` and `[1-9]`), `--next`, `-J`, `-C` resume, `-K` config files,
-   `--netrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
+1. URL globbing (`{a,b}` and `[1-9]`), `-J`, `-C` resume, `--retry`, `--variable`,
+   `--netrc`, a default `.curlrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
    encoders, `--preproxy`, SOCKS5 with GSS-API, `--proxy-http2` and client certificates for an
    HTTPS proxy, Digest with the proxy of a
    CONNECT tunnel, and client certificates in PKCS#12 files or from engines and providers.
@@ -414,6 +424,9 @@ The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #
   securl has no `--unix-socket` yet.
 - [#4132](https://github.com/vx-lang/Vx/issues/4132) `std::fs` cannot remove a file, tell its
   kind, or give the right to open one file later.
+- [#4142](https://github.com/vx-lang/Vx/issues/4142) A `return` from inside an `if` that moves a
+  field out of a local, such as `return step.file;`, frees that field twice. The new parser of
+  `-K` hit it, and copies the field instead. Vx PR #4149 fixes it.
 
 ## License
 

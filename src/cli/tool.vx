@@ -119,20 +119,11 @@ pub fn tool_main(root : Root, command_line : Vec<String>) -> i32 {
   };
   let mut stdin = root.stdin;
   let args = words_of(&command_line);
-  match parse_args(&args) {
-    Result<Config, Failure>::Ok(parsed) => {
-      let mut cfg = parsed;
-      cfg.proxy_env = proxy_env(&root.env);
-      cfg.columns = columns_of(&root.env);
-      // As curl does while it reads the command line: a `--cacert` or `--proxy-cacert` file
-      // must exist.
-      if !file_given_exists(&mut console, &root.files, &cfg.cacert, "cacert")
-         || !file_given_exists(&mut console, &root.files, &cfg.proxy_cacert, "proxy-cacert") {
-        return FAILED_INIT;
-      }
-      return run(&root.network, &root.files, &mut stdin, &mut console, &cfg);
-    },
-    Result<Config, Failure>::Err(f) => {
+  let columns = columns_of(&root.env);
+  let mut parser = new_arg_parser();
+  match read_command_line(&mut parser, &args, &root.files, &mut stdin, &mut console, columns) {
+    Result<i32, Failure>::Ok(_n) => {},
+    Result<i32, Failure>::Err(f) => {
       let mut m = lit("curl: ");
       append(&mut m, &f.message);
       push_lit(&mut m, "\ncurl: try 'curl --help' for more information\n");
@@ -140,6 +131,153 @@ pub fn tool_main(root : Root, command_line : Vec<String>) -> i32 {
       return f.code;
     }
   }
+  let mut groups = parser.finish();
+  let env_vars = proxy_env(&root.env);
+  for cfg in groups.iter_mut() {
+    cfg.proxy_env = clone_env(&env_vars);
+    cfg.columns = columns;
+  }
+  // As curl does while it reads the command line: a `--cacert` or `--proxy-cacert` file must
+  // exist.
+  for cfg in groups.iter() {
+    if !cfg.show_help && !cfg.show_version
+       && (!file_given_exists(&mut console, &root.files, &cfg.cacert, "cacert")
+         || !file_given_exists(&mut console, &root.files, &cfg.proxy_cacert, "proxy-cacert")) {
+      return FAILED_INIT;
+    }
+  }
+  return run(&root.network, &root.files, &mut stdin, &mut console, &groups);
+}
+
+fn clone_env(vars : &Vec<EnvVar>) -> Vec<EnvVar> {
+  let mut out = Vec<EnvVar>::new();
+  for v in vars.iter() {
+    out.push(EnvVar {
+      name : clone_bytes(&v.name),
+      value : clone_bytes(&v.value)
+    });
+  }
+  return out;
+}
+
+// How deep config files of `-K` may name more config files: curl's CONFIG_MAX_LEVELS.
+const CONFIG_MAX_LEVELS : i32 = 5;
+
+/// Read the command line into `parser`, with the config file of each `-K`, which the tool
+/// reads with its file right. The parser itself cannot open a file.
+fn read_command_line(parser : &mut ArgParser, args : &Vec<Vec<u8>>, files : &Files,
+stdin : &mut Stdin, console : &mut Console, columns : i32) -> Result<i32, Failure> {
+  let mut at = 0;
+  loop {
+    let read = parser.words(args, at);
+    print_warnings(console, parser, columns);
+    let stop = read?;
+    if stop.has_config {
+      match read_config(parser, &stop.config_file, files, stdin, console, columns,
+        CONFIG_MAX_LEVELS - 1) {
+        Result<i32, ConfigError>::Ok(_n) => {},
+        Result<i32, ConfigError>::Err(e) => {
+          let mut m = lit("option ");
+          append(&mut m, &stop.config_option);
+          push_lit(&mut m, ": ");
+          append(&mut m, &e.reason);
+          return Result<i32, Failure>::Err(fail_with(e.code, m));
+        }
+      }
+    }
+    if stop.finished {
+      return Result<i32, Failure>::Ok(0);
+    }
+    at = stop.at;
+  }
+}
+
+/// Print the warnings of the parser so far.
+fn print_warnings(console : &mut Console, parser : &mut ArgParser, columns : i32) -> void {
+  for w in parser.take_warnings().iter() {
+    console.to_stderr(&message_lines("Warning: ", w, columns));
+  }
+}
+
+/// An error line of curl's `errorf`: wrapped at the width of the terminal, and silent with `-s`
+/// unless `-S` is given too.
+fn error_line(console : &mut Console, parser : &ArgParser, text : &Vec<u8>, columns : i32) -> void {
+  if parser.errors_shown() {
+    console.to_stderr(&message_lines("curl: ", text, columns));
+  }
+}
+
+/// Read the config file `name` of `-K` (`-` for standard input) into `parser`, as curl's
+/// `parseconfig`. `levels` is how many more files deep it may go. On an error, it prints curl's
+/// line about it, and gives the reason for the option that read the file.
+fn read_config(parser : &mut ArgParser, name : &Vec<u8>, files : &Files, stdin : &mut Stdin,
+console : &mut Console, columns : i32, levels : i32) -> Result<i32, ConfigError> {
+  let mut shown = clone_bytes(name);
+  if eq_lit(name, "-") {
+    shown = lit("<stdin>");
+  }
+  let mut text = Vec<u8>::new();
+  match read_file(files, stdin, name) {
+    Result<Vec<u8>, Failure>::Ok(bytes) => {
+      text = bytes;
+    },
+    Result<Vec<u8>, Failure>::Err(_f) => {
+      error_line(console, parser, &lit_then("cannot read config from '", &lit_then_lit(&shown, "'")),
+        columns);
+      return Result<i32, ConfigError>::Err(ConfigError {
+        text : Vec<u8>::new(),
+        reason : lit("error encountered when reading a file"),
+        code : READ_ERROR
+      });
+    }
+  }
+  let lines = config_lines(&text, &shown);
+  for line in lines.iter() {
+    if line.warning.len() > 0 && !parser.silent_now() {
+      console.to_stderr(&message_lines("Warning: ", &line.warning, columns));
+    }
+    let result = parser.config_line(line, &shown);
+    print_warnings(console, parser, columns);
+    match result {
+      Result<Step, ConfigError>::Ok(step) => {
+        if step.has_config {
+          let mut nested = Result<i32, ConfigError>::Ok(0);
+          if levels - 1 < 0 {
+            error_line(console, parser, &lit("Max config file recursion level reached (5)"), columns);
+            nested = Result<i32, ConfigError>::Err(ConfigError {
+              text : Vec<u8>::new(),
+              reason : lit("is badly used here"),
+              code : FAILED_INIT
+            });
+          } else {
+            nested = read_config(parser, &step.config_file, files, stdin, console, columns,
+              levels - 1);
+          }
+          match nested {
+            Result<i32, ConfigError>::Ok(_n) => {},
+            Result<i32, ConfigError>::Err(inner) => {
+              let outer = config_error(&shown, line.lineno, &line.option, &inner.reason,
+                &inner.reason, inner.code);
+              error_line(console, parser, &outer.text, columns);
+              return Result<i32, ConfigError>::Err(outer);
+            }
+          }
+        }
+      },
+      Result<Step, ConfigError>::Err(e) => {
+        error_line(console, parser, &e.text, columns);
+        return Result<i32, ConfigError>::Err(e);
+      }
+    }
+  }
+  return Result<i32, ConfigError>::Ok(0);
+}
+
+/// `a` and then the string literal `s`.
+fn lit_then_lit(a : &Vec<u8>, s : *const i8) -> Vec<u8> {
+  let mut out = clone_bytes(a);
+  push_lit(&mut out, s);
+  return out;
 }
 
 /// Print `curl: (code) message` unless `-s` asks for silence and `-S` does not bring errors
@@ -361,25 +499,49 @@ fn upload_url(url_text : &Vec<u8>, file_name : &Vec<u8>) -> Vec<u8> {
 }
 
 /// Run every transfer of the command line, and give the exit code.
-fn run(network : &Network, files : &Files, stdin : &mut Stdin, console : &mut Console, cfg : &Config)
--> i32 {
-  if cfg.show_help {
+/// Run the groups of the command line, one after the other, and give the exit code of the last
+/// transfer, as curl does. The cookies and the HSTS cache go on from one group to the next, as
+/// curl shares them.
+fn run(network : &Network, files : &Files, stdin : &mut Stdin, console : &mut Console,
+groups : &Vec<Config>) -> i32 {
+  let first = groups.get_ref(0);
+  if first.show_help {
     print_help(console);
     return 0;
   }
-  if cfg.show_version {
+  if first.show_version {
     print_version(console);
     return 0;
   }
+  // curl checks the request method of each group while it reads the command line.
+  for cfg in groups.iter() {
+    if cfg.head && ((cfg.data.len() > 0 && !cfg.get_data) || cfg.has_upload) {
+      let mut m = lit("curl: You can only select one HTTP request method! You asked for both POST\n");
+      push_lit(&mut m, "curl: (-d, --data) and HEAD (-I, --head).\n");
+      push_lit(&mut m, "curl: try 'curl --help' for more information\n");
+      console.to_stderr(&m);
+      return FAILED_INIT;
+    }
+  }
+  let mut session = Session {
+    jar : new_jar(false),
+    hsts : new_hsts(false)
+  };
+  let mut code = 0;
+  for cfg in groups.iter() {
+    code = run_group(network, files, stdin, console, cfg, &mut session);
+    if code == FAILED_INIT {
+      break;
+    }
+  }
+  return code;
+}
+
+/// Run the transfers of one group of the command line, and give the exit code of the last one.
+fn run_group(network : &Network, files : &Files, stdin : &mut Stdin, console : &mut Console,
+cfg : &Config, session : &mut Session) -> i32 {
   if cfg.urls.len() == 0 {
     console.to_stderr(&lit("curl: (2) no URL specified\ncurl: try 'curl --help' for more information\n"));
-    return FAILED_INIT;
-  }
-  if cfg.head && ((cfg.data.len() > 0 && !cfg.get_data) || cfg.has_upload) {
-    let mut m = lit("curl: You can only select one HTTP request method! You asked for both POST\n");
-    push_lit(&mut m, "curl: (-d, --data) and HEAD (-I, --head).\n");
-    push_lit(&mut m, "curl: try 'curl --help' for more information\n");
-    console.to_stderr(&m);
     return FAILED_INIT;
   }
 
@@ -503,39 +665,35 @@ fn run(network : &Network, files : &Files, stdin : &mut Stdin, console : &mut Co
     }
   }
 
-  // The cookie engine runs when `-b` names a file or `-c` a jar. `main` reads the files with
-  // its file right, and the transfers get the jar without that right.
-  let mut jar = new_jar(cfg.cookie_files.len() > 0 || cfg.has_cookie_jar);
+  // The cookie engine runs for this group when `-b` names a file or `-c` a jar. `main` reads
+  // the files with its file right, and the transfers get the jar without that right.
+  session.jar.enabled = cfg.cookie_files.len() > 0 || cfg.has_cookie_jar;
   for name in cfg.cookie_files.iter() {
     match read_file(files, stdin, name) {
       Result<Vec<u8>, Failure>::Ok(text) => {
-        load_cookie_text(&mut jar, &text, cfg.junk_session_cookies);
+        load_cookie_text(&mut session.jar, &text, cfg.junk_session_cookies);
       },
       Result<Vec<u8>, Failure>::Err(_f) => {
         // libcurl ignores a cookie file that it cannot read.
       }
     }
   }
-  start_jar(&mut jar);
+  start_jar(&mut session.jar);
 
   // The HSTS cache of `--hsts`, which `main` reads and writes with its file right too. libcurl
   // skips a file that it cannot read.
   // A line that is too long fails the first transfer. libcurl reads the file again before
   // each transfer, and by then the first one saved it without that line.
-  let mut hsts = new_hsts(cfg.has_hsts);
+  session.hsts.enabled = cfg.has_hsts;
   let mut hsts_too_long = false;
   if cfg.hsts.len() > 0 {
     match read_path(files, &cfg.hsts) {
       Result<Vec<u8>, Failure>::Ok(text) => {
-        hsts_too_long = !load_hsts_text(&mut hsts, &text);
+        hsts_too_long = !load_hsts_text(&mut session.hsts, &text);
       },
       Result<Vec<u8>, Failure>::Err(_f) => {}
     }
   }
-  let mut session = Session {
-    jar : jar,
-    hsts : hsts
-  };
 
   // The TLS settings read the certificate authorities from files, so `main` makes them with its
   // file right. The transfers get them without that right.
@@ -568,7 +726,7 @@ fn run(network : &Network, files : &Files, stdin : &mut Stdin, console : &mut Co
             proxy : p
           };
           let code = run_all(network, files, console, &settings, cfg, &headers, &request_body,
-            &upload_body, kind, other_kind, &form_boundary, &mut session, hsts_too_long);
+            &upload_body, kind, other_kind, &form_boundary, session, hsts_too_long);
           save_jar(console, files, cfg, &mut session.jar);
           save_hsts(files, cfg, &session.hsts);
           return code;
@@ -665,7 +823,7 @@ fn effective_url(text : &Vec<u8>, path_as_is : bool) -> Vec<u8> {
   }
 }
 
-/// Run the transfer of each URL, and give the exit code of the last one that failed.
+/// Run the transfer of each URL, and give the exit code of the last one.
 fn run_all(network : &Network, files : &Files, console : &mut Console, tls : &TlsSettings, cfg : &Config,
 headers : &Vec<Vec<u8>>, request_body : &Vec<u8>, upload_body : &Vec<u8>, kind : i32,
 other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first : bool) -> i32 {
@@ -731,8 +889,10 @@ other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first :
       }
       write_pieces(console, files, &pieces);
     }
-    if code != 0 {
-      exit_code = code;
+    // As curl: the exit code is the one of the last transfer, and a fatal error stops the rest.
+    exit_code = code;
+    if code == FAILED_INIT {
+      return exit_code;
     }
     i = i + 1;
   }

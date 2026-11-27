@@ -3,6 +3,7 @@
 // This file needs no right at all: it reads only the argument bytes. Options that name a file,
 // such as `-d @file` or `-o file`, keep the name here. `main` opens the file, because only
 // `main` has the right to open files.
+import core::mem;
 import core::option;
 import core::result;
 import std::vec;
@@ -367,6 +368,9 @@ const OPT_PROXY_CAPATH : i32 = 90;
 const OPT_REMOVE_ON_ERROR : i32 = 91;
 const OPT_LIMIT_RATE : i32 = 92;
 const OPT_MAX_FILESIZE : i32 = 93;
+// `--next` and `-K`, which the parser handles itself.
+const OPT_NEXT : i32 = 94;
+const OPT_CONFIG : i32 = 95;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -467,6 +471,8 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "remove-on-error") { return OPT_REMOVE_ON_ERROR; }
   if eq_lit(name, "limit-rate") { return OPT_LIMIT_RATE; }
   if eq_lit(name, "max-filesize") { return OPT_MAX_FILESIZE; }
+  if eq_lit(name, "next") { return OPT_NEXT; }
+  if eq_lit(name, "config") { return OPT_CONFIG; }
   return OPT_UNKNOWN;
 }
 
@@ -499,6 +505,8 @@ fn short_option(letter : u8) -> i32 {
   if letter == 76u8 { return OPT_LOCATION; }        // L
   if letter == 79u8 { return OPT_REMOTE_NAME; }     // O
   if letter == 113u8 { return OPT_DISABLE; }        // q
+  if letter == 58u8 { return OPT_NEXT; }            // :
+  if letter == 75u8 { return OPT_CONFIG; }          // K
   if letter == 115u8 { return OPT_SILENT; }         // s
   if letter == 83u8 { return OPT_SHOW_ERROR; }      // S
   if letter == 118u8 { return OPT_VERBOSE; }        // v
@@ -518,7 +526,7 @@ fn takes_value(id : i32) -> bool {
     || id == OPT_FORM || id == OPT_FORM_STRING || id == OPT_COOKIE_JAR
     || id == OPT_KEEPALIVE_TIME || id == OPT_KEEPALIVE_CNT
     || (id >= OPT_SOCKS4 && id <= OPT_PASS) || id == OPT_HSTS || id == OPT_PROXY_CACERT
-    || id == OPT_PROXY_CAPATH || id == OPT_LIMIT_RATE || id == OPT_MAX_FILESIZE;
+    || id == OPT_PROXY_CAPATH || id == OPT_LIMIT_RATE || id == OPT_MAX_FILESIZE || id == OPT_CONFIG;
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -1204,22 +1212,171 @@ fn toggle_bit(bits : i32, bit : i32, enable : bool) -> i32 {
   return bits & (AUTH_ANY - bit);
 }
 
-/// Parse the command-line arguments, without the program name, into a `Config`.
-pub fn parse_args(args : &Vec<Vec<u8>>) -> Result<Config, Failure> {
-  let mut cfg = default_config();
-  let mut i = 0;
-  while i < args.len() {
-    let arg = args.get_ref(i);
-    let is_option = arg.len() > 1 && arg.get(0) == 45u8;
-    if !is_option {
-      cfg.urls.push(clone_bytes(arg));
-      i = i + 1;
-      continue;
+// Options of curl that hold for all transfers, whichever `--next` group gives them: curl keeps
+// them in its GlobalConfig. The last one given counts.
+struct Globals {
+  silent : bool,
+  show_error : bool,
+  verbose : bool,
+  has_trace : bool,
+  trace : Vec<u8>,
+}
+
+/// What an option asks of the caller besides the change to the configuration.
+struct Step {
+  // The option took the next word as its value.
+  used_next : bool,
+  // `--next`: the options that come after it make a new group.
+  next_group : bool,
+  // `-K FILE`: the caller reads FILE and gives its lines to `config_line`.
+  has_config : bool,
+  config_file : Vec<u8>,
+  // `-h` or `-V`: curl stops reading the command line and shows the help or the version.
+  stop : bool,
+}
+
+/// Reads a command line, and the config files of `-K`, into the groups of `--next`.
+struct ArgParser {
+  groups : Vec<Config>,
+  current : Config,
+  globals : Globals,
+  // After `--`, every word is a URL.
+  still_flags : bool,
+  show_help : bool,
+  show_version : bool,
+  // Warnings of curl about the options so far, for the caller to print.
+  warnings : Vec<Vec<u8>>,
+}
+
+/// A parser with one group of the defaults of curl.
+pub fn new_arg_parser() -> ArgParser {
+  return ArgParser {
+    groups : Vec<Config>::new(),
+    current : default_config(),
+    globals : Globals {
+      silent : false,
+      show_error : false,
+      verbose : false,
+      has_trace : false,
+      trace : Vec<u8>::new()
+    },
+    still_flags : true,
+    show_help : false,
+    show_version : false,
+    warnings : Vec<Vec<u8>>::new()
+  };
+}
+
+/// Where the reading of the command line stopped.
+struct WordsStop {
+  // The index of the next word to read.
+  at : i32,
+  // A `-K` option: the file to read before the next word, and the option as it was written.
+  has_config : bool,
+  config_file : Vec<u8>,
+  config_option : Vec<u8>,
+  // The words ended, or `-h` or `-V` stopped the reading.
+  finished : bool,
+}
+
+fn no_step() -> Step {
+  return Step {
+    used_next : false,
+    next_group : false,
+    has_config : false,
+    config_file : Vec<u8>::new(),
+    stop : false
+  };
+}
+
+impl ArgParser {
+  /// The warnings so far, which the caller prints. It leaves none.
+  pub fn take_warnings(self : &mut ArgParser) -> Vec<Vec<u8>> {
+    return replace(&mut self.warnings, Vec<Vec<u8>>::new());
+  }
+
+  /// curl's warning for a value that starts with a Unicode character such as a curly quote,
+  /// which is often a mistake for an ASCII one. It does not show a password.
+  fn check_unicode(self : &mut ArgParser, id : i32, value : &Vec<u8>) -> void {
+    if self.globals.silent || value.len() < 3 || value.get(0) != 226u8 || value.get(1) != 128u8
+       || value.get(2) < 128u8 {
+      return;
     }
-    if arg.get(1) == 45u8 {
+    let mut m = Vec<u8>::new();
+    if id == OPT_USER || id == OPT_PROXY_USER || id == OPT_PASS {
+      push_lit(&mut m, "The argument to --");
+      if id == OPT_USER {
+        push_lit(&mut m, "user");
+      }
+      if id == OPT_PROXY_USER {
+        push_lit(&mut m, "proxy-user");
+      }
+      if id == OPT_PASS {
+        push_lit(&mut m, "pass");
+      }
+      push_lit(&mut m, " starts with a Unicode character. Maybe ASCII was intended?");
+    } else {
+      push_lit(&mut m, "The argument '");
+      append(&mut m, value);
+      push_lit(&mut m, "' starts with a Unicode character. Maybe ASCII was intended?");
+    }
+    self.warnings.push(m);
+  }
+
+  /// Apply option `id` to the current group, and keep the global ones aside.
+  fn apply_option(self : &mut ArgParser, id : i32, value : &Vec<u8>, enable : bool, shown : &Vec<u8>,
+  step : &mut Step) -> Result<i32, Failure> {
+    if takes_value(id) {
+      self.check_unicode(id, value);
+    }
+    if id == OPT_NEXT {
+      step.next_group = true;
+      return done();
+    }
+    if id == OPT_CONFIG {
+      step.has_config = true;
+      step.config_file = clone_bytes(value);
+      return done();
+    }
+    let _applied = apply(&mut self.current, id, value, enable, shown)?;
+    if id == OPT_SILENT {
+      self.globals.silent = enable;
+    }
+    if id == OPT_SHOW_ERROR {
+      self.globals.show_error = enable;
+    }
+    if id == OPT_VERBOSE {
+      self.globals.verbose = enable;
+    }
+    if id == OPT_TRACE_ASCII || id == OPT_TRACE {
+      self.globals.has_trace = true;
+      self.globals.trace = clone_bytes(value);
+    }
+    if id == OPT_HELP {
+      self.show_help = true;
+      step.stop = true;
+    }
+    if id == OPT_VERSION {
+      self.show_version = true;
+      step.stop = true;
+    }
+    return done();
+  }
+
+  /// One option, as curl's `getparameter`: `flag` is a long option (`--name`, or `name` in a
+  /// config file) or a cluster of short ones (`-sSL`), and `next` the word after it when there
+  /// is one. `shown` names the option in errors.
+  fn option(self : &mut ArgParser, flag : &Vec<u8>, next : &Vec<u8>, has_next : bool,
+  shown : &Vec<u8>) -> Result<Step, Failure> {
+    let mut step = no_step();
+    let long = flag.len() == 0 || flag.get(0) != 45u8 || (flag.len() > 1 && flag.get(1) == 45u8);
+    if long {
       // A long option, such as `--header` or `--no-location`. As in curl, `--name=value` gives
       // the value in the same word; a boolean option ignores it.
-      let mut name = rest_from(arg, 2);
+      let mut name = clone_bytes(flag);
+      if flag.len() > 0 && flag.get(0) == 45u8 {
+        name = rest_from(flag, 2);
+      }
       let mut inline_value = false;
       let mut given = Vec<u8>::new();
       let eq = find_byte(&name, 61u8, 0);
@@ -1239,57 +1396,367 @@ pub fn parse_args(args : &Vec<Vec<u8>>) -> Result<Config, Failure> {
         }
       }
       if id == OPT_UNKNOWN {
-        return Result<Config, Failure>::Err(option_error(arg, "is unknown"));
+        return Result<Step, Failure>::Err(option_error(shown, "is unknown"));
       }
       let mut value = Vec<u8>::new();
       if takes_value(id) && inline_value {
         value = given;
       } else if takes_value(id) {
-        if i + 1 >= args.len() {
-          return Result<Config, Failure>::Err(option_error(arg, "requires parameter"));
+        if !has_next {
+          return Result<Step, Failure>::Err(option_error(shown, "requires parameter"));
         }
-        value = clone_bytes(args.get_ref(i + 1));
-        i = i + 1;
+        value = clone_bytes(next);
+        step.used_next = true;
       }
-      name = clone_bytes(arg);
-      let _applied = apply(&mut cfg, id, &value, enable, &name)?;
-      i = i + 1;
-      continue;
+      let _applied = self.apply_option(id, &value, enable, shown, &mut step)?;
+      return Result<Step, Failure>::Ok(step);
     }
     // One or more short options, such as `-sSL` or `-ofile`.
     let mut j = 1;
-    let mut used_next = false;
-    while j < arg.len() {
-      let letter = arg.get(j);
+    if flag.len() == 1 {
+      return Result<Step, Failure>::Err(option_error(shown, "is unknown"));
+    }
+    while j < flag.len() && !step.stop {
+      let letter = flag.get(j);
       let id = short_option(letter);
-      let mut shown = lit("-");
-      shown.push(letter);
+      let mut letter_shown = lit("-");
+      letter_shown.push(letter);
       if id == OPT_UNKNOWN {
-        return Result<Config, Failure>::Err(option_error(&shown, "is unknown"));
+        return Result<Step, Failure>::Err(option_error(&letter_shown, "is unknown"));
       }
       if takes_value(id) {
         let mut value = Vec<u8>::new();
-        if j + 1 < arg.len() {
-          value = rest_from(arg, j + 1);
+        if j + 1 < flag.len() {
+          value = rest_from(flag, j + 1);
         } else {
-          if i + 1 >= args.len() {
-            return Result<Config, Failure>::Err(option_error(&shown, "requires parameter"));
+          if !has_next {
+            return Result<Step, Failure>::Err(option_error(&letter_shown, "requires parameter"));
           }
-          value = clone_bytes(args.get_ref(i + 1));
-          used_next = true;
+          value = clone_bytes(next);
+          step.used_next = true;
         }
-        let _applied = apply(&mut cfg, id, &value, true, &shown)?;
-        j = arg.len();
+        let _applied = self.apply_option(id, &value, true, &letter_shown, &mut step)?;
+        j = flag.len();
       } else {
         let none = Vec<u8>::new();
-        let _applied = apply(&mut cfg, id, &none, true, &shown)?;
+        let _applied = self.apply_option(id, &none, true, &letter_shown, &mut step)?;
         j = j + 1;
       }
     }
-    if used_next {
+    return Result<Step, Failure>::Ok(step);
+  }
+
+  /// Start a new group after `--next`. False when the current group has no URL yet.
+  fn next_group(self : &mut ArgParser) -> bool {
+    if self.current.urls.len() == 0 {
+      return false;
+    }
+    let group = replace(&mut self.current, default_config());
+    self.groups.push(group);
+    return true;
+  }
+
+  /// Whether `-s` is in force so far, for the warnings while the command line is read.
+  pub fn silent_now(self : &ArgParser) -> bool {
+    return self.globals.silent;
+  }
+
+  /// Whether curl's error lines show so far: not with `-s`, unless `-S` brings them back.
+  pub fn errors_shown(self : &ArgParser) -> bool {
+    return !self.globals.silent || self.globals.show_error;
+  }
+
+  /// Read the words of the command line from `at`. It stops after a `-K` option, so that the
+  /// caller reads its file, at the end of the words, and at `-h` or `-V`.
+  pub fn words(self : &mut ArgParser, args : &Vec<Vec<u8>>, at : i32) -> Result<WordsStop, Failure> {
+    let mut i = at;
+    while i < args.len() {
+      let word = args.get_ref(i);
+      if self.still_flags && word.len() > 0 && word.get(0) == 45u8 {
+        if eq_lit(word, "--") {
+          // The end of the options: the words after it are URLs.
+          self.still_flags = false;
+          i = i + 1;
+          continue;
+        }
+        let has_next = i + 1 < args.len();
+        let mut next = Vec<u8>::new();
+        if has_next {
+          next = clone_bytes(args.get_ref(i + 1));
+        }
+        let step = self.option(word, &next, has_next, word)?;
+        if step.next_group && !self.next_group() {
+          return Result<WordsStop, Failure>::Err(fail_lit(FAILED_INIT,
+            "missing URL before --next\ncurl: option --next: is badly used here"));
+        }
+        if step.used_next {
+          i = i + 1;
+        }
+        i = i + 1;
+        if step.stop {
+          return Result<WordsStop, Failure>::Ok(words_stop(i, true));
+        }
+        if step.has_config {
+          return Result<WordsStop, Failure>::Ok(WordsStop {
+            at : i,
+            has_config : true,
+            config_file : clone_bytes(&step.config_file),
+            config_option : clone_bytes(word),
+            finished : false
+          });
+        }
+      } else {
+        self.current.urls.push(clone_bytes(word));
+        i = i + 1;
+      }
+    }
+    return Result<WordsStop, Failure>::Ok(words_stop(i, true));
+  }
+
+  /// One line of a config file of `-K`, as curl's `parseconfig` gives it to `getparameter`.
+  /// Gives the step, with a `-K` in it for a nested file.
+  pub fn config_line(self : &mut ArgParser, line : &ConfigLine, file : &Vec<u8>)
+  -> Result<Step, ConfigError> {
+    match self.option(&line.option, &line.param, line.has_param, &line.option) {
+      Result<Step, Failure>::Ok(step) => {
+        if line.has_param && line.param.len() > 0 && !step.used_next {
+          let reason = lit("had unsupported trailing garbage");
+          return Result<Step, ConfigError>::Err(config_error(file, line.lineno, &line.option,
+            &reason, &reason, FAILED_INIT));
+        }
+        if step.next_group {
+          // In a config file, `next` before any URL changes nothing.
+          let _started = self.next_group();
+        }
+        return Result<Step, ConfigError>::Ok(step);
+      },
+      Result<Step, Failure>::Err(f) => {
+        let reason = reason_of(&f);
+        let mut outer = clone_bytes(&reason);
+        if eq_lit(&reason, "is unknown") {
+          outer = lit("found an unknown config option");
+        }
+        return Result<Step, ConfigError>::Err(config_error(file, line.lineno, &line.option,
+          &reason, &outer, f.code));
+      }
+    }
+  }
+
+  /// The groups of the command line, each with the global options.
+  pub fn finish(self : &mut ArgParser) -> Vec<Config> {
+    let last = replace(&mut self.current, default_config());
+    self.groups.push(last);
+    let mut groups = replace(&mut self.groups, Vec<Config>::new());
+    for g in groups.iter_mut() {
+      g.silent = self.globals.silent;
+      g.show_error = self.globals.show_error;
+      g.verbose = self.globals.verbose;
+      g.has_trace = self.globals.has_trace;
+      g.trace = clone_bytes(&self.globals.trace);
+      g.show_help = self.show_help;
+      g.show_version = self.show_version;
+    }
+    return groups;
+  }
+}
+
+fn words_stop(at : i32, finished : bool) -> WordsStop {
+  return WordsStop {
+    at : at,
+    has_config : false,
+    config_file : Vec<u8>::new(),
+    config_option : Vec<u8>::new(),
+    finished : finished
+  };
+}
+
+/// A failure while reading a config file of `-K`: the lines that curl prints, the reason that
+/// the option that read the file gives in turn, and the exit code.
+struct ConfigError {
+  text : Vec<u8>,
+  reason : Vec<u8>,
+  code : i32,
+}
+
+/// The error of the option `option` on line `lineno` of `file`, as curl prints it.
+pub fn config_error(file : &Vec<u8>, lineno : i32, option : &Vec<u8>, reason : &Vec<u8>,
+outer : &Vec<u8>, code : i32) -> ConfigError {
+  let mut m = clone_bytes(file);
+  m.push(58u8);
+  push_i64(&mut m, lineno as i64);
+  push_lit(&mut m, " config file option '");
+  append(&mut m, option);
+  push_lit(&mut m, "' ");
+  append(&mut m, reason);
+  return ConfigError {
+    text : m,
+    reason : clone_bytes(outer),
+    code : code
+  };
+}
+
+/// The reason of an option error "option NAME: REASON".
+fn reason_of(f : &Failure) -> Vec<u8> {
+  let at = find_seq(&f.message, &lit(": "), 0);
+  if starts_lit(&f.message, "option ") && at >= 0 {
+    return rest_from(&f.message, at + 2);
+  }
+  return clone_bytes(&f.message);
+}
+
+/// One option of a config file: its name as written (`url`, `--url` or `-o`), and its value,
+/// which may be missing. `warning` is a warning of curl about the line, or empty.
+struct ConfigLine {
+  lineno : i32,
+  option : Vec<u8>,
+  has_param : bool,
+  param : Vec<u8>,
+  warning : Vec<u8>,
+}
+
+fn is_space(b : u8) -> bool {
+  return b == 32u8 || (b >= 9u8 && b <= 13u8);
+}
+
+/// The options of the config file `text`, named `file` in warnings, as curl's `parseconfig`
+/// reads them: one option on a line, a `#` line is a comment, a name without a dash may have
+/// `=` or `:` before its value, and a value in double quotes takes backslash escapes.
+pub fn config_lines(text : &Vec<u8>, file : &Vec<u8>) -> Vec<ConfigLine> {
+  let mut out = Vec<ConfigLine>::new();
+  let mut start = 0;
+  let mut lineno = 0;
+  while start < text.len() {
+    let mut end = find_byte(text, 10u8, start);
+    if end < 0 {
+      end = text.len();
+    }
+    let line = range_of(text, start, end);
+    start = end + 1;
+    lineno = lineno + 1;
+    let mut i = 0;
+    while i < line.len() && is_space(line.get(i)) {
       i = i + 1;
     }
-    i = i + 1;
+    if i >= line.len() || line.get(i) == 35u8 {
+      continue;
+    }
+    let dashed = line.get(i) == 45u8;
+    let opt_start = i;
+    while i < line.len() && !is_space(line.get(i))
+          && !(!dashed && (line.get(i) == 61u8 || line.get(i) == 58u8)) {
+      i = i + 1;
+    }
+    let option = range_of(&line, opt_start, i);
+    if i < line.len() {
+      i = i + 1;
+    }
+    while i < line.len() && (line.get(i) == 32u8 || line.get(i) == 9u8
+          || (!dashed && (line.get(i) == 61u8 || line.get(i) == 58u8))) {
+      i = i + 1;
+    }
+    let mut param = Vec<u8>::new();
+    let mut has_param = false;
+    let mut warning = Vec<u8>::new();
+    if i < line.len() && line.get(i) == 34u8 {
+      // A quoted value, up to the next quote that no backslash escapes.
+      has_param = true;
+      i = i + 1;
+      while i < line.len() && line.get(i) != 34u8 {
+        let mut b = line.get(i);
+        if b == 92u8 {
+          i = i + 1;
+          if i >= line.len() {
+            break;
+          }
+          b = line.get(i);
+          if b == 116u8 {
+            b = 9u8;
+          }
+          if b == 110u8 {
+            b = 10u8;
+          }
+          if b == 114u8 {
+            b = 13u8;
+          }
+          if b == 118u8 {
+            b = 11u8;
+          }
+        }
+        param.push(b);
+        i = i + 1;
+      }
+    } else {
+      let mut quote_warning = false;
+      if i < line.len() && line.get(i) == 39u8 {
+        quote_warning = true;
+      }
+      let p_start = i;
+      while i < line.len() && !is_space(line.get(i)) {
+        i = i + 1;
+      }
+      param = range_of(&line, p_start, i);
+      has_param = param.len() > 0;
+      let mut k = i;
+      if k < line.len() {
+        k = k + 1;
+      }
+      while k < line.len() && (line.get(k) == 32u8 || line.get(k) == 9u8) {
+        k = k + 1;
+      }
+      let mut trailing = false;
+      if k < line.len() {
+        let c = line.get(k);
+        trailing = c != 13u8 && c != 35u8;
+      }
+      if quote_warning {
+        warning = config_warning(file, lineno, &option,
+          "uses argument with leading single quote. It is probably a mistake. Consider double quotes.");
+      }
+      if trailing {
+        warning = config_warning(file, lineno, &option,
+          "uses argument with unquoted whitespace. This may cause side-effects. Consider double quotes.");
+      }
+    }
+    out.push(ConfigLine {
+      lineno : lineno,
+      option : option,
+      has_param : has_param,
+      param : param,
+      warning : warning
+    });
   }
-  return Result<Config, Failure>::Ok(cfg);
+  return out;
+}
+
+fn config_warning(file : &Vec<u8>, lineno : i32, option : &Vec<u8>, what : *const i8) -> Vec<u8> {
+  let mut m = clone_bytes(file);
+  m.push(58u8);
+  push_i64(&mut m, lineno as i64);
+  push_lit(&mut m, " Option '");
+  append(&mut m, option);
+  push_lit(&mut m, "' ");
+  push_lit(&mut m, what);
+  return m;
+}
+
+/// Parse a command line with no `-K`, without the program name, into its first group. For the
+/// unit tests.
+pub fn parse_args(args : &Vec<Vec<u8>>) -> Result<Config, Failure> {
+  let mut p = new_arg_parser();
+  let stop = p.words(args, 0)?;
+  if stop.has_config {
+    return Result<Config, Failure>::Err(fail_lit(FAILED_INIT, "-K needs the tool"));
+  }
+  let mut groups = p.finish();
+  if groups.len() != 1 {
+    return Result<Config, Failure>::Err(fail_lit(FAILED_INIT, "--next needs the tool"));
+  }
+  match groups.pop() {
+    Option<Config>::Some(c) => {
+      return Result<Config, Failure>::Ok(c);
+    },
+    Option<Config>::None() => {
+      return Result<Config, Failure>::Err(fail_lit(FAILED_INIT, "no group"));
+    }
+  }
 }

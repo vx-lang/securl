@@ -1,4 +1,5 @@
 // Checks how securl::options reads a command line.
+import core::option;
 import core::result;
 import std::vec;
 import sys::text;
@@ -90,6 +91,37 @@ fn main() -> i32 {
     "option --max-filesize=x: expected a proper numerical parameter"), "the word as it was given");
   assert(eq_lit(&error_of(&words("--bogus=1", "a", "b", "c", "d")), "option --bogus=1: is unknown"),
     "an unknown option with =");
+
+  // `--next` makes groups; `-v` and `-s` hold for all of them, wherever they come.
+  let mut p = new_arg_parser();
+  let stop = p.words(&words("http://a/", "-H", "X: 1", "--next", "-v"), 0);
+  assert(stop.is_ok(), "the first words parse");
+  let mut tail = Vec<Vec<u8>>::new();
+  tail.push(lit("-s"));
+  tail.push(lit("http://b/"));
+  assert(p.words(&tail, 0).is_ok(), "the second words parse");
+  let groups = p.finish();
+  assert(groups.len() == 2, "two groups");
+  assert(groups.get_ref(0).headers.len() == 1 && groups.get_ref(1).headers.len() == 0,
+    "-H only in its group");
+  assert(groups.get_ref(0).verbose && groups.get_ref(0).silent && groups.get_ref(1).verbose,
+    "-v and -s for every group");
+  assert(eq_lit(&error_of(&words("-v", "--next", "a", "b", "c")),
+    "missing URL before --next\ncurl: option --next: is badly used here"), "--next first");
+
+  // The lines of a config file of -K.
+  let text = lit("# a comment\n  url = \"http://h/a b\"\n-o out\nheader: \"X: \\\"q\\\"\\t\"\nsilent\nmax-time 5 junk\n");
+  let lines = config_lines(&text, &lit("f"));
+  assert(lines.len() == 5, "the comment is no option");
+  assert(eq_lit(&lines.get_ref(0).option, "url") && eq_lit(&lines.get_ref(0).param, "http://h/a b"),
+    "a quoted value with a blank");
+  assert(lines.get_ref(0).lineno == 2, "the line number counts the comment");
+  assert(eq_lit(&lines.get_ref(1).option, "-o") && eq_lit(&lines.get_ref(1).param, "out"),
+    "a short option");
+  assert(eq_lit(&lines.get_ref(2).param, "X: \"q\"\t"), "the escapes of a quoted value");
+  assert(!lines.get_ref(3).has_param, "an option with no value");
+  assert(eq_lit(&lines.get_ref(4).param, "5") && lines.get_ref(4).warning.len() > 0,
+    "a warning for words after the value");
 
   return 0;
 }
