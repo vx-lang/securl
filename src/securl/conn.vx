@@ -1,5 +1,5 @@
 // A connection with a read buffer, for reading a response line by line and then its body. The
-// connection is plain TCP, or TLS after `start_tls`.
+// connection is plain TCP or a Unix-domain socket, or TLS over one after `start_tls`.
 import core::option;
 import core::result;
 import core::time;
@@ -137,24 +137,7 @@ deadline : Instant, options : &SocketOptions) -> Result<Conn, Failure> {
       if options.keepalive {
         set_keepalive(&stream, options.idle, options.interval, options.count);
       }
-      let mut buffer = Vec<u8>::new();
-      let mut i = 0;
-      while i < READ_BUFFER_SIZE {
-        buffer.push(0u8);
-        i = i + 1;
-      }
-      let mut net = NetStream::plain(stream);
-      net.set_deadline(deadline);
-      return Result<Conn, Failure>::Ok(Conn {
-        stream : net,
-        buffer : buffer,
-        start : 0,
-        end : 0,
-        closed : false,
-        deadline : deadline,
-        recv_limit : no_limit(),
-        send_limit : no_limit()
-      });
+      return Result<Conn, Failure>::Ok(conn_of(NetStream::plain(stream), deadline));
     },
     Result<TcpStream, NetError>::Err(e) => {
       match e {
@@ -184,6 +167,94 @@ deadline : Instant, options : &SocketOptions) -> Result<Conn, Failure> {
       }
     }
   }
+}
+
+/// The longest path of a Unix-domain socket: `sun_path` holds 108 bytes with the NUL.
+const UNIX_PATH_MAX : i32 = 107;
+
+/// Connect to the Unix-domain socket at `path`, for `--unix-socket`. `names` are for the
+/// message of a connect that fails. The connect, and each wait of the connection after it,
+/// give up at `deadline`. The caller needs the network right.
+pub fn open_unix_conn(network : &Network, path : &Vec<u8>, names : &ConnNames,
+deadline : Instant) -> Result<Conn, Failure> {
+  let started = Instant::now();
+  if path.len() > UNIX_PATH_MAX {
+    // curl's check, before it tries to connect.
+    let mut m = lit("Unix socket path too long: '");
+    append(&mut m, path);
+    push_lit(&mut m, "'");
+    return Result<Conn, Failure>::Err(fail_with(COULDNT_RESOLVE_HOST, m));
+  }
+  let text = to_string(path);
+  let mut target = String::new();
+  match text {
+    Option<String>::Some(s) => {
+      target = s;
+    },
+    Option<String>::None() => {
+      // A path that is not UTF-8 cannot become a `String`.
+      return Result<Conn, Failure>::Err(fail_with(COULDNT_CONNECT,
+        connect_failure(names, &started)));
+    }
+  }
+  let connected = unix_connect_by(network, &target, deadline);
+  match connected {
+    Result<UnixStream, NetError>::Ok(stream) => {
+      return Result<Conn, Failure>::Ok(conn_of(NetStream::unix(stream), deadline));
+    },
+    Result<UnixStream, NetError>::Err(e) => {
+      match e {
+        NetError::Cancelled() => {
+          return Result<Conn, Failure>::Err(fail_lit(OPERATION_TIMEDOUT, "Operation timed out"));
+        },
+        NetError::Refused() => {
+          let mut f = fail_with(COULDNT_CONNECT, connect_failure(names, &started));
+          f.refused = true;
+          return Result<Conn, Failure>::Err(f);
+        },
+        _ => {
+          return Result<Conn, Failure>::Err(fail_with(COULDNT_CONNECT,
+            connect_failure(names, &started)));
+        }
+      }
+    }
+  }
+}
+
+/// `UnixStream::connect`, which gives up at `deadline`.
+fn unix_connect_by(network : &Network, path : &String, deadline : Instant)
+-> Result<UnixStream, NetError> {
+  if deadline == Instant::never() {
+    return UnixStream::connect(network, path);
+  }
+  if past_deadline(deadline) {
+    return Result<UnixStream, NetError>::Err(NetError::Cancelled);
+  }
+  return within(deadline - Instant::now(), || -> Result<UnixStream, NetError> {
+    return UnixStream::connect(network, path);
+  });
+}
+
+/// A connection over `net`, whose waits give up at `deadline`, with an empty read buffer.
+fn conn_of(net : NetStream, deadline : Instant) -> Conn {
+  let mut buffer = Vec<u8>::new();
+  let mut i = 0;
+  while i < READ_BUFFER_SIZE {
+    buffer.push(0u8);
+    i = i + 1;
+  }
+  let mut stream = net;
+  stream.set_deadline(deadline);
+  return Conn {
+    stream : stream,
+    buffer : buffer,
+    start : 0,
+    end : 0,
+    closed : false,
+    deadline : deadline,
+    recv_limit : no_limit(),
+    send_limit : no_limit()
+  };
 }
 
 impl Conn {

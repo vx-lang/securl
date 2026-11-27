@@ -59,13 +59,13 @@ make test-h2    # HTTP/2 tests against a local server (makes a virtualenv with h
 
 Measured with curl's own test suite: curl's `runtests.pl` and its test servers, pointed at
 `build/securl` with `-c`. The tests come from curl commit 2f5c657, and the compiler is vxc from
-Vx main 375403e18.
+Vx main c1bf025ea.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 541 of 757 (71%) |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 545 of 762 (71%) |
 | The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 491 of 569 (86%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 217 of 217 |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 239 of 239 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 12 of 12 |
 
@@ -84,7 +84,7 @@ program of the curl build, linked with curl's own libcurl, so they never run sec
 the counts above included them by mistake: 152 of them passed, and the table said 522 of 874.
 Test 1070 depends on timing: the test server closes the connection while securl sends the
 body. It passes in some runs, between one in four and one in twelve, with and without recent
-changes. It passed in the run of the table above. Test 1849 (two HTTPS transfers through a
+changes. It failed in the run of the table above. Test 1849 (two HTTPS transfers through a
 proxy) fails in about one run in three, and did so before the latest changes too: the log of the
 test server sometimes lacks the second request. It passed in that run too.
 
@@ -95,12 +95,12 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 16,080 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 1,485 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 16,271 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 1,486 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 14 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
-| `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,301 | 48 `extern` functions, 92 `unsafe` blocks |
+| `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,354 | 48 `extern` functions, 90 `unsafe` blocks |
 
-Of the trusted code in `src/sys/`, 132 of the 140 items are the OpenSSL bindings: TLS (with the
+Of the trusted code in `src/sys/`, 130 of the 138 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
 `hash.vx`.
 `lit` and `push_lit` of `sys` are safe to call, and read a string literal through its raw
@@ -112,7 +112,7 @@ literal stays the only pointer that the other packages can have, `tools/check-no
 refuses `as_mut_ptr`, `as_ptr`, pointer casts and `core::ptr` outside `src/sys`. Each build,
 `make audit` and the GitHub workflow in `.github/workflows/checks.yml` run it.
 
-`core` and `std` have trusted code too: the audit counts 1,001 `unsafe` blocks and 93 `extern`
+`core` and `std` have trusted code too: the audit counts 1,021 `unsafe` blocks and 104 `extern`
 functions in the modules that the program uses. That is the trusted base of the language, as
 Rust's `std` is for a Rust program. OpenSSL itself is C.
 
@@ -388,6 +388,14 @@ with no address gives exit 5 and "Could not resolve proxy". A proxy that is not 
 `/server` or `host:99999`, gives exit 5 too, with curl's "Unsupported proxy syntax in '/server':
 No host present".
 
+`--unix-socket` sends the request to a Unix-domain socket, through `std::net::UnixStream`, which
+takes the network right. The request still names the host of the URL, and HTTPS checks the
+certificate against that name. As in curl, a proxy, `--connect-to` and `--resolve` do not apply,
+and a path longer than 107 bytes gives exit 6. A SOCKS proxy on the host `localhost` with a path,
+such as `socks5h://localhost/run/tor.sock`, is the Unix-domain socket at that path, as in curl.
+In `sys/tls.vx`, the socket of a connection is an enum of a `TcpStream` and a `UnixStream`, so
+plain HTTP, TLS and the time limits work the same way on both.
+
 `--limit-rate` takes curl's sizes, such as `500`, `2k` or `1.5M`, and holds each direction of
 the transfer to that many bytes per second after the connect, as curl does: a read waits until
 the rate allows the bytes so far, and a slow rate reads less at a time. `-m` still ends it.
@@ -421,13 +429,12 @@ time variables yet.
 
 In order of how much users need them:
 
-1. Connection reuse (and with it, HTTP/2 multiplexing),
-   `--unix-socket`, the
+1. Connection reuse (and with it, HTTP/2 multiplexing), the
    `Upgrade: h2c` of `--http2` on plain HTTP, and HTTP/2 through an HTTP proxy.
 1. URL globbing (`{a,b}` and `[1-9]`), `--variable`, `--no-clobber`, `-R`, resume of a
    retry (`--retry` with `-C -`),
    `--netrc`, a default `.curlrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
-   encoders, `--preproxy`, SOCKS5 with GSS-API, `--proxy-http2` and client certificates for an
+   encoders, `--preproxy`, `--abstract-unix-socket`, SOCKS5 with GSS-API, `--proxy-http2` and client certificates for an
    HTTPS proxy, Digest with the proxy of a
    CONNECT tunnel, and client certificates in PKCS#12 files or from engines and providers.
 1. HTTP/3.
@@ -464,8 +471,10 @@ The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #
 - [#4120](https://github.com/vx-lang/Vx/issues/4120) `std::net` had no name lookup, so
   `src/sys/socket.vx` called `getaddrinfo` for SOCKS4 and SOCKS5. Vx #4154 added
   `std::net::lookup`, and securl uses it.
-- [#4131](https://github.com/vx-lang/Vx/issues/4131) `std::net` has no Unix-domain socket, so
-  securl has no `--unix-socket` yet.
+- [#4131](https://github.com/vx-lang/Vx/issues/4131) `std::net` had no Unix-domain socket, so
+  securl had no `--unix-socket`. Vx #4155 added `UnixStream`, and securl uses it. Its path is a
+  C string, so it cannot name an abstract socket, whose name starts with a NUL byte, and
+  securl has no `--abstract-unix-socket`.
 - [#4132](https://github.com/vx-lang/Vx/issues/4132) `std::fs` could not remove a file, tell its
   kind, or give the right to open one file later, so `src/sys/files.vx` called `unlink` and
   `statx`. Vx #4156 added `remove_file`, `file_kind` and `PendingFile`, and securl uses the first

@@ -83,6 +83,9 @@ struct Config {
   range : Vec<u8>,
   resolve : Vec<Vec<u8>>,
   connect_to : Vec<Vec<u8>>,
+  // `--unix-socket`: connect to this socket file, and to no proxy.
+  has_unix_socket : bool,
+  unix_socket : Vec<u8>,
   max_time_ms : i64,
   connect_timeout_ms : i64,
   has_trace : bool,
@@ -233,6 +236,8 @@ pub fn default_config() -> Config {
     range : Vec<u8>::new(),
     resolve : Vec<Vec<u8>>::new(),
     connect_to : Vec<Vec<u8>>::new(),
+    has_unix_socket : false,
+    unix_socket : Vec<u8>::new(),
     max_time_ms : 0i64,
     connect_timeout_ms : 0i64,
     has_trace : false,
@@ -405,6 +410,7 @@ const OPT_RETRY_ALL_ERRORS : i32 = 100;
 const OPT_CONTINUE_AT : i32 = 101;
 const OPT_MANUAL : i32 = 102;
 const OPT_REMOTE_HEADER_NAME : i32 = 103;
+const OPT_UNIX_SOCKET : i32 = 104;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -515,6 +521,7 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "continue-at") { return OPT_CONTINUE_AT; }
   if eq_lit(name, "manual") { return OPT_MANUAL; }
   if eq_lit(name, "remote-header-name") { return OPT_REMOTE_HEADER_NAME; }
+  if eq_lit(name, "unix-socket") { return OPT_UNIX_SOCKET; }
   return OPT_UNKNOWN;
 }
 
@@ -572,7 +579,16 @@ fn takes_value(id : i32) -> bool {
     || id == OPT_KEEPALIVE_TIME || id == OPT_KEEPALIVE_CNT
     || (id >= OPT_SOCKS4 && id <= OPT_PASS) || id == OPT_HSTS || id == OPT_PROXY_CACERT
     || id == OPT_PROXY_CAPATH || id == OPT_LIMIT_RATE || id == OPT_MAX_FILESIZE || id == OPT_CONFIG
-    || (id >= OPT_RETRY && id <= OPT_RETRY_MAX_TIME) || id == OPT_CONTINUE_AT;
+    || (id >= OPT_RETRY && id <= OPT_RETRY_MAX_TIME) || id == OPT_CONTINUE_AT
+    || id == OPT_UNIX_SOCKET;
+}
+
+/// Whether the value of the option names a file, as curl's `ARG_FILE` options.
+fn takes_file(id : i32) -> bool {
+  return id == OPT_CACERT || id == OPT_CAPATH || id == OPT_CERT || id == OPT_CONFIG
+    || id == OPT_DUMP_HEADER || id == OPT_KEY || id == OPT_OUTPUT || id == OPT_PROXY_CACERT
+    || id == OPT_PROXY_CAPATH || id == OPT_TRACE || id == OPT_TRACE_ASCII
+    || id == OPT_UNIX_SOCKET || id == OPT_UPLOAD_FILE;
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -1007,6 +1023,15 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
   }
   if id == OPT_CONNECT_TO {
     cfg.connect_to.push(clone_bytes(value));
+    return done();
+  }
+  if id == OPT_UNIX_SOCKET {
+    if value.len() == 0 {
+      return Result<i32, Failure>::Err(option_error(shown,
+        "blank argument where content is expected"));
+    }
+    cfg.has_unix_socket = true;
+    cfg.unix_socket = clone_bytes(value);
     return done();
   }
   if id == OPT_TRACE_ASCII || id == OPT_TRACE {
@@ -1467,6 +1492,12 @@ impl ArgParser {
   step : &mut Step) -> Result<i32, Failure> {
     if takes_value(id) {
       self.check_unicode(id, value);
+    }
+    if takes_file(id) && !self.globals.silent && value.len() > 1 && value.get(0) == 45u8 {
+      let mut m = lit("The filename argument '");
+      append(&mut m, value);
+      push_lit(&mut m, "' looks like a flag.");
+      self.warnings.push(m);
     }
     if id == OPT_NEXT {
       step.next_group = true;

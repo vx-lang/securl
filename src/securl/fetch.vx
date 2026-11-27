@@ -745,12 +745,13 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
     tr_encoding : cfg.tr_encoding
   };
 
+  // `--unix-socket` needs no address: `--connect-to` and `--resolve` do not apply to it.
   let mut address = Vec<u8>::new();
   if proxy.used {
     // `--connect-to` is for the server, not for the proxy, as in curl.
     let proxy_host = resolve_rule(cfg, &proxy.url.host, proxy.url.port)?;
     address = address_of(&proxy_host, proxy.url.port);
-  } else {
+  } else if !cfg.has_unix_socket {
     address = connect_address(cfg, u)?;
   }
   info.hop_start_download = info.size_download;
@@ -1204,7 +1205,11 @@ fn conn_names(cfg : &Config, u : &Url, proxy : &Proxy, tunnel : bool) -> Result<
   }
   if proxy.used {
     push_lit(&mut label, " over proxy ");
-    append(&mut label, &proxy.url.host);
+    if proxy.unix_path.len() > 0 {
+      append(&mut label, &proxy.unix_path);
+    } else {
+      append(&mut label, &proxy.url.host);
+    }
   } else {
     // A `match` of `f()?` that binds a name panics the AST code generator (Vx #4172), so the
     // value gets a name first.
@@ -1233,16 +1238,8 @@ fn conn_names(cfg : &Config, u : &Url, proxy : &Proxy, tunnel : bool) -> Result<
 fn connect_phase(network : &Network, tls : &TlsSettings, cfg : &Config, u : &Url, proxy : &Proxy,
 address : &Vec<u8>, secure : bool, tunnel : bool, deadline : Instant, info : &mut TransferInfo,
 console : &mut Console, sinks : &mut Sinks) -> Result<Conn, Failure> {
-  if cfg.verbose {
-    let mut m = lit("  Trying ");
-    append(&mut m, address);
-    push_lit(&mut m, "...");
-    verbose_info(console, &m);
-  }
-  let names = conn_names(cfg, u, proxy, tunnel)?;
-  let mut c = open_conn(network, address, &names, deadline, &socket_options(cfg))?;
+  let mut c = open_peer(network, cfg, u, proxy, address, tunnel, deadline, info, console)?;
   info.num_connects = info.num_connects + 1;
-  info.remote_address = clone_bytes(address);
   if cfg.verbose {
     let mut m = lit("Connected to ");
     append(&mut m, &host_text(u));
@@ -1276,6 +1273,59 @@ console : &mut Console, sinks : &mut Sinks) -> Result<Conn, Failure> {
       verbose_info(console, &lit("TLS handshake done"));
     }
   }
+  return Result<Conn, Failure>::Ok(c);
+}
+
+/// Open the connection: to the socket file of `--unix-socket`, or else to `address`. With `-v`,
+/// curl's line before the connect.
+fn open_peer(network : &Network, cfg : &Config, u : &Url, proxy : &Proxy, address : &Vec<u8>,
+tunnel : bool, deadline : Instant, info : &mut TransferInfo, console : &mut Console)
+-> Result<Conn, Failure> {
+  if cfg.has_unix_socket {
+    let mut label = host_port_text(&u.host, u.port);
+    push_lit(&mut label, " over unix://");
+    append(&mut label, &cfg.unix_socket);
+    let names = ConnNames {
+      host : clone_bytes(&u.host),
+      is_proxy : false,
+      label : label
+    };
+    return open_unix_peer(network, cfg, &cfg.unix_socket, &names, deadline, info, console);
+  }
+  if proxy.unix_path.len() > 0 {
+    let names = conn_names(cfg, u, proxy, tunnel)?;
+    return open_unix_peer(network, cfg, &proxy.unix_path, &names, deadline, info, console);
+  }
+  if cfg.verbose {
+    let mut m = lit("  Trying ");
+    append(&mut m, address);
+    push_lit(&mut m, "...");
+    verbose_info(console, &m);
+  }
+  let names = conn_names(cfg, u, proxy, tunnel)?;
+  let c = open_conn(network, address, &names, deadline, &socket_options(cfg))?;
+  info.remote_address = clone_bytes(address);
+  return Result<Conn, Failure>::Ok(c);
+}
+
+/// Open the connection to the Unix-domain socket at `path`. curl keeps the path where it keeps
+/// an IP address, so `-v` and `%{remote_ip}` show at most 45 bytes of it, with port 0, or -1 in
+/// `%{remote_port}`.
+fn open_unix_peer(network : &Network, cfg : &Config, path : &Vec<u8>, names : &ConnNames,
+deadline : Instant, info : &mut TransferInfo, console : &mut Console) -> Result<Conn, Failure> {
+  let mut shown = clone_bytes(path);
+  if shown.len() > 45 {
+    shown = range_of(&shown, 0, 45);
+  }
+  if cfg.verbose {
+    let mut m = lit("  Trying ");
+    append(&mut m, &shown);
+    push_lit(&mut m, ":0...");
+    verbose_info(console, &m);
+  }
+  let c = open_unix_conn(network, path, names, deadline)?;
+  info.remote_address = shown;
+  push_lit(&mut info.remote_address, ":-1");
   return Result<Conn, Failure>::Ok(c);
 }
 
@@ -1348,6 +1398,9 @@ struct Proxy {
   has_credentials : bool,
   user : Vec<u8>,
   password : Vec<u8>,
+  // The Unix-domain socket of a SOCKS proxy given as `socks5h://localhost/PATH`, as in curl,
+  // or empty for a proxy on TCP.
+  unix_path : Vec<u8>,
 }
 
 /// Whether `--noproxy` names `host`: `*`, the host itself, or a domain that it ends with.
@@ -1417,8 +1470,13 @@ fn proxy_for(console : &mut Console, cfg : &Config, u : &Url) -> Result<Proxy, F
     url : clone_url(u),
     has_credentials : false,
     user : Vec<u8>::new(),
-    password : Vec<u8>::new()
+    password : Vec<u8>::new(),
+    unix_path : Vec<u8>::new()
   };
+  // A Unix-domain socket goes to no proxy, and curl reads no proxy variables for it.
+  if cfg.has_unix_socket {
+    return Result<Proxy, Failure>::Ok(none);
+  }
   let mut noproxy = clone_bytes(&cfg.noproxy);
   if !cfg.has_noproxy {
     noproxy = proxy_env_value(console, cfg, "no_proxy", "NO_PROXY");
@@ -1490,13 +1548,22 @@ fn proxy_for(console : &mut Console, cfg : &Config, u : &Url) -> Result<Proxy, F
       password = Vec<u8>::new();
     }
   }
+  // A SOCKS proxy on the host `localhost` with a path is the Unix-domain socket at that path.
+  let mut unix_path = Vec<u8>::new();
+  if is_socks(kind) && eq_lit_nocase(&url.host, "localhost") {
+    let path = percent_decode(&url.path);
+    if path.len() > 0 && !eq_lit(&path, "/") {
+      unix_path = path;
+    }
+  }
   return Result<Proxy, Failure>::Ok(Proxy {
     used : true,
     kind : kind,
     url : url,
     has_credentials : has_credentials,
     user : user,
-    password : password
+    password : password,
+    unix_path : unix_path
   });
 }
 

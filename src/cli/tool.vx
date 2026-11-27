@@ -315,7 +315,7 @@ fn print_version(console : &mut Console) -> void {
   append(&mut m, &securl_version());
   push_lit(&mut m, " ");
   append(&mut m, &tls_library_version());
-  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: brotli HSTS HTTP2 HTTPS-proxy IPv6 Largefile libz SSL zstd\n");
+  push_lit(&mut m, "\nRelease-Date: [unreleased]\nProtocols: http https\nFeatures: brotli HSTS HTTP2 HTTPS-proxy IPv6 Largefile libz SSL UnixSockets zstd\n");
   let _ok = console.to_stdout(&m);
 }
 
@@ -368,6 +368,7 @@ fn print_help(console : &mut Console) -> void {
   push_lit(&mut m, "     --noproxy <hosts>      List of hosts which do not use a proxy\n");
   push_lit(&mut m, "     --resolve <host:port:addr> Resolve the host+port to this address\n");
   push_lit(&mut m, "     --connect-to <HOST1:PORT1:HOST2:PORT2> Connect to host\n");
+  push_lit(&mut m, "     --unix-socket <path>   Connect through this Unix domain socket\n");
   push_lit(&mut m, " -0, --http1.0              Use HTTP 1.0\n");
   push_lit(&mut m, "     --http1.1              Use HTTP/1.1\n");
   push_lit(&mut m, "     --http2                Use HTTP/2 (the default over TLS)\n");

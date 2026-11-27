@@ -1,19 +1,21 @@
-// TLS through OpenSSL, and one stream type for plain TCP and TLS connections.
+// TLS through OpenSSL, and one stream type for plain and TLS connections, over TCP or a
+// Unix-domain socket.
 //
 // TRUSTED CODE. Each OpenSSL call is an `extern` function. The rest of securl sees only safe
-// functions: `TlsConfig::new`, `NetStream::plain`, `start_tls`, `read` and `write_all`.
+// functions: `TlsConfig::new`, `NetStream::plain`, `NetStream::unix`, `start_tls`, `read` and
+// `write_all`.
 //
 // Rights. `TlsConfig::new` reads the certificates of the certificate authorities from files,
 // so it takes a `&Files`. `main` makes the `TlsConfig` and lends it to the transfer, which then
-// needs no file right. A TLS connection starts from a `TcpStream`, which needs the network
-// right.
+// needs no file right. A connection starts from a `TcpStream`, or from a `UnixStream` for
+// `--unix-socket`, and each of them needs the network right.
 //
 // The sockets of `std::net` do not block: a read that has to wait parks the task. OpenSSL works
 // on the file descriptor of the socket, so it gives "want read" or "want write" when the socket
 // is not ready. Then this file waits with `poll` and tries again.
 //
 // Time limits. Each `NetStream` has a deadline, which the caller sets. A wait of the
-// `TcpStream` runs in `std::sync::wait::within`, so it gives `NetError::Cancelled` at the
+// socket runs in `std::sync::wait::within`, so it gives `NetError::Cancelled` at the
 // deadline. `poll` does not know the deadline, so this file polls in short slices and checks
 // the clock between them. A wait that passes the deadline gives `CURLE_OPERATION_TIMEDOUT`.
 // The connect, before there is a `NetStream`, is in `securl::conn`.
@@ -268,31 +270,74 @@ fn wait_for(fd : i32, events : i32, deadline : Instant) -> bool {
   }
 }
 
-/// `tcp.read(buffer)`, which gives up at `deadline`.
-fn read_by(tcp : &mut TcpStream, buffer : &mut Vec<u8>, deadline : Instant)
+/// The socket of a `NetStream`: TCP, or a Unix-domain socket for `--unix-socket`. It closes
+/// when it drops.
+enum Socket {
+  Tcp(TcpStream),
+  Unix(UnixStream),
+}
+
+/// The file descriptor of `sock`, for OpenSSL and `poll`.
+fn socket_fd(sock : &Socket) -> i32 {
+  match sock {
+    Socket::Tcp(t) => {
+      return unsafe { vx_tcp_stream_fd(t.ptr) };
+    }
+    Socket::Unix(u) => {
+      return u.fd();
+    }
+  }
+}
+
+/// `read(buffer)` of the stream in `sock`.
+fn socket_read(sock : &mut Socket, buffer : &mut Vec<u8>) -> Result<u64, NetError> {
+  match sock {
+    Socket::Tcp(t) => {
+      return t.read(buffer);
+    }
+    Socket::Unix(u) => {
+      return u.read(buffer);
+    }
+  }
+}
+
+/// `write_all(bytes)` of the stream in `sock`.
+fn socket_write_all(sock : &mut Socket, bytes : &Vec<u8>) -> Result<u64, NetError> {
+  match sock {
+    Socket::Tcp(t) => {
+      return t.write_all(bytes);
+    }
+    Socket::Unix(u) => {
+      return u.write_all(bytes);
+    }
+  }
+}
+
+/// `socket_read(sock, buffer)`, which gives up at `deadline`.
+fn read_by(sock : &mut Socket, buffer : &mut Vec<u8>, deadline : Instant)
 -> Result<u64, NetError> {
   if deadline == Instant::never() {
-    return tcp.read(buffer);
+    return socket_read(sock, buffer);
   }
   if past_deadline(deadline) {
     return Result<u64, NetError>::Err(NetError::Cancelled);
   }
   return within(deadline - Instant::now(), || -> Result<u64, NetError> {
-    return tcp.read(buffer);
+    return socket_read(sock, buffer);
   });
 }
 
-/// `tcp.write_all(bytes)`, which gives up at `deadline`.
-fn write_all_by(tcp : &mut TcpStream, bytes : &Vec<u8>, deadline : Instant)
+/// `socket_write_all(sock, bytes)`, which gives up at `deadline`.
+fn write_all_by(sock : &mut Socket, bytes : &Vec<u8>, deadline : Instant)
 -> Result<u64, NetError> {
   if deadline == Instant::never() {
-    return tcp.write_all(bytes);
+    return socket_write_all(sock, bytes);
   }
   if past_deadline(deadline) {
     return Result<u64, NetError>::Err(NetError::Cancelled);
   }
   return within(deadline - Instant::now(), || -> Result<u64, NetError> {
-    return tcp.write_all(bytes);
+    return socket_write_all(sock, bytes);
   });
 }
 
@@ -317,9 +362,9 @@ fn timed_out() -> TlsError {
   return tls_error(CURLE_OPERATION_TIMEDOUT, lit("Operation timed out"));
 }
 
-/// The error of a failed read or write of a plain `TcpStream`: `code` and `message`, or a
+/// The error of a failed read or write of a plain socket: `code` and `message`, or a
 /// timeout when the time limit ended the wait.
-fn tcp_error(e : NetError, code : i32, message : *const i8) -> TlsError {
+fn socket_error(e : NetError, code : i32, message : *const i8) -> TlsError {
   match e {
     NetError::Cancelled() => {
       return timed_out();
@@ -610,8 +655,8 @@ impl Drop for TlsConfig {
   }
 }
 
-/// A connection to a server: plain TCP, TLS over TCP, or TLS inside TLS. With TLS, OpenSSL
-/// reads and writes the socket of `tcp`. The `TcpStream` closes the socket when the stream
+/// A connection to a server: plain, TLS, or TLS inside TLS, over TCP or a Unix-domain socket.
+/// With TLS, OpenSSL reads and writes the socket of `sock`, which closes when the stream
 /// drops.
 ///
 /// TLS inside TLS is HTTPS through an HTTPS proxy: `ssl` is the connection to the proxy, and
@@ -619,8 +664,8 @@ impl Drop for TlsConfig {
 /// the memory BIO `inner_out`, and this file sends them over `ssl`. What arrives over `ssl`
 /// goes into the memory BIO `inner_in`, where `inner` reads it.
 struct NetStream {
-  tcp : TcpStream,
-  // The OpenSSL connection, or null for plain TCP.
+  sock : Socket,
+  // The OpenSSL connection, or null for a plain connection.
   ssl : *mut i8,
   // The OpenSSL connection inside `ssl`, or null. It owns its two BIOs.
   inner : *mut i8,
@@ -683,8 +728,17 @@ fn setup_error(what : *const i8) -> TlsError {
 impl NetStream {
   /// A plain TCP connection.
   pub fn plain(tcp : TcpStream) -> NetStream {
+    return NetStream::of(Socket::Tcp(tcp));
+  }
+
+  /// A plain connection over a Unix-domain socket, for `--unix-socket`.
+  pub fn unix(stream : UnixStream) -> NetStream {
+    return NetStream::of(Socket::Unix(stream));
+  }
+
+  fn of(sock : Socket) -> NetStream {
     return NetStream {
-      tcp : tcp,
+      sock : sock,
       ssl : unsafe { 0 as *mut i8 },
       inner : unsafe { 0 as *mut i8 },
       inner_in : unsafe { 0 as *mut i8 },
@@ -724,7 +778,7 @@ impl NetStream {
     }
     // From here, the drop of the stream frees `ssl`.
     self.ssl = ssl;
-    let fd = unsafe { vx_tcp_stream_fd(self.tcp.ptr) };
+    let fd = socket_fd(&self.sock);
     if unsafe { SSL_set_fd(ssl, fd) } != 1 {
       return Result<i32, TlsError>::Err(setup_error("SSL: SSL_set_fd failed"));
     }
@@ -912,17 +966,17 @@ impl NetStream {
   /// Read from the socket: plain, or through the TLS connection `ssl`.
   fn outer_read(self : &mut NetStream, buffer : &mut Vec<u8>) -> Result<u64, TlsError> {
     if !self.is_tls() {
-      match read_by(&mut self.tcp, buffer, self.deadline) {
+      match read_by(&mut self.sock, buffer, self.deadline) {
         Result<u64, NetError>::Ok(n) => {
           return Result<u64, TlsError>::Ok(n);
         },
         Result<u64, NetError>::Err(e) => {
-          return Result<u64, TlsError>::Err(tcp_error(e, CURLE_RECV_ERROR,
+          return Result<u64, TlsError>::Err(socket_error(e, CURLE_RECV_ERROR,
             "Recv failure: Connection reset by peer"));
         }
       }
     }
-    let fd = unsafe { vx_tcp_stream_fd(self.tcp.ptr) };
+    let fd = socket_fd(&self.sock);
     loop {
       let r = unsafe { SSL_read(self.ssl, buffer.as_mut_ptr(), buffer.len()) };
       if r > 0 {
@@ -951,17 +1005,17 @@ impl NetStream {
   /// Write all of `bytes` to the socket: plain, or through the TLS connection `ssl`.
   fn outer_write_all(self : &mut NetStream, bytes : &Vec<u8>) -> Result<u64, TlsError> {
     if !self.is_tls() {
-      match write_all_by(&mut self.tcp, bytes, self.deadline) {
+      match write_all_by(&mut self.sock, bytes, self.deadline) {
         Result<u64, NetError>::Ok(n) => {
           return Result<u64, TlsError>::Ok(n);
         },
         Result<u64, NetError>::Err(e) => {
-          return Result<u64, TlsError>::Err(tcp_error(e, CURLE_SEND_ERROR,
+          return Result<u64, TlsError>::Err(socket_error(e, CURLE_SEND_ERROR,
             "Send failure: Connection reset by peer"));
         }
       }
     }
-    let fd = unsafe { vx_tcp_stream_fd(self.tcp.ptr) };
+    let fd = socket_fd(&self.sock);
     let base = bytes.as_mut_ptr() as *const u8;
     let mut done : i32 = 0;
     while done < bytes.len() {
@@ -1108,8 +1162,8 @@ fn clone_of(src : &Vec<u8>) -> Vec<u8> {
 }
 
 impl Drop for NetStream {
-  /// Send the TLS close messages and free the OpenSSL connections. The `TcpStream` closes the
-  /// socket after this. The close message of the inner connection goes out with one write of
+  /// Send the TLS close messages and free the OpenSSL connections. The socket closes after
+  /// this. The close message of the inner connection goes out with one write of
   /// the outer one, which does not wait.
   fn drop(self : &mut NetStream) -> void {
     if !is_null(self.inner as *const i8) {

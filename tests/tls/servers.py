@@ -3,8 +3,9 @@
 
     python3 tests/tls/servers.py CERT_DIR PORT_FILE PROXY_LOG
 
-It starts seven servers on free ports of 127.0.0.1 and writes their ports to PORT_FILE as
-"https http proxy mute socks mtls tlsproxy":
+It starts seven servers on free ports of 127.0.0.1 and three on Unix-domain sockets, and writes
+their ports and the paths of the sockets to PORT_FILE as
+"https http proxy mute socks mtls tlsproxy unix-http unix-https unix-socks":
 
 - an HTTPS server with the certificate in CERT_DIR. `/` answers "hello over tls", and `/big`
   answers 1 MiB in chunks, so that TLS reads have to wait for more data.
@@ -19,6 +20,9 @@ It starts seven servers on free ports of 127.0.0.1 and writes their ports to POR
 - an HTTPS server that asks for a client certificate signed by client-ca.pem. `/whoami`
   answers with the common name of the certificate.
 - the HTTP proxy again, over TLS with the certificate of the HTTPS server: an HTTPS proxy.
+- the HTTP server, the HTTPS server and the SOCKS proxy again, on the sockets `unix-http.sock`,
+  `unix-https.sock` and `unix-socks.sock` in the folder of PORT_FILE, for `--unix-socket` and
+  `socks5h://localhost/PATH`. `/host` answers with the Host header of the request.
 
 On both HTTP servers, `/stall` sends 10 of the 100 bytes of its body and then waits, for the
 time limits of reads, and `/huge-chunk` sends a chunk size too large for 64 bits. The paths of
@@ -206,6 +210,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "3")
             self.end_headers()
             self.wfile.write(b"sts")
+        elif self.path == "/host":
+            self.send_body(self.headers.get("Host", "").encode() + b"\n")
         elif self.path == "/":
             self.send_body(b"hello over tls\n")
         elif self.path == "/whoami":
@@ -283,6 +289,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
+
+
+class UnixServer(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+
+    def __init__(self, path, handler):
+        if os.path.exists(path):
+            os.unlink(path)
+        super().__init__(path, handler)
 
 
 def pipe(a, b):
@@ -489,12 +504,21 @@ def main():
     # The proxy again, over TLS with the certificate of the HTTPS server: an HTTPS proxy.
     tls_proxy = Proxy(("127.0.0.1", 0), ProxyHandler)
     tls_proxy.socket = context.wrap_socket(tls_proxy.socket, server_side=True)
-    for server in (https, plain, proxy, mute, socks, mtls, tls_proxy):
+    folder = os.path.dirname(os.path.abspath(PORT_FILE))
+    unix_http = UnixServer(os.path.join(folder, "unix-http.sock"), Handler)
+    unix_http.https_port = https.server_address[1]
+    unix_https = UnixServer(os.path.join(folder, "unix-https.sock"), Handler)
+    unix_https.socket = context.wrap_socket(unix_https.socket, server_side=True)
+    unix_socks = UnixServer(os.path.join(folder, "unix-socks.sock"), SocksHandler)
+    for server in (https, plain, proxy, mute, socks, mtls, tls_proxy, unix_http, unix_https,
+                   unix_socks):
         threading.Thread(target=server.serve_forever, daemon=True).start()
     with open(PORT_FILE + ".tmp", "w") as f:
         f.write(f"{https.server_address[1]} {plain.server_address[1]} {proxy.server_address[1]} "
                 f"{mute.server_address[1]} {socks.server_address[1]} "
-                f"{mtls.server_address[1]} {tls_proxy.server_address[1]}\n")
+                f"{mtls.server_address[1]} {tls_proxy.server_address[1]} "
+                f"{unix_http.server_address} {unix_https.server_address} "
+                f"{unix_socks.server_address}\n")
     os.replace(PORT_FILE + ".tmp", PORT_FILE)
     threading.Event().wait()
 

@@ -25,7 +25,7 @@ while [ ! -s "$work/ports" ] && [ $tries -lt 50 ]; do
   sleep 0.1
   tries=$((tries + 1))
 done
-read -r https http proxy mute socks mtls tlsproxy < "$work/ports"
+read -r https http proxy mute socks mtls tlsproxy usock usocks usocks5 < "$work/ports"
 
 fail=0
 # check NAME EXPECTED_EXIT EXPECTED_STDOUT CURL_ARGUMENTS...
@@ -659,4 +659,55 @@ sockopts "--no-keepalive" "TCP_NODELAY=1" -s --no-keepalive "http://127.0.0.1:$h
 sockopts "the same options over TLS" \
   "TCP_NODELAY=1 SO_KEEPALIVE=1 TCP_KEEPIDLE=60 TCP_KEEPINTVL=60 TCP_KEEPCNT=9" \
   -s --cacert "$certs/ca.pem" --resolve "localhost:$https:127.0.0.1" "https://localhost:$https/"
+
+# --unix-socket: the request names the host of the URL, and goes to the socket file. A proxy,
+# --connect-to and --resolve do not apply to it, as in curl.
+check "HTTP over a Unix socket" 0 "example.com" -sS --unix-socket "$usock" \
+  "http://example.com/host"
+check "  with the port of the URL in Host" 0 "example.com:8080" -sS --unix-socket "$usock" \
+  "http://example.com:8080/host"
+check "  and no proxy" 0 "example.com" -sS --unix-socket "$usock" -x "127.0.0.1:$mute" \
+  "http://example.com/host"
+curl_env="http_proxy=http://127.0.0.1:$mute"
+check "  nor one from the environment" 0 "example.com" -sS --unix-socket "$usock" \
+  "http://example.com/host"
+curl_env=
+check "  nor --connect-to" 0 "example.com" -sS --unix-socket "$usock" \
+  --connect-to "example.com:80:127.0.0.1:1" "http://example.com/host"
+check "HTTPS over a Unix socket" 0 "hello over tls" -sS --cacert "$certs/ca.pem" \
+  --unix-socket "$usocks" "https://localhost/"
+check "  checks the name of the URL in the certificate" 60 "" -sS --cacert "$certs/ca.pem" \
+  --unix-socket "$usocks" "https://example.com/"
+check "-m stops a stalled body over a Unix socket" 28 "" -sS -m 1 -o "$work/stalled" \
+  --unix-socket "$usock" "http://example.com/stall"
+check "a socket file with no server" 7 "" -sS --unix-socket "$work/no-such.sock" \
+  "http://example.com/"
+stderr_has "  with curl's message" \
+  "curl: (7) Failed to connect to example.com:80 over unix://$work/no-such.sock after "
+long=/tmp/$(printf '%0120d' 0)
+check "a socket path longer than 107 bytes" 6 "" -sS --unix-socket "$long" "http://example.com/"
+stderr_has "  with curl's message" "curl: (6) Unix socket path too long: '$long'"
+check "a blank --unix-socket" 2 "" -sS --unix-socket "" "http://example.com/"
+rm -f "$work/-x"
+check "a file name that looks like an option" 0 "" --unix-socket "$usock" --output-dir "$work" \
+  -o -x "http://example.com/host"
+stderr_has "  gets curl's warning" "Warning: The filename argument '-x' looks like a flag."
+if [ "$(cat "$work/-x" 2>/dev/null)" = "example.com" ]; then
+  echo "ok     and is still the name of the file"
+else
+  echo "FAIL   no file $work/-x with the body"
+  fail=1
+fi
+sockopts "a Unix socket gets no TCP options" "" -s --unix-socket "$usock" "http://example.com/"
+# A SOCKS proxy on the host localhost with a path is the Unix-domain socket at that path.
+: > "$work/proxy.log"
+check "SOCKS5h on a Unix socket" 0 "hello over tls" -sS -x "socks5h://localhost$usocks5" \
+  "http://localhost:$http/"
+logged "  gets the name" "SOCKS5 atyp=3 localhost:$http user="
+check "  and --socks5 with HTTPS" 0 "hello over tls" -sS --cacert "$certs/ca.pem" \
+  --socks5 "localhost$usocks5" "https://127.0.0.1:$https/"
+check "a SOCKS socket file with no server" 7 "" -sS -x "socks5h://localhost$work/no-such.sock" \
+  "http://localhost:$http/"
+stderr_has "  with curl's message" \
+  "curl: (7) Failed to connect to localhost:$http over proxy $work/no-such.sock after "
 exit $fail
