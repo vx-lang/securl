@@ -270,6 +270,17 @@ check "-v names the variable" 0 "hello over tls" -sS -v --cacert "$certs/ca.pem"
 stderr_has "  with curl's message" "Uses proxy env variable https_proxy == '$p'"
 curl_env=
 
+# A proxy that is not a URL is exit 5, and the message names the proxy as it was given.
+check "a proxy with no host" 5 "" -sS -x "/server" "http://127.0.0.1:$http/"
+stderr_has "  with curl's message" "curl: (5) Unsupported proxy syntax in '/server': No host present"
+check "a proxy with a bad port" 5 "" -sS -x "localhost:99999" "http://127.0.0.1:$http/"
+stderr_has "  with curl's message" "curl: (5) Unsupported proxy syntax in 'localhost:99999': Port number was not a decimal number between 0 and 65535"
+curl_env="http_proxy=/server"
+check "  and one from the environment" 5 "" -sS "http://127.0.0.1:$http/"
+curl_env=
+check "a URL with no host" 3 "" -sS "http://:$http/"
+stderr_has "  with curl's message" "curl: (3) URL rejected: No host present"
+
 # logged NAME TEXT: the log of the proxies has TEXT.
 logged() {
   if grep -qF -- "$2" "$work/proxy.log"; then

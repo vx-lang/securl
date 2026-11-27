@@ -271,7 +271,7 @@ pub fn parse_url(text : &Vec<u8>, path_as_is : bool) -> Result<Url, Failure> {
   }
   if host.len() == 0 {
     return Result<Url, Failure>::Err(fail_lit(URL_MALFORMAT,
-      "URL rejected: No host part in the URL"));
+      "URL rejected: No host present"));
   }
 
   let mut port = default_port(&scheme);

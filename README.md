@@ -55,7 +55,7 @@ make test-tls   # HTTPS and time-limit tests against local servers (needs python
 make test-h2    # HTTP/2 tests against a local server (makes a virtualenv with h2 from PyPI)
 ```
 
-## Status (2026-11-26)
+## Status (2026-11-27)
 
 Measured with curl's own test suite: curl's `runtests.pl` and its test servers, pointed at
 `build/securl` with `-c`. The tests come from curl commit 2f5c657, and the compiler is vxc from
@@ -63,9 +63,9 @@ Vx main 375403e18.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 539 of 757 (71%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 490 of 569 (86%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 210 of 210 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 541 of 757 (71%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 491 of 569 (86%) |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 217 of 217 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 12 of 12 |
 
@@ -86,7 +86,7 @@ Test 1070 depends on timing: the test server closes the connection while securl 
 body. It passes in some runs, between one in four and one in twelve, with and without recent
 changes. It passed in the run of the table above. Test 1849 (two HTTPS transfers through a
 proxy) fails in about one run in three, and did so before the latest changes too: the log of the
-test server sometimes lacks the second request. It failed in that run.
+test server sometimes lacks the second request. It passed in that run too.
 
 The C build of the test suite has OpenSSL, so that runtests.pl runs the Digest tests (see "Run
 curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tests too.
@@ -384,7 +384,9 @@ host of the URL. Through an HTTP proxy, curl then always makes a CONNECT tunnel 
 and so does securl. `--connect-to` never changes where the proxy itself is. A connect that fails
 gives curl 8.23's message, such as `Failed to connect to example.com:443 via 10.0.0.2:8443 after
 3 ms` or `Failed to connect to example.com:443 over proxy 10.0.0.1 after 0 ms`, and a proxy name
-with no address gives exit 5 and "Could not resolve proxy".
+with no address gives exit 5 and "Could not resolve proxy". A proxy that is not a URL, such as
+`/server` or `host:99999`, gives exit 5 too, with curl's "Unsupported proxy syntax in '/server':
+No host present".
 
 `--limit-rate` takes curl's sizes, such as `500`, `2k` or `1.5M`, and holds each direction of
 the transfer to that many bytes per second after the connect, as curl does: a read waits until

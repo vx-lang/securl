@@ -1461,7 +1461,14 @@ fn proxy_for(console : &mut Console, cfg : &Config, u : &Url) -> Result<Proxy, F
   } else {
     text = lit_then("http://", &text);
   }
-  let mut url = parse_url(&text, false)?;
+  // A proxy that is not a URL is exit 5, as in curl, which names the proxy as it was given.
+  let parsed = parse_url(&text, false);
+  let mut url = match parsed {
+    Result<Url, Failure>::Ok(v) => { v },
+    Result<Url, Failure>::Err(f) => {
+      return Result<Proxy, Failure>::Err(proxy_syntax_failure(&given, &f));
+    }
+  };
   if !has_port_in(&text) {
     // libcurl's default ports for a proxy: 443 over TLS, and else 1080.
     url.port = 1080;
@@ -1491,6 +1498,19 @@ fn proxy_for(console : &mut Console, cfg : &Config, u : &Url) -> Result<Proxy, F
     user : user,
     password : password
   });
+}
+
+/// curl's error for a proxy `given` that does not parse as a URL: `f` says why.
+fn proxy_syntax_failure(given : &Vec<u8>, f : &Failure) -> Failure {
+  let mut reason = clone_bytes(&f.message);
+  if starts_lit(&reason, "URL rejected: ") {
+    reason = rest_from(&reason, 14);
+  }
+  let mut m = lit("Unsupported proxy syntax in '");
+  append(&mut m, given);
+  push_lit(&mut m, "': ");
+  append(&mut m, &reason);
+  return fail_with(COULDNT_RESOLVE_PROXY, m);
 }
 
 /// Whether the authority of the URL `text` gives a port.
