@@ -82,5 +82,14 @@ fn main() -> i32 {
   assert(eq_lit(&error_of(&words("--keepalive-time", "", "a", "b", "c")),
     "option --keepalive-time: expected a proper numerical parameter"), "no number");
 
+  // `--name=value`, as in curl. A boolean option ignores its value.
+  let g = parsed(&words("--max-filesize=2k", "--max-time=1.5", "--location=no", "-s", "http://h/"));
+  assert(g.max_filesize == 2048i64 && g.max_time_ms == 1500i64, "a value after =");
+  assert(g.follow && g.urls.len() == 1, "a boolean option with = and no word taken");
+  assert(eq_lit(&error_of(&words("--max-filesize=x", "a", "b", "c", "d")),
+    "option --max-filesize=x: expected a proper numerical parameter"), "the word as it was given");
+  assert(eq_lit(&error_of(&words("--bogus=1", "a", "b", "c", "d")), "option --bogus=1: is unknown"),
+    "an unknown option with =");
+
   return 0;
 }

@@ -166,6 +166,8 @@ struct Config {
   columns : i32,
   // `--limit-rate`: bytes per second for each direction of a transfer, or 0.
   limit_rate : i64,
+  // `--max-filesize`: the most bytes of a body, before and after decoding, or 0.
+  max_filesize : i64,
   hsts : Vec<u8>,
   // The proxy variables of the environment that are set, such as `https_proxy`. The tool
   // reads them. This package gets their values, and not the right to read the environment.
@@ -266,6 +268,7 @@ pub fn default_config() -> Config {
     remove_on_error : false,
     columns : 79,
     limit_rate : 0i64,
+    max_filesize : 0i64,
     hsts : Vec<u8>::new(),
     proxy_env : Vec<EnvVar>::new()
   };
@@ -363,6 +366,7 @@ const OPT_PROXY_CACERT : i32 = 89;
 const OPT_PROXY_CAPATH : i32 = 90;
 const OPT_REMOVE_ON_ERROR : i32 = 91;
 const OPT_LIMIT_RATE : i32 = 92;
+const OPT_MAX_FILESIZE : i32 = 93;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -462,6 +466,7 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "proxy-capath") { return OPT_PROXY_CAPATH; }
   if eq_lit(name, "remove-on-error") { return OPT_REMOVE_ON_ERROR; }
   if eq_lit(name, "limit-rate") { return OPT_LIMIT_RATE; }
+  if eq_lit(name, "max-filesize") { return OPT_MAX_FILESIZE; }
   return OPT_UNKNOWN;
 }
 
@@ -513,7 +518,7 @@ fn takes_value(id : i32) -> bool {
     || id == OPT_FORM || id == OPT_FORM_STRING || id == OPT_COOKIE_JAR
     || id == OPT_KEEPALIVE_TIME || id == OPT_KEEPALIVE_CNT
     || (id >= OPT_SOCKS4 && id <= OPT_PASS) || id == OPT_HSTS || id == OPT_PROXY_CACERT
-    || id == OPT_PROXY_CAPATH || id == OPT_LIMIT_RATE;
+    || id == OPT_PROXY_CAPATH || id == OPT_LIMIT_RATE || id == OPT_MAX_FILESIZE;
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -1068,6 +1073,10 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     cfg.limit_rate = size_arg(value, shown)?;
     return done();
   }
+  if id == OPT_MAX_FILESIZE {
+    cfg.max_filesize = size_arg(value, shown)?;
+    return done();
+  }
   if id == OPT_KEEPALIVE_CNT {
     cfg.keepalive_cnt = unsigned_arg(value, shown)?;
     return done();
@@ -1208,8 +1217,17 @@ pub fn parse_args(args : &Vec<Vec<u8>>) -> Result<Config, Failure> {
       continue;
     }
     if arg.get(1) == 45u8 {
-      // A long option, such as `--header` or `--no-location`.
+      // A long option, such as `--header` or `--no-location`. As in curl, `--name=value` gives
+      // the value in the same word; a boolean option ignores it.
       let mut name = rest_from(arg, 2);
+      let mut inline_value = false;
+      let mut given = Vec<u8>::new();
+      let eq = find_byte(&name, 61u8, 0);
+      if eq >= 0 {
+        inline_value = true;
+        given = rest_from(&name, eq + 1);
+        name = range_of(&name, 0, eq);
+      }
       let mut enable = true;
       let mut id = long_option(&name);
       if id == OPT_UNKNOWN && starts_lit(&name, "no-") {
@@ -1224,7 +1242,9 @@ pub fn parse_args(args : &Vec<Vec<u8>>) -> Result<Config, Failure> {
         return Result<Config, Failure>::Err(option_error(arg, "is unknown"));
       }
       let mut value = Vec<u8>::new();
-      if takes_value(id) {
+      if takes_value(id) && inline_value {
+        value = given;
+      } else if takes_value(id) {
         if i + 1 >= args.len() {
           return Result<Config, Failure>::Err(option_error(arg, "requires parameter"));
         }

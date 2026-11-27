@@ -429,6 +429,21 @@ else
   echo "skip brotli: no libbrotlienc for python3, or $curl has no brotli"
 fi
 
+# --max-filesize: a body that decodes to more than the limit fails before the piece that would
+# go past it, and a body longer than the limit gives the bytes up to it.
+check "--max-filesize stops a decoded body" 63 "" -sS --compressed --max-filesize 100000 \
+  -o "$work/limited" "http://127.0.0.1:$http/gzip"
+stderr_has "  with curl's message" "Would have exceeded max file size"
+check "--max-filesize=1000 cuts a chunked body" 63 "1000" -sS --max-filesize=1000 \
+  -o "$work/limited" -w '%{size_download}' --cacert "$certs/ca.pem" "https://localhost:$https/big"
+stderr_has "  with curl's message" "Exceeded the maximum allowed file size (1000) with 1000 bytes"
+if [ "$(wc -c < "$work/limited")" -eq 1000 ]; then
+  echo "ok     and keeps 1000 bytes"
+else
+  echo "FAIL   the file has $(wc -c < "$work/limited") bytes"
+  fail=1
+fi
+
 # --tr-encoding: gzip as a transfer coding. Without it, curl refuses one that it did not ask for.
 check "--tr-encoding decodes Transfer-Encoding: gzip" 0 "203890" -s --tr-encoding \
   -w '%{size_delivered}' -o "$work/te" "http://127.0.0.1:$http/te-gzip"

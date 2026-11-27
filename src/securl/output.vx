@@ -47,10 +47,18 @@ struct Output {
   // Content-Encoding named an encoding that securl does not know. The first byte of the body
   // fails, as in libcurl.
   unknown_encoding : bool,
-  // A body is being written: its bytes count in `delivered`, after any decoding.
+  // A body is being written: its bytes count in `raw_in` as they come and in `delivered` after
+  // any decoding.
   in_body : bool,
+  raw_in : i64,
   delivered : i64,
+  // `--max-filesize` for the body, or 0.
+  limit : i64,
 }
+
+// libcurl hands the body to the output in pieces of at most this size (CURL_MAX_WRITE_SIZE),
+// and checks `--max-filesize` before each.
+const DELIVER_PIECE : i32 = 16384;
 
 /// An output to standard output.
 pub fn stdout_output() -> Output {
@@ -61,7 +69,9 @@ pub fn stdout_output() -> Output {
     decoders : Vec<Decoder>::new(),
     unknown_encoding : false,
     in_body : false,
-    delivered : 0i64
+    raw_in : 0i64,
+    delivered : 0i64,
+    limit : 0i64
   };
 }
 
@@ -74,7 +84,9 @@ pub fn file_output(file : File) -> Output {
     decoders : Vec<Decoder>::new(),
     unknown_encoding : false,
     in_body : false,
-    delivered : 0i64
+    raw_in : 0i64,
+    delivered : 0i64,
+    limit : 0i64
   };
 }
 
@@ -87,7 +99,9 @@ pub fn null_output() -> Output {
     decoders : Vec<Decoder>::new(),
     unknown_encoding : false,
     in_body : false,
-    delivered : 0i64
+    raw_in : 0i64,
+    delivered : 0i64,
+    limit : 0i64
   };
 }
 
@@ -144,6 +158,7 @@ impl Output {
   pub fn start_body(self : &mut Output, transfer_codings : &Vec<u8>, encodings : &Vec<u8>)
   -> Result<i32, Failure> {
     self.in_body = true;
+    self.raw_in = 0i64;
     self.delivered = 0i64;
     let mut decoders = Vec<Decoder>::new();
     self.add_decoders(&mut decoders, &coding_names(transfer_codings));
@@ -208,9 +223,39 @@ impl Output {
     return Result<Vec<u8>, Failure>::Ok(data);
   }
 
+  /// The most bytes that the next body may have, before and after decoding, or 0 for no limit.
+  pub fn limit_body(self : &mut Output, limit : i64) -> void {
+    self.limit = limit;
+  }
+
   /// Write all of `bytes` to the output, decoded when a body is being decoded. `console` has
   /// the right to write to standard output.
   pub fn write(self : &mut Output, console : &mut Console, bytes : &Vec<u8>)
+  -> Result<i32, Failure> {
+    if bytes.len() == 0 {
+      return Result<i32, Failure>::Ok(0);
+    }
+    if self.in_body && self.limit > 0i64 && self.raw_in + (bytes.len() as i64) > self.limit {
+      // As libcurl: the bytes up to the limit go out, and then the transfer fails.
+      let allowed = (self.limit - self.raw_in) as i32;
+      let _w = self.write_within(console, &range_of(bytes, 0, allowed))?;
+      self.raw_in = self.limit;
+      let mut m = lit("Exceeded the maximum allowed file size (");
+      push_i64(&mut m, self.limit);
+      push_lit(&mut m, ") with ");
+      push_i64(&mut m, self.limit);
+      push_lit(&mut m, " bytes");
+      return Result<i32, Failure>::Err(fail_with(FILESIZE_EXCEEDED, m));
+    }
+    let _w = self.write_within(console, bytes)?;
+    if self.in_body {
+      self.raw_in = self.raw_in + (bytes.len() as i64);
+    }
+    return Result<i32, Failure>::Ok(0);
+  }
+
+  /// Write `bytes`, which are within the limit of the body, decoded when the body is.
+  fn write_within(self : &mut Output, console : &mut Console, bytes : &Vec<u8>)
   -> Result<i32, Failure> {
     if bytes.len() == 0 {
       return Result<i32, Failure>::Ok(0);
@@ -226,6 +271,24 @@ impl Output {
   fn put(self : &mut Output, console : &mut Console, bytes : &Vec<u8>) -> Result<i32, Failure> {
     if bytes.len() == 0 {
       return Result<i32, Failure>::Ok(0);
+    }
+    if self.in_body && self.limit > 0i64 && bytes.len() > DELIVER_PIECE {
+      // Decoded bytes go in pieces, each checked against the limit before it goes.
+      let mut at = 0;
+      while at < bytes.len() {
+        let mut end = at + DELIVER_PIECE;
+        if end > bytes.len() {
+          end = bytes.len();
+        }
+        let _w = self.put(console, &range_of(bytes, at, end))?;
+        at = end;
+      }
+      return Result<i32, Failure>::Ok(0);
+    }
+    if self.in_body && self.limit > 0i64
+       && (bytes.len() as i64) > self.limit - self.delivered {
+      return Result<i32, Failure>::Err(fail_lit(FILESIZE_EXCEEDED,
+        "Would have exceeded max file size"));
     }
     self.written = self.written + (bytes.len() as i64);
     if self.in_body {

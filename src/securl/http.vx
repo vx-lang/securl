@@ -416,6 +416,9 @@ struct ResponseHead {
   location : Vec<u8>,
   content_type : Vec<u8>,
   close : bool,
+  // A Content-Length header held a number too large for 63 bits. libcurl then reads to the end
+  // of the connection, or fails with `--max-filesize`.
+  length_overflow : bool,
   // A Content-Length header held something that is not a number, or two lengths disagree.
   bad_length : bool,
   // The headers, without the status line, each without its line end. For `-w %header{}`.
@@ -444,6 +447,7 @@ pub fn empty_head() -> ResponseHead {
     location : Vec<u8>::new(),
     content_type : Vec<u8>::new(),
     close : false,
+    length_overflow : false,
     bad_length : false,
     headers : Vec<Vec<u8>>::new(),
     error_code : 0,
@@ -598,7 +602,13 @@ pub fn parse_header_line(line : &Vec<u8>, index : i32, raw : bool, head : &mut R
       if end < 0 {
         end = value.len();
       }
-      match parse_u64(&range_of(&value, start, end)) {
+      let part = range_of(&value, start, end);
+      if too_large_number(&part) {
+        // As libcurl: the rest of the list does not count.
+        head.length_overflow = true;
+        return;
+      }
+      match parse_u64(&part) {
         Option<u64>::Some(n) => {
           if head.content_length >= 0i64 && head.content_length != (n as i64) {
             head.bad_length = true;
@@ -643,4 +653,25 @@ pub fn parse_header_line(line : &Vec<u8>, index : i32, raw : bool, head : &mut R
 /// Whether a response with this status to this request has no body.
 pub fn has_no_body(status : i32, kind : i32) -> bool {
   return kind == REQ_HEAD || status == 204 || status == 304 || (status >= 100 && status < 200);
+}
+
+/// Whether `a`, with blanks around it, is a decimal number larger than 2^63 - 1, which libcurl
+/// takes as an overflow.
+fn too_large_number(a : &Vec<u8>) -> bool {
+  let t = trim_blanks(a);
+  if t.len() == 0 {
+    return false;
+  }
+  let mut v : i64 = 0i64;
+  for b in t.iter() {
+    if !is_digit(*b) {
+      return false;
+    }
+    let d = (*b - 48u8) as i64;
+    if v > (9223372036854775807i64 - d) / 10i64 {
+      return true;
+    }
+    v = v * 10i64 + d;
+  }
+  return false;
 }

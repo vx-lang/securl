@@ -63,9 +63,9 @@ Vx main 12f3786c8.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 443 of 757 (59%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 392 of 461 (85%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 183 of 183 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 451 of 757 (59%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 405 of 477 (84%) |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 188 of 188 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 12 of 12 |
 
@@ -82,7 +82,7 @@ program of the curl build, linked with curl's own libcurl, so they never run sec
 the counts above included them by mistake: 152 of them passed, and the table said 522 of 874.
 Test 1070 depends on timing: the test server closes the connection while securl sends the
 body. It passes in some runs, between one in four and one in twelve, with and without recent
-changes. It passed in the run of the table above.
+changes. It failed in the run of the table above.
 
 The C build of the test suite has OpenSSL, so that runtests.pl runs the Digest tests (see "Run
 curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tests too.
@@ -91,7 +91,7 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 14,841 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 14,978 | none, and `--no-trusted-code` enforces this |
 | `src/cli/` (the tool) and `src/disk/` (its files) | 964 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 13 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,451 | 52 `extern` functions, 100 `unsafe` blocks |
@@ -317,8 +317,9 @@ missing options that block the most tests.
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
 `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
 `--connect-timeout` `--compressed` `--tr-encoding` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay`
-`--limit-rate` `--remove-on-error` `-h`
-`-V`, and the options that runtests.pl adds: `-q` `--trace-ascii` `--trace-time`.
+`--limit-rate` `--max-filesize` `--remove-on-error` `-h`
+`-V`, and the options that runtests.pl adds: `-q` `--trace-ascii` `--trace-time`. As in curl,
+a long option may take its value in the same word, as `--max-time=2`.
 
 As libcurl does, each connection sets TCP_NODELAY and TCP keepalive: the first probe after 60
 seconds with no traffic, then one each 60 seconds, and 9 probes with no answer drop the
@@ -343,6 +344,13 @@ as libcurl does for `localhost` (::1 first, then 127.0.0.1), or else with `getad
 `--limit-rate` takes curl's sizes, such as `500`, `2k` or `1.5M`, and holds each direction of
 the transfer to that many bytes per second after the connect, as curl does: a read waits until
 the rate allows the bytes so far, and a slow rate reads less at a time. `-m` still ends it.
+
+`--max-filesize` takes the same sizes and checks the body three times, as libcurl does: a
+Content-Length that is too large (or too large for 63 bits) fails before the body; the body is
+written up to the limit and then fails with "Exceeded the maximum allowed file size"; and the
+decoded body of `--compressed` goes in pieces of 16 KiB, each checked before it is written, so
+a small compressed body that decodes to a large one ("a compression bomb") fails with "Would
+have exceeded max file size". The body of a redirect that curl follows does not count.
 
 curl makes an `-o` file when the first byte of the body arrives. The transfer code of securl
 cannot open files, so the tool opens the file before the transfer. When a transfer fails before

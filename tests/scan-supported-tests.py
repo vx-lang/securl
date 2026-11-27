@@ -27,6 +27,7 @@ proxy-basic proxy-anyauth form form-string form-escape cookie-jar junk-session-c
 http2 http2-prior-knowledge tcp-nodelay keepalive keepalive-time keepalive-cnt proxytunnel
 socks4 socks4a socks5 socks5-hostname cert cert-type key key-type pass compressed tr-encoding hsts
 suppress-connect-headers proxy-insecure proxy-cacert proxy-capath remove-on-error limit-rate
+max-filesize
 """.split())
 SUPPORTED_SHORT = set("AbcdDeFHjmorTuwXxU0fGiIkLOqsSvVhg#NpE")
 # The short options that take a value: the rest of the word is that value.
@@ -63,7 +64,7 @@ def missing_options(command):
     missing = set()
     for word in words:
         if word.startswith("--"):
-            option = word[2:]
+            option = word[2:].split("=", 1)[0]
             base = option[3:] if option.startswith("no-") else option
             if option not in SUPPORTED_LONG and base not in SUPPORTED_LONG:
                 missing.add(word)
