@@ -63,9 +63,9 @@ Vx main 98e8df6d5.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 597 of 762 (78%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 538 of 569 (94%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 286 of 286 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 599 of 762 (78%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 539 of 569 (94%) |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 290 of 290 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 13 of 13 |
 
@@ -95,7 +95,7 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 17,944 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 18,064 | none, and `--no-trusted-code` enforces this |
 | `src/cli/` (the tool) and `src/disk/` (its files) | 1,725 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 14 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,355 | 48 `extern` functions, 87 `unsafe` blocks |
@@ -367,7 +367,7 @@ missing options that block the most tests.
 `--form-escape` `-D` `-e` (with `;auto`) `-f` `--fail-with-body` `-G` `-H` (with the `name:` and
 `name;` forms) `-I` `-i` `-k` `--cacert` `--capath` `-E` (`--cert`) `--cert-type` `--key` `--key-type` `--pass` `-L` `--location-trusted` `--max-redirs`
 `-o` `-O` `--remote-name-all` `--output-dir` `-g` (`--globoff`) `-r` `-s` `-S` `-T` `-u` `--digest` `--basic`
-`--anyauth` `-v` `-w` (most variables, `%header{}`, `%{header_json}`, `%output{}`, `%{stderr}`)
+`--anyauth` `-v` `-w` (most variables, the `%{time_*}` timers, `%header{}`, `%{header_json}`, `%output{}`, `%{stderr}`)
 `-X` `-x` `-U` `-p` `--proxytunnel` `--suppress-connect-headers` `--proxy-insecure`
 `--proxy-cacert` `--proxy-capath` `--socks4` `--socks4a` `--socks5` `--socks5-hostname` `--hsts`
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
@@ -490,12 +490,15 @@ no name takes `curl_response`, with curl's warning.
 curl's note and warnings, with `std::fs::file_kind` and `std::fs::remove_file`.
 
 The 2025 curl user survey asked for each user's favourite option. securl accepts 19 of the top
-20 answers. It does not have `--libcurl`. `-vv` and `-vvv` work as `-v`, and `-w` has no
-time variables yet.
+20 answers. It does not have `--libcurl`, and `-vv` and `-vvv` work as `-v`.
 
 ## Not done yet
 
 In order of how much users need them:
+
+`-w %{time_namelookup}` is the time before the connect starts: the name lookup happens inside
+the connect of Vx's `std::net`, so `%{time_connect}` holds it. The other timers are libcurl's,
+and add up over the requests of a redirect as in libcurl.
 
 1. Reuse of HTTP/2 connections (and with it, multiplexing), the `Upgrade: h2c` of `--http2`
    on plain HTTP, and HTTP/2 through an HTTP proxy.

@@ -842,4 +842,29 @@ check "credentials: -H Authorization and Cookie, not to another host" 0 "$none" 
   -H "Authorization: Bearer t" -H "Cookie: k=v" "$to$other_host"
 check "credentials: those of a proxy do not go to the server" 0 "$none" -s -p \
   -x "http://u:p@127.0.0.1:$proxy" "$here_s"
+# -w %{time_*}: libcurl's timers, which never go down in this order: the lookup, the connect,
+# the TLS handshake (0 without TLS), the request sent, its body sent, the first byte, and the
+# total. A redirect sets time_redirect.
+tw='%{time_namelookup} %{time_connect} %{time_appconnect} %{time_pretransfer} %{time_posttransfer} %{time_starttransfer} %{time_redirect} %{time_total}'
+timers() {
+  name=$1
+  want_redirect=$2
+  shift 2
+  got=$(env $curl_env timeout 20 "$curl" -s -o /dev/null -w "$tw" "$@" 2> "$work/stderr")
+  verdict=$(echo "$got" | awk -v r="$want_redirect" '{
+    ok = ($1 > 0 && $1 <= $2 && $2 <= $4 && $4 <= $5 && $5 <= $6 && $6 <= $8);
+    if ($3 > 0) ok = ok && $2 <= $3 && $3 <= $4;
+    if (r == "yes") ok = ok && $7 > 0 && $7 <= $8; else ok = ok && $7 == 0;
+    print (ok ? "ok" : "bad") }')
+  if [ "$verdict" = "ok" ]; then
+    echo "ok   $name"
+  else
+    echo "FAIL $name: timers '$got'"
+    fail=1
+  fi
+}
+timers "timers: HTTP" no "http://127.0.0.1:$http/"
+timers "timers: HTTPS" no -k "https://localhost:$https/"
+timers "timers: a redirect" yes -L "http://127.0.0.1:$http/to-host"
+timers "timers: an upload" no -d @"$here/run.sh" "http://127.0.0.1:$http/"
 exit $fail

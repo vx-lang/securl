@@ -194,8 +194,60 @@ fn header_json(headers : &Vec<Vec<u8>>, out : &mut Vec<u8>) -> void {
   push_lit(out, "\n}");
 }
 
+/// A time in microseconds as curl's `-w` writes it: seconds with six decimals.
+fn push_time(out : &mut Vec<u8>, us : i64) -> void {
+  push_i64(out, us / 1000000i64);
+  push_lit(out, ".");
+  let mut frac = Vec<u8>::new();
+  push_i64(&mut frac, us % 1000000i64);
+  let mut n = frac.len();
+  while n < 6 {
+    out.push(48u8);
+    n = n + 1;
+  }
+  append(out, &frac);
+}
+
+/// The value of a `%{time_*}` variable, or -1 for a name that is none.
+fn time_of(name : &Vec<u8>, info : &TransferInfo) -> i64 {
+  if eq_lit(name, "time_namelookup") {
+    return info.time_namelookup;
+  }
+  if eq_lit(name, "time_connect") {
+    return info.time_connect;
+  }
+  if eq_lit(name, "time_appconnect") {
+    return info.time_appconnect;
+  }
+  if eq_lit(name, "time_pretransfer") {
+    return info.time_pretransfer;
+  }
+  if eq_lit(name, "time_posttransfer") {
+    return info.time_posttransfer;
+  }
+  if eq_lit(name, "time_starttransfer") {
+    return info.time_starttransfer;
+  }
+  if eq_lit(name, "time_redirect") {
+    return info.time_redirect;
+  }
+  if eq_lit(name, "time_total") {
+    return info.time_total;
+  }
+  // securl has no queue of transfers.
+  if eq_lit(name, "time_queue") {
+    return 0i64;
+  }
+  return -1i64;
+}
+
 fn variable(name : &Vec<u8>, info : &TransferInfo, ctx : &WriteOutContext, out : &mut Vec<u8>)
 -> bool {
+  let t = time_of(name, info);
+  if t >= 0i64 {
+    push_time(out, t);
+    return true;
+  }
   if eq_lit(name, "http_connect") {
     push_three_digits(out, info.http_connect);
     return true;
