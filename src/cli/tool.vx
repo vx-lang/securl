@@ -116,7 +116,9 @@ pub fn tool_main(root : Root, command_line : Vec<String>) -> i32 {
   // The rights to the terminal. Only the code that gets them can use them.
   let mut console = Console {
     out : root.stdout,
-    err : root.stderr
+    err : root.stderr,
+    err_file : Option<File>::None(),
+    err_to_stdout : false
   };
   let mut stdin = root.stdin;
   let args = words_of(&command_line);
@@ -179,6 +181,9 @@ stdin : &mut Stdin, console : &mut Console, columns : i32) -> Result<i32, Failur
     let read = parser.words(args, at);
     print_warnings(console, parser, columns);
     let stop = read?;
+    if stop.has_stderr {
+      redirect_stderr(console, parser, files, &stop.stderr_file, columns);
+    }
     if stop.has_config {
       match read_config(parser, &stop.config_file, files, stdin, console, columns,
         CONFIG_MAX_LEVELS - 1) {
@@ -196,6 +201,29 @@ stdin : &mut Stdin, console : &mut Console, columns : i32) -> Result<i32, Failur
       return Result<i32, Failure>::Ok(0);
     }
     at = stop.at;
+  }
+}
+
+/// Send standard error to the file `name` from now on, or to standard output for `-`, as curl's
+/// `tool_set_stderr_file`. A file that does not open leaves it where it was, with curl's
+/// warning, which says "Warning" twice.
+fn redirect_stderr(console : &mut Console, parser : &ArgParser, files : &Files, name : &Vec<u8>,
+columns : i32) -> void {
+  if eq_lit(name, "-") {
+    console.stderr_to_stdout();
+    return;
+  }
+  match create_file(files, name) {
+    Result<File, Failure>::Ok(f) => {
+      console.stderr_to_file(f);
+    },
+    Result<File, Failure>::Err(_f) => {
+      if !parser.silent_now() {
+        console.to_stderr(&message_lines("Warning: ", &lit_then("Warning: Failed to open ", name),
+          columns));
+      }
+      return;
+    }
   }
 }
 
@@ -247,6 +275,9 @@ console : &mut Console, columns : i32, levels : i32) -> Result<i32, ConfigError>
     print_warnings(console, parser, columns);
     match result {
       Result<Step, ConfigError>::Ok(step) => {
+        if step.has_stderr {
+          redirect_stderr(console, parser, files, &step.stderr_file, columns);
+        }
         if step.has_config {
           let mut nested = Result<i32, ConfigError>::Ok(0);
           if levels - 1 < 0 {

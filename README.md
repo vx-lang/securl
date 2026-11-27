@@ -63,9 +63,9 @@ Vx main c1bf025ea.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 545 of 762 (71%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 491 of 569 (86%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 239 of 239 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 547 of 762 (71%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 490 of 569 (86%) |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 253 of 253 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 12 of 12 |
 
@@ -84,7 +84,7 @@ program of the curl build, linked with curl's own libcurl, so they never run sec
 the counts above included them by mistake: 152 of them passed, and the table said 522 of 874.
 Test 1070 depends on timing: the test server closes the connection while securl sends the
 body. It passes in some runs, between one in four and one in twelve, with and without recent
-changes. It failed in the run of the table above. Test 1849 (two HTTPS transfers through a
+changes. In the runs of the table above, it passed in the first and failed in the second. Test 1849 (two HTTPS transfers through a
 proxy) fails in about one run in three, and did so before the latest changes too: the log of the
 test server sometimes lacks the second request. It passed in that run too.
 
@@ -95,8 +95,8 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 16,271 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 1,486 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 16,323 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 1,517 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 14 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,354 | 48 `extern` functions, 90 `unsafe` blocks |
 
@@ -320,9 +320,9 @@ missing options that block the most tests.
 `-X` `-x` `-U` `-p` `--proxytunnel` `--suppress-connect-headers` `--proxy-insecure`
 `--proxy-cacert` `--proxy-capath` `--socks4` `--socks4a` `--socks5` `--socks5-hostname` `--hsts`
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
-`--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
+`--unix-socket` `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
 `--connect-timeout` `--compressed` `--tr-encoding` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay`
-`--limit-rate` `--max-filesize` `--remove-on-error` `--next` (`-:`) `-K` (`--config`)
+`--limit-rate` `--max-filesize` `--remove-on-error` `--next` (`-:`) `-K` (`--config`) `--stderr`
 `--retry` `--retry-delay` `--retry-max-time` `--retry-connrefused` `--retry-all-errors` `-C`
 (`--continue-at`) `-J` (`--remote-header-name`) `-M` (`--manual`, which says that the manual
 is not built in) `-h`
@@ -339,6 +339,12 @@ the value, double quotes with backslash escapes, `#` comments, `next` lines, and
 files deep. The tool reads the file with its file right and hands each line to the parser of
 the command line, which cannot open a file. Errors and warnings name the file and the line as
 curl does, and wrap at the width of the terminal.
+
+`--stderr FILE` sends what would go to standard error to FILE, and `--stderr -` to standard
+output: the errors, the warnings, `-v` and `-w %{stderr}`. As in curl, it holds from where it
+comes, so a warning about an earlier option still goes to standard error, and a file that does
+not open leaves it there, with curl's "Warning: Warning: Failed to open FILE". The parser stops
+at it, as at `-K`, and the tool opens the file with its file right.
 
 `--retry N` tries a transfer again, as curl does, after a time-out, a host with no address, an
 HTTP response 408, 429, 500, 502, 503, 504, 522 or 524 (also with `-f`), a refused connection
@@ -434,7 +440,8 @@ In order of how much users need them:
 1. URL globbing (`{a,b}` and `[1-9]`), `--variable`, `--no-clobber`, `-R`, resume of a
    retry (`--retry` with `-C -`),
    `--netrc`, a default `.curlrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
-   encoders, `--preproxy`, `--abstract-unix-socket`, SOCKS5 with GSS-API, `--proxy-http2` and client certificates for an
+   encoders, `--preproxy`, `--abstract-unix-socket`, the progress meter and `-#` (securl
+   accepts them and shows no progress), SOCKS5 with GSS-API, `--proxy-http2` and client certificates for an
    HTTPS proxy, Digest with the proxy of a
    CONNECT tunnel, and client certificates in PKCS#12 files or from engines and providers.
 1. HTTP/3.

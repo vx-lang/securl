@@ -411,6 +411,8 @@ const OPT_CONTINUE_AT : i32 = 101;
 const OPT_MANUAL : i32 = 102;
 const OPT_REMOTE_HEADER_NAME : i32 = 103;
 const OPT_UNIX_SOCKET : i32 = 104;
+// `--stderr`, which the parser hands to the tool, as `-K`.
+const OPT_STDERR : i32 = 105;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -522,6 +524,7 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "manual") { return OPT_MANUAL; }
   if eq_lit(name, "remote-header-name") { return OPT_REMOTE_HEADER_NAME; }
   if eq_lit(name, "unix-socket") { return OPT_UNIX_SOCKET; }
+  if eq_lit(name, "stderr") { return OPT_STDERR; }
   return OPT_UNKNOWN;
 }
 
@@ -580,7 +583,7 @@ fn takes_value(id : i32) -> bool {
     || (id >= OPT_SOCKS4 && id <= OPT_PASS) || id == OPT_HSTS || id == OPT_PROXY_CACERT
     || id == OPT_PROXY_CAPATH || id == OPT_LIMIT_RATE || id == OPT_MAX_FILESIZE || id == OPT_CONFIG
     || (id >= OPT_RETRY && id <= OPT_RETRY_MAX_TIME) || id == OPT_CONTINUE_AT
-    || id == OPT_UNIX_SOCKET;
+    || id == OPT_UNIX_SOCKET || id == OPT_STDERR;
 }
 
 /// Whether the value of the option names a file, as curl's `ARG_FILE` options.
@@ -588,7 +591,7 @@ fn takes_file(id : i32) -> bool {
   return id == OPT_CACERT || id == OPT_CAPATH || id == OPT_CERT || id == OPT_CONFIG
     || id == OPT_DUMP_HEADER || id == OPT_KEY || id == OPT_OUTPUT || id == OPT_PROXY_CACERT
     || id == OPT_PROXY_CAPATH || id == OPT_TRACE || id == OPT_TRACE_ASCII
-    || id == OPT_UNIX_SOCKET || id == OPT_UPLOAD_FILE;
+    || id == OPT_UNIX_SOCKET || id == OPT_UPLOAD_FILE || id == OPT_STDERR;
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -1393,6 +1396,9 @@ struct Step {
   // `-K FILE`: the caller reads FILE and gives its lines to `config_line`.
   has_config : bool,
   config_file : Vec<u8>,
+  // `--stderr FILE`: the caller sends standard error to FILE from here on.
+  has_stderr : bool,
+  stderr_file : Vec<u8>,
   // `-h` or `-V`: curl stops reading the command line and shows the help or the version.
   stop : bool,
 }
@@ -1439,6 +1445,9 @@ struct WordsStop {
   has_config : bool,
   config_file : Vec<u8>,
   config_option : Vec<u8>,
+  // A `--stderr` option: where standard error goes from the next word on.
+  has_stderr : bool,
+  stderr_file : Vec<u8>,
   // The words ended, or `-h` or `-V` stopped the reading.
   finished : bool,
 }
@@ -1449,6 +1458,8 @@ fn no_step() -> Step {
     next_group : false,
     has_config : false,
     config_file : Vec<u8>::new(),
+    has_stderr : false,
+    stderr_file : Vec<u8>::new(),
     stop : false
   };
 }
@@ -1512,6 +1523,11 @@ impl ArgParser {
     if id == OPT_CONFIG {
       step.has_config = true;
       step.config_file = clone_bytes(value);
+      return done();
+    }
+    if id == OPT_STDERR {
+      step.has_stderr = true;
+      step.stderr_file = clone_bytes(value);
       return done();
     }
     let _applied = apply(&mut self.current, id, value, enable, shown)?;
@@ -1643,7 +1659,8 @@ impl ArgParser {
   }
 
   /// Read the words of the command line from `at`. It stops after a `-K` option, so that the
-  /// caller reads its file, at the end of the words, and at `-h` or `-V`.
+  /// caller reads its file, after a `--stderr` option, so that the caller opens its file, at the
+  /// end of the words, and at `-h` or `-V`.
   pub fn words(self : &mut ArgParser, args : &Vec<Vec<u8>>, at : i32) -> Result<WordsStop, Failure> {
     let mut i = at;
     while i < args.len() {
@@ -1673,13 +1690,17 @@ impl ArgParser {
           return Result<WordsStop, Failure>::Ok(words_stop(i, true));
         }
         if step.has_config {
-          return Result<WordsStop, Failure>::Ok(WordsStop {
-            at : i,
-            has_config : true,
-            config_file : step.config_file,
-            config_option : clone_bytes(word),
-            finished : false
-          });
+          let mut stop = words_stop(i, false);
+          stop.has_config = true;
+          stop.config_file = step.config_file;
+          stop.config_option = clone_bytes(word);
+          return Result<WordsStop, Failure>::Ok(stop);
+        }
+        if step.has_stderr {
+          let mut stop = words_stop(i, false);
+          stop.has_stderr = true;
+          stop.stderr_file = step.stderr_file;
+          return Result<WordsStop, Failure>::Ok(stop);
         }
       } else {
         self.current.urls.push(clone_bytes(word));
@@ -1743,6 +1764,8 @@ fn words_stop(at : i32, finished : bool) -> WordsStop {
     has_config : false,
     config_file : Vec<u8>::new(),
     config_option : Vec<u8>::new(),
+    has_stderr : false,
+    stderr_file : Vec<u8>::new(),
     finished : finished
   };
 }

@@ -20,9 +20,14 @@ const MAX_ENCODE_STACK : i32 = 5;
 /// The rights to write to standard output and to standard error. Only `main` can make one,
 /// because only `main` has the rights of the program. So code that gets no `&mut Console`
 /// cannot write to the terminal.
+///
+/// `--stderr` sends what would go to standard error to a file, which the tool opens, or to
+/// standard output with `-`.
 struct Console {
   out : Stdout,
   err : Stderr,
+  err_file : Option<File>,
+  err_to_stdout : bool,
 }
 
 impl Console {
@@ -31,9 +36,33 @@ impl Console {
     return self.out.write_all(bytes).is_ok();
   }
 
-  /// Write `bytes` to standard error. A closed standard error is not an error for curl.
+  /// Write `bytes` to standard error, or where `--stderr` sends it. A closed standard error is
+  /// not an error for curl.
   pub fn to_stderr(self : &mut Console, bytes : &Vec<u8>) -> void {
-    let _r = self.err.write_all(bytes);
+    if self.err_to_stdout {
+      let _o = self.out.write_all(bytes);
+      return;
+    }
+    match &mut self.err_file {
+      Option<File>::Some(f) => {
+        let _w = write_all_to_file(f, bytes);
+      },
+      Option<File>::None() => {
+        let _r = self.err.write_all(bytes);
+      }
+    }
+  }
+
+  /// From now on, write what goes to standard error to `file`, as `--stderr FILE` does.
+  pub fn stderr_to_file(self : &mut Console, file : File) -> void {
+    self.err_file = Option<File>::Some(file);
+    self.err_to_stdout = false;
+  }
+
+  /// From now on, write what goes to standard error to standard output, as `--stderr -` does.
+  pub fn stderr_to_stdout(self : &mut Console) -> void {
+    self.err_file = Option<File>::None();
+    self.err_to_stdout = true;
   }
 }
 

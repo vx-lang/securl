@@ -710,4 +710,44 @@ check "a SOCKS socket file with no server" 7 "" -sS -x "socks5h://localhost$work
   "http://localhost:$http/"
 stderr_has "  with curl's message" \
   "curl: (7) Failed to connect to localhost:$http over proxy $work/no-such.sock after "
+
+# --stderr: what would go to standard error goes to the file from that option on, or to
+# standard output with `-`.
+# file_is NAME FILE TEXT: FILE holds exactly TEXT.
+file_is() {
+  if [ "$(cat "$2" 2>/dev/null)" = "$3" ]; then
+    echo "ok   $1"
+  else
+    echo "FAIL $1: '$2' holds '$(cat "$2" 2>/dev/null)' (want '$3')"
+    fail=1
+  fi
+}
+echo old > "$work/stderr.txt"
+check "--stderr FILE" 1 "" -sS --stderr "$work/stderr.txt" "hej://moo"
+file_is "  gets the error, in place of what the file held" "$work/stderr.txt" \
+  'curl: (1) Protocol "hej" not supported'
+check "--stderr - sends it to standard output" 1 'curl: (1) Protocol "hej" not supported' \
+  -sS --stderr - "hej://moo"
+check "-w %{stderr} with --stderr" 0 "" -s --stderr "$work/stderr.txt" -o /dev/null \
+  -w '%{stderr}%{http_code}' "http://127.0.0.1:$http/"
+file_is "  writes to the file" "$work/stderr.txt" "200"
+check "-v with --stderr" 0 "hello over tls" -s -v --stderr "$work/stderr.txt" \
+  "http://127.0.0.1:$http/"
+if grep -q "^> GET / HTTP/1.1" "$work/stderr.txt"; then
+  echo "ok     writes the request to the file"
+else
+  echo "FAIL   no request in $work/stderr.txt"
+  fail=1
+fi
+check "a warning before --stderr stays on standard error" 1 "" --unix-socket -a \
+  --stderr "$work/stderr.txt" -o -b "hej://moo"
+stderr_has "  where it was" "Warning: The filename argument '-a' looks like a flag."
+file_is "  and the ones after it go to the file" "$work/stderr.txt" \
+  "$(printf '%s\n%s' "Warning: The filename argument '-b' looks like a flag." \
+    'curl: (1) Protocol "hej" not supported')"
+check "a --stderr file that does not open" 1 "" -S --stderr "/no-such-dir/x" "hej://moo"
+stderr_has "  gets curl's warning" "Warning: Warning: Failed to open /no-such-dir/x"
+printf 'stderr = "%s"\nurl = "hej://moo"\n' "$work/stderr.txt" > "$work/stderr.cfg"
+check "--stderr in a config file" 1 "" -K "$work/stderr.cfg"
+file_is "  works too" "$work/stderr.txt" 'curl: (1) Protocol "hej" not supported'
 exit $fail
