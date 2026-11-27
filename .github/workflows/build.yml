@@ -124,6 +124,7 @@ jobs:
             -DBUILD_TESTING=ON
           cmake --build ~/curl-src/build -j4
           cmake --build ~/curl-src/build --target testdeps -j4
-          JOBS=4 tools/build-test-tools.sh
+          # nghttpx includes <print> of C++23, which needs GCC 14: the default is GCC 13.
+          CC=gcc-14 CXX=g++-14 JOBS=4 tools/build-test-tools.sh
       - name: The supported curl tests
         run: tests/check-supported.sh ~/curl-src
