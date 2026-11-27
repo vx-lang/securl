@@ -34,6 +34,7 @@ const UNSUPPORTED_PROTOCOL : i32 = 1;
 const FAILED_INIT : i32 = 2;
 const URL_MALFORMAT : i32 = 3;
 const NOT_BUILT_IN : i32 = 4;
+const COULDNT_RESOLVE_PROXY : i32 = 5;
 const COULDNT_RESOLVE_HOST : i32 = 6;
 const COULDNT_CONNECT : i32 = 7;
 const WEIRD_SERVER_REPLY : i32 = 8;

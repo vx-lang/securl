@@ -373,15 +373,12 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
 }
 
 /// The CONNECT request that asks an HTTP proxy for a tunnel to the host of `u`.
-pub fn build_connect_request(u : &Url, has_credentials : bool, user : &Vec<u8>,
+pub fn build_connect_request(target : &Vec<u8>, has_credentials : bool, user : &Vec<u8>,
 password : &Vec<u8>, has_user_agent : bool, user_agent : &Vec<u8>) -> Vec<u8> {
-  let mut target = host_text(u);
-  push_lit(&mut target, ":");
-  push_u64(&mut target, u.port as u64);
   let mut out = lit("CONNECT ");
-  append(&mut out, &target);
+  append(&mut out, target);
   push_lit(&mut out, " HTTP/1.1\r\n");
-  add_line(&mut out, "Host: ", &target);
+  add_line(&mut out, "Host: ", target);
   if has_credentials {
     let mut pair = clone_bytes(user);
     push_lit(&mut pair, ":");

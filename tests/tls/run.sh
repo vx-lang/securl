@@ -303,6 +303,13 @@ if getent hosts ip6-localhost > /dev/null 2>&1; then
     "http://ip6-localhost:$http/"
   stderr_has "  and sends its address" "cannot complete SOCKS5 connection to ip6-localhost. (5)"
 fi
+# curl 8.23 gives the error of its resolver, not the "error 6 resolving SOCKS destination" of its
+# SOCKS code.
+check "SOCKS5 with a name that has no address" 6 "" -sS -x "socks5://$s" \
+  "http://no-such-host.invalid:$http/"
+stderr_has "  with curl's message" "curl: (6) Could not resolve host: no-such-host.invalid"
+check "SOCKS4 with a name that has no address" 6 "" -sS -x "socks4://$s" \
+  "http://no-such-host.invalid:$http/"
 check "SOCKS5h sends the name" 0 "hello over tls" -sS -x "socks5h://$s" "http://localhost:$http/"
 logged "  to the proxy" "SOCKS5 atyp=3 localhost:$http user="
 check "  and so does --socks5-hostname" 0 "hello over tls" -sS --socks5-hostname "$s" \

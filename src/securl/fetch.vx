@@ -276,7 +276,11 @@ fn connect_target(cfg : &Config, u : &Url) -> Result<Target, Failure> {
   for rule in cfg.connect_to.iter() {
     let f = colon_fields(rule);
     if f.len() == 4 {
-      let host_ok = f.get_ref(0).len() == 0 || eq_nocase(f.get_ref(0), &u.host);
+      let mut from = clone_bytes(f.get_ref(0));
+      if from.len() > 1 && from.get(0) == 91u8 && from.get(from.len() - 1) == 93u8 {
+        from = range_of(&from, 1, from.len() - 1);
+      }
+      let host_ok = from.len() == 0 || eq_nocase(&from, &u.host);
       if host_ok && port_matches(f.get_ref(1), u.port) {
         if f.get_ref(2).len() > 0 {
           host = clone_bytes(f.get_ref(2));
@@ -681,7 +685,8 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
     &creds.password, has_custom(headers, "Authorization"), &method, &u.path, &origin_of(u));
   // The credentials of an HTTP proxy go with each request that goes through it. The CONNECT of
   // a tunnel sends its own.
-  let via_proxy = proxy.used && is_http_proxy(proxy.kind) && !secure && !cfg.proxytunnel;
+  let tunnel = tunnels(cfg, u, &proxy, secure)?;
+  let via_proxy = proxy.used && is_http_proxy(proxy.kind) && !tunnel;
   let proxy_allowed = via_proxy && proxy.has_credentials;
   let proxy_header = output_auth(&mut auth.proxy, &mut auth.proxy_digest, proxy_allowed,
     &proxy.user, &proxy.password, has_custom(headers, "Proxy-Authorization"), &method, &u.path,
@@ -742,7 +747,9 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
 
   let mut address = Vec<u8>::new();
   if proxy.used {
-    address = connect_address(cfg, &proxy.url)?;
+    // `--connect-to` is for the server, not for the proxy, as in curl.
+    let proxy_host = resolve_rule(cfg, &proxy.url.host, proxy.url.port)?;
+    address = address_of(&proxy_host, proxy.url.port);
   } else {
     address = connect_address(cfg, u)?;
   }
@@ -753,7 +760,7 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
   let connect_started = Instant::now();
   let connect_deadline = earliest(deadline,
     deadline_after(Duration::from_millis(connect_limit_ms(cfg) as u64)));
-  let mut c = connected(connect_phase(network, tls, cfg, u, &proxy, &address, secure,
+  let mut c = connected(connect_phase(network, tls, cfg, u, &proxy, &address, secure, tunnel,
     connect_deadline, info, console, sinks), &connect_started)?;
   c.set_deadline(deadline);
   if cfg.limit_rate > 0i64 {
@@ -1139,10 +1146,91 @@ fn earliest(a : Instant, b : Instant) -> Instant {
   return b;
 }
 
+/// The place that `--connect-to` gives for `u` when it is not the server of `u` itself: curl's
+/// "via peer".
+fn via_target(cfg : &Config, u : &Url) -> Result<Option<Target>, Failure> {
+  let target = connect_target(cfg, u)?;
+  if eq_nocase(&target.host, &u.host) && target.port == u.port {
+    return Result<Option<Target>, Failure>::Ok(Option<Target>::None());
+  }
+  return Result<Option<Target>, Failure>::Ok(Option<Target>::Some(target));
+}
+
+/// Whether the request goes through a CONNECT tunnel of an HTTP proxy: for HTTPS, with `-p`,
+/// and, as in curl, whenever `--connect-to` sends it to another place.
+fn tunnels(cfg : &Config, u : &Url, proxy : &Proxy, secure : bool) -> Result<bool, Failure> {
+  if !proxy.used || !is_http_proxy(proxy.kind) {
+    return Result<bool, Failure>::Ok(false);
+  }
+  if secure || cfg.proxytunnel {
+    return Result<bool, Failure>::Ok(true);
+  }
+  return Result<bool, Failure>::Ok(via_target(cfg, u)?.is_some());
+}
+
+/// `host:port`, with brackets around an IPv6 address.
+fn host_port_text(host : &Vec<u8>, port : i32) -> Vec<u8> {
+  let mut m = Vec<u8>::new();
+  if find_byte(host, 58u8, 0) >= 0 {
+    push_lit(&mut m, "[");
+    append(&mut m, host);
+    push_lit(&mut m, "]");
+  } else {
+    append(&mut m, host);
+  }
+  push_lit(&mut m, ":");
+  push_u64(&mut m, port as u64);
+  return m;
+}
+
+/// `host:port`.
+fn host_port(host : &Vec<u8>, port : i32) -> Vec<u8> {
+  let mut m = clone_bytes(host);
+  push_lit(&mut m, ":");
+  push_u64(&mut m, port as u64);
+  return m;
+}
+
+/// What the messages of a connect that failed name, as curl 8.23 does: the origin, which is the
+/// proxy when an HTTP proxy forwards the request and else the server; `via` the place of
+/// `--connect-to`; and `over proxy` the name of the proxy.
+fn conn_names(cfg : &Config, u : &Url, proxy : &Proxy, tunnel : bool) -> Result<ConnNames, Failure> {
+  let forwards = proxy.used && is_http_proxy(proxy.kind) && !tunnel;
+  let mut label = Vec<u8>::new();
+  if forwards {
+    label = host_port(&proxy.url.host, proxy.url.port);
+  } else {
+    label = host_port(&u.host, u.port);
+  }
+  if proxy.used {
+    push_lit(&mut label, " over proxy ");
+    append(&mut label, &proxy.url.host);
+  } else {
+    // A `match` of `f()?` that binds a name panics the AST code generator, so it takes a name.
+    let via = via_target(cfg, u)?;
+    match via {
+      Option<Target>::Some(target) => {
+        push_lit(&mut label, " via ");
+        append(&mut label, &host_port(&target.host, target.port));
+      },
+      Option<Target>::None() => {}
+    }
+  }
+  let mut host = clone_bytes(&u.host);
+  if proxy.used {
+    host = clone_bytes(&proxy.url.host);
+  }
+  return Result<ConnNames, Failure>::Ok(ConnNames {
+    host : host,
+    is_proxy : proxy.used,
+    label : label
+  });
+}
+
 /// Connect to `address`, then make the tunnel of a proxy and start TLS when `secure`. Each step
 /// gives up at `deadline`.
 fn connect_phase(network : &Network, tls : &TlsSettings, cfg : &Config, u : &Url, proxy : &Proxy,
-address : &Vec<u8>, secure : bool, deadline : Instant, info : &mut TransferInfo,
+address : &Vec<u8>, secure : bool, tunnel : bool, deadline : Instant, info : &mut TransferInfo,
 console : &mut Console, sinks : &mut Sinks) -> Result<Conn, Failure> {
   if cfg.verbose {
     let mut m = lit("  Trying ");
@@ -1150,7 +1238,8 @@ console : &mut Console, sinks : &mut Sinks) -> Result<Conn, Failure> {
     push_lit(&mut m, "...");
     verbose_info(console, &m);
   }
-  let mut c = open_conn(network, address, &u.host, u.port, deadline, &socket_options(cfg))?;
+  let names = conn_names(cfg, u, proxy, tunnel)?;
+  let mut c = open_conn(network, address, &names, deadline, &socket_options(cfg))?;
   info.num_connects = info.num_connects + 1;
   info.remote_address = clone_bytes(address);
   if cfg.verbose {
@@ -1170,12 +1259,12 @@ console : &mut Console, sinks : &mut Sinks) -> Result<Conn, Failure> {
     }
   }
   // A SOCKS proxy connects to the server. HTTPS through an HTTP proxy goes through a CONNECT
-  // tunnel, and so does HTTP with `-p`.
+  // tunnel, and so does HTTP with `-p` or `--connect-to`.
   if proxy.used && is_socks(proxy.kind) {
     let request = socks_request(network, cfg, u, proxy)?;
     let _socks = socks_connect(&mut c, &request)?;
   }
-  if proxy.used && !is_socks(proxy.kind) && (secure || cfg.proxytunnel) {
+  if tunnel {
     open_tunnel(&mut c, cfg, u, proxy, info, console, sinks)?;
   }
   if secure {
@@ -1422,7 +1511,17 @@ fn has_port_in(text : &Vec<u8>) -> bool {
 /// in curl, unless `--suppress-connect-headers`.
 fn open_tunnel(c : &mut Conn, cfg : &Config, u : &Url, proxy : &Proxy, info : &mut TransferInfo,
 console : &mut Console, sinks : &mut Sinks) -> Result<i32, Failure> {
-  let request = build_connect_request(u, proxy.has_credentials, &proxy.user, &proxy.password,
+  let mut target = host_text(u);
+  push_lit(&mut target, ":");
+  push_u64(&mut target, u.port as u64);
+  let via = via_target(cfg, u)?;
+  match via {
+    Option<Target>::Some(t) => {
+      target = host_port_text(&t.host, t.port);
+    },
+    Option<Target>::None() => {}
+  }
+  let request = build_connect_request(&target, proxy.has_credentials, &proxy.user, &proxy.password,
     cfg.has_user_agent, &cfg.user_agent);
   if cfg.verbose {
     verbose_lines(console, "> ", &request);

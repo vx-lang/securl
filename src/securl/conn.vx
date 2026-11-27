@@ -103,11 +103,22 @@ fn failure_of(e : TlsError) -> Failure {
   return fail_with(e.code, e.message);
 }
 
-/// Connect to `address`, written as `host:port`, and set the socket options `options`. `host`
-/// and `port` are for the messages. The connect, and each wait of the connection after it, give
-/// up at `deadline`, which `Instant::never()` turns off. The caller needs the network right.
-pub fn open_conn(network : &Network, address : &Vec<u8>, host : &Vec<u8>, port : i32,
+/// What the messages of a connect that failed name, as curl 8.23 does.
+struct ConnNames {
+  // The host of `address` before its lookup, and whether it is a proxy, for "Could not resolve
+  // host: NAME" or "Could not resolve proxy: NAME".
+  host : Vec<u8>,
+  is_proxy : bool,
+  // The text after "Failed to connect to ", such as `example.com:443 over proxy 10.0.0.1`.
+  label : Vec<u8>,
+}
+
+/// Connect to `address`, written as `host:port`, and set the socket options `options`. `names`
+/// are for the messages. The connect, and each wait of the connection after it, give up at
+/// `deadline`, which `Instant::never()` turns off. The caller needs the network right.
+pub fn open_conn(network : &Network, address : &Vec<u8>, names : &ConnNames,
 deadline : Instant, options : &SocketOptions) -> Result<Conn, Failure> {
+  let started = Instant::now();
   let mut target = String::new();
   match to_string(address) {
     Option<String>::Some(s) => {
@@ -148,8 +159,13 @@ deadline : Instant, options : &SocketOptions) -> Result<Conn, Failure> {
     Result<TcpStream, NetError>::Err(e) => {
       match e {
         NetError::BadAddress() => {
+          if names.is_proxy {
+            let mut m = lit("Could not resolve proxy: ");
+            append(&mut m, &names.host);
+            return Result<Conn, Failure>::Err(fail_with(COULDNT_RESOLVE_PROXY, m));
+          }
           let mut m = lit("Could not resolve host: ");
-          append(&mut m, host);
+          append(&mut m, &names.host);
           return Result<Conn, Failure>::Err(fail_with(COULDNT_RESOLVE_HOST, m));
         },
         NetError::Cancelled() => {
@@ -157,12 +173,13 @@ deadline : Instant, options : &SocketOptions) -> Result<Conn, Failure> {
           return Result<Conn, Failure>::Err(fail_lit(OPERATION_TIMEDOUT, "Operation timed out"));
         },
         NetError::Refused() => {
-          let mut f = fail_with(COULDNT_CONNECT, connect_failure(host, port));
+          let mut f = fail_with(COULDNT_CONNECT, connect_failure(names, &started));
           f.refused = true;
           return Result<Conn, Failure>::Err(f);
         },
         _ => {
-          return Result<Conn, Failure>::Err(fail_with(COULDNT_CONNECT, connect_failure(host, port)));
+          return Result<Conn, Failure>::Err(fail_with(COULDNT_CONNECT,
+            connect_failure(names, &started)));
         }
       }
     }
@@ -333,12 +350,12 @@ impl Conn {
   }
 }
 
-/// curl's text for a connection that did not open.
-fn connect_failure(host : &Vec<u8>, port : i32) -> Vec<u8> {
+/// curl's text for a connection that did not open, which began at `started`.
+fn connect_failure(names : &ConnNames, started : &Instant) -> Vec<u8> {
   let mut m = lit("Failed to connect to ");
-  append(&mut m, host);
-  push_lit(&mut m, " port ");
-  push_u64(&mut m, port as u64);
-  push_lit(&mut m, ": Could not connect to server");
+  append(&mut m, &names.label);
+  push_lit(&mut m, " after ");
+  push_u64(&mut m, started.elapsed().as_millis());
+  push_lit(&mut m, " ms: Could not connect to server");
   return m;
 }

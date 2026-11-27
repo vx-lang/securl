@@ -59,20 +59,22 @@ make test-h2    # HTTP/2 tests against a local server (makes a virtualenv with h
 
 Measured with curl's own test suite: curl's `runtests.pl` and its test servers, pointed at
 `build/securl` with `-c`. The tests come from curl commit 2f5c657, and the compiler is vxc from
-Vx main 12f3786c8.
+Vx main 0c0120e49.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 538 of 757 (71%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 488 of 569 (85%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 205 of 205 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 539 of 757 (71%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 490 of 569 (86%) |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 210 of 210 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 12 of 12 |
 
 `CURL=/path/to/curl tests/tls/run.sh` runs the checks of `tests/tls` against another curl, and
 `tests/h2/run.sh` takes `CURL` too. curl 8.23.1-DEV, built from the same curl commit, passes all
 TLS checks but one, which it skips: curl reads the extension of a chunk-size line with no limit
-and waits for `-m`, while securl stops after 100 KiB. curl 8.18 with nghttp2 passes all HTTP/2
+and waits for `-m`, while securl stops after 100 KiB. In about one run in six, curl gets exit 55
+instead of 56 when the server asks for a client certificate that it does not have, because the
+server's alert can come before curl's request is sent. curl 8.18 with nghttp2 passes all HTTP/2
 checks, with the same exit codes. It skips four that look for securl's own messages, where
 curl gives the error texts of nghttp2.
 
@@ -82,7 +84,9 @@ program of the curl build, linked with curl's own libcurl, so they never run sec
 the counts above included them by mistake: 152 of them passed, and the table said 522 of 874.
 Test 1070 depends on timing: the test server closes the connection while securl sends the
 body. It passes in some runs, between one in four and one in twelve, with and without recent
-changes. It failed in the run of the table above.
+changes. It passed in the run of the table above. Test 1849 (two HTTPS transfers through a
+proxy) fails in about one run in three, and did so before the latest changes too: the log of the
+test server sometimes lacks the second request. It failed in that run.
 
 The C build of the test suite has OpenSSL, so that runtests.pl runs the Digest tests (see "Run
 curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tests too.
@@ -91,7 +95,7 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 15,973 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 16,080 | none, and `--no-trusted-code` enforces this |
 | `src/cli/` (the tool) and `src/disk/` (its files) | 1,485 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 14 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,301 | 48 `extern` functions, 92 `unsafe` blocks |
@@ -372,7 +376,15 @@ A proxy URL with the scheme `socks4`, `socks4a`, `socks5` or `socks5h`, or the o
 and the user name and password of RFC 1929 for SOCKS5. SOCKS4a and SOCKS5h send the host name to
 the proxy. SOCKS4 and SOCKS5 send its address, so securl looks the name up: with `--resolve`, or
 as libcurl does for `localhost` (::1 first, then 127.0.0.1), or else with `std::net::lookup`,
-which takes the network right.
+which takes the network right. A name with no address gives exit 6 and "Could not resolve
+host", as curl 8.23 does.
+
+`--connect-to` sends the connection to another host and port, and the request still names the
+host of the URL. Through an HTTP proxy, curl then always makes a CONNECT tunnel to that place,
+and so does securl. `--connect-to` never changes where the proxy itself is. A connect that fails
+gives curl 8.23's message, such as `Failed to connect to example.com:443 via 10.0.0.2:8443 after
+3 ms` or `Failed to connect to example.com:443 over proxy 10.0.0.1 after 0 ms`, and a proxy name
+with no address gives exit 5 and "Could not resolve proxy".
 
 `--limit-rate` takes curl's sizes, such as `500`, `2k` or `1.5M`, and holds each direction of
 the transfer to that many bytes per second after the connect, as curl does: a read waits until

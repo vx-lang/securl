@@ -477,7 +477,7 @@ fn retry_wait(console : &mut Console, cfg : &Config, code : i32, refused : bool,
 info : &TransferInfo, sleep : &mut i64, left : i64, elapsed : i64) -> i64 {
   let mut reason = lit("");
   let mut http = false;
-  if code == OPERATION_TIMEDOUT || code == COULDNT_RESOLVE_HOST || code == 5 {
+  if code == OPERATION_TIMEDOUT || code == COULDNT_RESOLVE_HOST || code == COULDNT_RESOLVE_PROXY {
     reason = lit(": timeout");
   } else if cfg.retry_connrefused && code == COULDNT_CONNECT {
     if refused {

@@ -97,19 +97,12 @@ fn push_port(out : &mut Vec<u8>, port : i32) -> void {
   out.push((port % 256) as u8);
 }
 
-/// The text `host:port` of the server, for a message.
-fn dest_text(req : &SocksRequest) -> Vec<u8> {
-  let mut m = clone_bytes(&req.host);
-  push_lit(&mut m, ":");
-  push_u64(&mut m, req.port as u64);
-  return m;
-}
-
-/// The message of a lookup of the server that failed. 6 is CURLE_COULDNT_RESOLVE_HOST.
+/// The failure of a lookup of the server, as curl 8.23 gives it: its resolver's message and exit
+/// code 6, not the "error 6 resolving SOCKS destination" of its SOCKS code.
 fn lookup_failure(req : &SocksRequest) -> Failure {
-  let mut m = lit("error 6 resolving SOCKS destination ");
-  append(&mut m, &dest_text(req));
-  return socks_fail(m);
+  let mut m = lit("Could not resolve host: ");
+  append(&mut m, &req.host);
+  return fail_with(COULDNT_RESOLVE_HOST, m);
 }
 
 /// Ask the SOCKS proxy at the other end of `c` for a connection to the server of `req`. When
