@@ -1,8 +1,8 @@
 # Build securl with vxc from a pinned commit of Vx main, and run its tests.
 #
-# The jobs run in Vx's build image, which has LLVM 22 with MLIR, clang and Rust. vxc builds from
-# the commit in VX_COMMIT, once: the cache keeps it, with its runtime library and the stdlib that
-# it reads beside it.
+# Each job installs LLVM 22, MLIR and z3 from apt.llvm.org with Vx's own setup_linux.sh. vxc
+# builds from the commit in VX_COMMIT once, and the cache keeps it in ~/vx, with its runtime
+# library and the stdlib that it reads beside it.
 name: build
 on:
   push:
@@ -13,20 +13,27 @@ env:
 jobs:
   vxc:
     runs-on: ubuntu-24.04
-    container: ghcr.io/vx-lang/vx-build:llvm22
     steps:
       - name: Cache vxc
         id: cache
         uses: actions/cache@v4
         with:
-          path: /opt/vx
+          path: ~/vx
           key: vxc-${{ env.VX_COMMIT }}
+      - name: Get Vx
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --filter=blob:none https://github.com/vx-lang/Vx ~/vx
+          git -C ~/vx checkout --detach "$VX_COMMIT"
+      - name: LLVM 22, MLIR and z3
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ~/vx/scripts/provision/setup_linux.sh
       - name: Build vxc
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          git clone --filter=blob:none https://github.com/vx-lang/Vx /opt/vx
-          cd /opt/vx
-          git checkout --detach "$VX_COMMIT"
+          cd ~/vx
+          ./setup.sh
+          . ./config.local
           cargo build --release
           mkdir -p dist
           cp target/release/vxc target/release/libvx_std_core.a target/release/libvx_std_core.so dist/
@@ -36,7 +43,6 @@ jobs:
   test:
     needs: vxc
     runs-on: ubuntu-24.04
-    container: ghcr.io/vx-lang/vx-build:llvm22
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,9 +50,13 @@ jobs:
       - name: Restore vxc
         uses: actions/cache/restore@v4
         with:
-          path: /opt/vx
+          path: ~/vx
           key: vxc-${{ env.VX_COMMIT }}
           fail-on-cache-miss: true
+      - name: LLVM 22 for vxc, and the runtime of libFuzzer
+        run: |
+          ~/vx/scripts/provision/setup_linux.sh
+          sudo apt-get install -y -qq libclang-rt-22-dev
       - name: Cache OpenSSL
         uses: actions/cache@v4
         with:
@@ -54,11 +64,9 @@ jobs:
           key: openssl-${{ hashFiles('.git/modules/third_party/openssl/HEAD', 'Makefile') }}
       - name: Settings
         run: |
-          echo "VXC = /opt/vx/dist/vxc" > config.mk
-          echo "VX_LIBDIR = /opt/vx/dist" >> config.mk
+          echo "VXC = $HOME/vx/dist/vxc" > config.mk
+          echo "VX_LIBDIR = $HOME/vx/dist" >> config.mk
           echo "JOBS = 4" >> config.mk
-      - name: Python
-        run: apt-get update -qq && apt-get install -y -qq python3 python3-venv
       - name: Build
         run: make
       - name: Audit
@@ -86,16 +94,15 @@ jobs:
   curl-tests:
     needs: test
     runs-on: ubuntu-24.04
-    container: ghcr.io/vx-lang/vx-build:llvm22
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      # securl links the runtime of vxc, libvx_std_core, from /opt/vx/dist.
+      # securl links the runtime of vxc, libvx_std_core, from ~/vx/dist.
       - name: Restore vxc
         uses: actions/cache/restore@v4
         with:
-          path: /opt/vx
+          path: ~/vx
           key: vxc-${{ env.VX_COMMIT }}
           fail-on-cache-miss: true
       - uses: actions/download-artifact@v4
@@ -107,21 +114,19 @@ jobs:
         with:
           path: build/openssl
           key: openssl-${{ hashFiles('.git/modules/third_party/openssl/HEAD', 'Makefile') }}
-      - name: Perl and Python
-        run: apt-get update -qq && apt-get install -y -qq perl python3 python3-venv
       - name: Build curl's test servers, stunnel and nghttpx
         run: |
           chmod +x build/securl
           make openssl-dev
-          git clone --filter=blob:none https://github.com/curl/curl /opt/curl-src
-          git -C /opt/curl-src checkout --detach "$CURL_COMMIT"
-          cmake -S /opt/curl-src -B /opt/curl-src/build -DCURL_ENABLE_SSL=ON -DCURL_USE_OPENSSL=ON \
+          git clone --filter=blob:none https://github.com/curl/curl ~/curl-src
+          git -C ~/curl-src checkout --detach "$CURL_COMMIT"
+          cmake -S ~/curl-src -B ~/curl-src/build -DCURL_ENABLE_SSL=ON -DCURL_USE_OPENSSL=ON \
             -DOPENSSL_USE_STATIC_LIBS=ON -DOPENSSL_ROOT_DIR="$PWD/build/openssl-dev/usr/local" \
             -DCURL_USE_LIBPSL=OFF -DUSE_LIBIDN2=OFF -DCURL_ZLIB=OFF -DCURL_BROTLI=OFF \
             -DCURL_ZSTD=OFF -DUSE_NGHTTP2=OFF -DCURL_USE_LIBSSH2=OFF -DCURL_DISABLE_LDAP=ON \
             -DBUILD_TESTING=ON
-          cmake --build /opt/curl-src/build -j4
-          cmake --build /opt/curl-src/build --target testdeps -j4
+          cmake --build ~/curl-src/build -j4
+          cmake --build ~/curl-src/build --target testdeps -j4
           JOBS=4 tools/build-test-tools.sh
       - name: The supported curl tests
-        run: tests/check-supported.sh /opt/curl-src
+        run: tests/check-supported.sh ~/curl-src
