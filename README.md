@@ -624,6 +624,7 @@ src/securl/          the protocol code; no trusted code
   writeout.vx          -w
 third_party/openssl  OpenSSL 3.5.9 (LTS), a shallow git submodule
 LICENSE              curl's license, with the copyright of securl and of curl
+CHANGELOG.md         what each release brings
 tests/unit/          unit tests of the parsers
 tests/tls/           HTTPS tests against local servers, with test certificates
 tests/run-curl-tests.sh   runs curl's runtests.pl against build/securl
