@@ -134,6 +134,12 @@ pub fn tool_main(root : Root, command_line : Vec<String>) -> i32 {
     }
   }
   let mut groups = parser.finish();
+  // As curl, at the end of the command line: the last group may not have both -J and -C -.
+  let last = groups.get_ref(groups.len() - 1);
+  if last.remote_header_name && last.resume_current {
+    console.to_stderr(&lit("curl: --continue-at and --remote-header-name cannot be combined\ncurl: try 'curl --help' for more information\n"));
+    return FAILED_INIT;
+  }
   let env_vars = proxy_env(&root.env);
   for cfg in groups.iter_mut() {
     cfg.proxy_env = clone_env(&env_vars);
@@ -372,28 +378,58 @@ fn print_help(console : &mut Console) -> void {
   let _ok = console.to_stdout(&m);
 }
 
-/// Open the output of transfer number `index`: a `-o` file, a `-O` file, or standard output.
-fn open_output(files : &Files, cfg : &Config, index : i32, url_text : &Vec<u8>,
-state : &mut OutputState) -> Result<Output, Failure> {
+/// Where the output of a transfer goes: standard output, or the file `path`, which the tool opens
+/// only when the transfer needs it. `remote` is a `-O` file, whose name `-J` may change.
+struct OutputPlan {
+  to_stdout : bool,
+  path : Vec<u8>,
+  remote : bool,
+}
+
+/// The output of transfer number `index`: a `-o` file, a `-O` file, or standard output.
+fn plan_output(console : &mut Console, cfg : &Config, index : i32, url_text : &Vec<u8>)
+-> Result<OutputPlan, Failure> {
   if index < cfg.outputs.len() {
     let name = cfg.outputs.get_ref(index);
     if eq_lit(name, "-") {
-      return Result<Output, Failure>::Ok(stdout_output());
+      return Result<OutputPlan, Failure>::Ok(stdout_plan());
     }
-    let file = create_output_file(files, &in_output_dir(cfg, name), state)?;
-    return Result<Output, Failure>::Ok(file_output(file));
+    return Result<OutputPlan, Failure>::Ok(OutputPlan {
+      to_stdout : false,
+      path : in_output_dir(cfg, name),
+      remote : false
+    });
   }
   if cfg.remote_name_all || index - cfg.outputs.len() < cfg.remote_names {
     let u = parse_url(url_text, cfg.path_as_is)?;
     let name = remote_file_name(&u);
-    if name.len() == 0 {
-      return Result<Output, Failure>::Err(fail_lit(WRITE_ERROR,
-        "Remote filename has no length"));
+    if eq_lit(&name, "curl_response") && !ends_with_lit(&u.path, "curl_response") && !cfg.silent {
+      console.to_stderr(&message_lines("Warning: ", &lit("No remote filename, uses \"curl_response\""),
+        cfg.columns));
     }
-    let file = create_output_file(files, &in_output_dir(cfg, &name), state)?;
-    return Result<Output, Failure>::Ok(file_output(file));
+    return Result<OutputPlan, Failure>::Ok(OutputPlan {
+      to_stdout : false,
+      path : in_output_dir(cfg, &name),
+      remote : true
+    });
   }
-  return Result<Output, Failure>::Ok(stdout_output());
+  return Result<OutputPlan, Failure>::Ok(stdout_plan());
+}
+
+fn stdout_plan() -> OutputPlan {
+  return OutputPlan {
+    to_stdout : true,
+    path : Vec<u8>::new(),
+    remote : false
+  };
+}
+
+fn ends_with_lit(a : &Vec<u8>, s : *const i8) -> bool {
+  let t = lit(s);
+  if t.len() > a.len() {
+    return false;
+  }
+  return same_bytes(&rest_from(a, a.len() - t.len()), &t);
 }
 
 /// What the tool knows about the output file of a transfer, to clean up after one that failed.
@@ -412,6 +448,10 @@ struct OutputState {
   // `-C`: the offset that the transfer goes on from, and whether it is the size of the file.
   resume : i64,
   resume_current : bool,
+  // A warning of curl about the file, such as one that `-J` would write over, and whether the
+  // transfer asked for the file at all.
+  warning : Vec<u8>,
+  asked : bool,
 }
 
 fn empty_output_state() -> OutputState {
@@ -423,7 +463,9 @@ fn empty_output_state() -> OutputState {
     keep : false,
     retrying : false,
     resume : 0i64,
-    resume_current : false
+    resume_current : false,
+    warning : Vec<u8>::new(),
+    asked : false
   };
 }
 
@@ -512,33 +554,27 @@ info : &TransferInfo, sleep : &mut i64, left : i64, elapsed : i64) -> i64 {
   return wait;
 }
 
-/// Create the output file `path`, and note it in `state`.
-fn create_output_file(files : &Files, path : &Vec<u8>, state : &mut OutputState)
--> Result<File, Failure> {
-  state.created = !file_exists(files, path);
-  if state.resume_current {
-    // `-C -`: go on from the size of the file as it is.
-    let size = file_size(files, path);
-    state.resume = 0i64;
-    if size > 0i64 {
-      state.resume = size;
-    }
+/// Open the output file of `plan` when the transfer needs it, and note it in `state`. With
+/// `-J` and a `-O` file, `name` from the response (when `from_server`) names the file in the
+/// output folder instead, and an existing file there stays: curl refuses to write over it.
+fn open_planned(files : &Files, cfg : &Config, state : &mut OutputState, plan : &OutputPlan,
+name : &Vec<u8>, from_server : bool) -> Result<File, Failure> {
+  state.asked = true;
+  let mut path = clone_bytes(&plan.path);
+  let server_name = from_server && name.len() > 0 && cfg.remote_header_name && plan.remote;
+  if server_name {
+    path = in_output_dir(cfg, name);
   }
-  let mut file = Option<File>::None();
+  state.created = !file_exists(files, &path);
+  if server_name && !state.created {
+    state.warning = lit_then("Failed to open the file ", &lit_then_lit(&path, ": File exists"));
+    return Result<File, Failure>::Err(fail_lit(WRITE_ERROR, "Failed writing header"));
+  }
+  state.path = clone_bytes(&path);
   if state.keep || state.resume > 0i64 {
-    file = Option<File>::Some(open_to_append(files, path)?);
-  } else {
-    file = Option<File>::Some(create_file(files, path)?);
+    return open_to_append(files, &path);
   }
-  state.path = clone_bytes(path);
-  match file {
-    Option<File>::Some(f) => {
-      return Result<File, Failure>::Ok(f);
-    },
-    Option<File>::None() => {
-      return Result<File, Failure>::Err(fail_lit(WRITE_ERROR, "no file"));
-    }
-  }
+  return create_file(files, &path);
 }
 
 /// Clean up the output file of a transfer that failed. curl opens its output file only when the
@@ -1125,7 +1161,19 @@ session : &mut Session, index : i32, info : &mut TransferInfo, state : &mut Outp
       state.resume_current = false;
     }
   }
-  let body_output = open_output(files, cfg, index, url_text, state)?;
+  let plan = plan_output(console, cfg, index, url_text)?;
+  let mut body_output = stdout_output();
+  if !plan.to_stdout {
+    // The file opens when the transfer needs it, as curl's does.
+    body_output = pending_output();
+    if state.resume_current {
+      let size = file_size(files, &plan.path);
+      state.resume = 0i64;
+      if size > 0i64 {
+        state.resume = size;
+      }
+    }
+  }
   let header_output = open_header_output(files, cfg, state.retrying)?;
   let mut sinks = Sinks {
     body : body_output,
@@ -1133,8 +1181,33 @@ session : &mut Session, index : i32, info : &mut TransferInfo, state : &mut Outp
     has_headers : cfg.has_dump_header,
     resume_from : state.resume
   };
-  let result = run_transfer(network, tls, cfg, headers, url_text, request_body, kind,
-    form_boundary, session, console, &mut sinks, info);
+  // The right to open this one output file, which is all of the file right that the transfer
+  // gets.
+  let opener = |name : &Vec<u8>, from_server : bool| -> Result<File, Failure> {
+    open_planned(files, cfg, state, &plan, name, from_server)
+  };
+  let mut result = run_transfer(network, tls, cfg, headers, url_text, request_body, kind,
+    form_boundary, session, console, &mut sinks, info,
+    opener as |&Vec<u8>, bool| -> Result<File, Failure>);
+  if sinks.body.is_pending() && sinks.body.has_held() && !state.asked {
+    // Bytes went to the output, such as the head of `-i`, but the transfer ended before the
+    // body: curl had made the file for them.
+    let empty = Vec<u8>::new();
+    match opener(&empty, false) {
+      Result<File, Failure>::Ok(f) => {
+        let _a = sinks.body.attach(f);
+      },
+      Result<File, Failure>::Err(e) => {
+        if result.is_ok() {
+          result = Result<i32, Failure>::Err(e);
+        }
+      }
+    }
+  }
+  if state.warning.len() > 0 && !cfg.silent {
+    console.to_stderr(&message_lines("Warning: ", &state.warning, cfg.columns));
+  }
+  info.filename_effective = clone_bytes(&state.path);
   state.written = sinks.body.written > 0i64;
   state.bytes = sinks.body.delivered;
   return result;

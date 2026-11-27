@@ -71,7 +71,10 @@ fn main() -> i32 {
   assert(error_code("http://h:8x/") == URL_MALFORMAT, "port not a number");
 
   assert(eq_lit(&remote_file_name(&parsed("http://h/dir/file.txt?x")), "file.txt"), "-O name");
-  assert(remote_file_name(&parsed("http://h/dir/")).len() == 0, "-O name of a folder");
+  // As curl 8.23: the slashes at the end do not count, and no name at all is curl_response.
+  assert(eq_lit(&remote_file_name(&parsed("http://h/dir/")), "dir"), "-O name of a folder");
+  assert(eq_lit(&remote_file_name(&parsed("http://h/")), "curl_response"), "-O name of no path");
+  assert(eq_lit(&remote_file_name(&parsed("http://h/a\\b")), "b"), "-O name after a backslash");
 
   assert(eq_lit(&resolved("http://h/a/b", "/c"), "http://h/c"), "absolute path");
   assert(eq_lit(&resolved("http://h/a/b", "c"), "http://h/a/c"), "relative path");

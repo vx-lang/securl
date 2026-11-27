@@ -183,6 +183,8 @@ struct Config {
   use_resume : bool,
   resume_from : i64,
   resume_current : bool,
+  // `-J`: with `-O`, the file name comes from the Content-Disposition of the response.
+  remote_header_name : bool,
   hsts : Vec<u8>,
   // The proxy variables of the environment that are set, such as `https_proxy`. The tool
   // reads them. This package gets their values, and not the right to read the environment.
@@ -293,6 +295,7 @@ pub fn default_config() -> Config {
     use_resume : false,
     resume_from : 0i64,
     resume_current : false,
+    remote_header_name : false,
     hsts : Vec<u8>::new(),
     proxy_env : Vec<EnvVar>::new()
   };
@@ -401,6 +404,7 @@ const OPT_RETRY_CONNREFUSED : i32 = 99;
 const OPT_RETRY_ALL_ERRORS : i32 = 100;
 const OPT_CONTINUE_AT : i32 = 101;
 const OPT_MANUAL : i32 = 102;
+const OPT_REMOTE_HEADER_NAME : i32 = 103;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -510,6 +514,7 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "retry-all-errors") { return OPT_RETRY_ALL_ERRORS; }
   if eq_lit(name, "continue-at") { return OPT_CONTINUE_AT; }
   if eq_lit(name, "manual") { return OPT_MANUAL; }
+  if eq_lit(name, "remote-header-name") { return OPT_REMOTE_HEADER_NAME; }
   return OPT_UNKNOWN;
 }
 
@@ -529,6 +534,7 @@ fn short_option(letter : u8) -> i32 {
   if letter == 114u8 { return OPT_RANGE; }          // r
   if letter == 67u8 { return OPT_CONTINUE_AT; }     // C
   if letter == 77u8 { return OPT_MANUAL; }          // M
+  if letter == 74u8 { return OPT_REMOTE_HEADER_NAME; } // J
   if letter == 84u8 { return OPT_UPLOAD_FILE; }     // T
   if letter == 117u8 { return OPT_USER; }           // u
   if letter == 119u8 { return OPT_WRITE_OUT; }      // w
@@ -1149,6 +1155,10 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
   }
   if id == OPT_MAX_FILESIZE {
     cfg.max_filesize = size_arg(value, shown)?;
+    return done();
+  }
+  if id == OPT_REMOTE_HEADER_NAME {
+    cfg.remote_header_name = enable;
     return done();
   }
   if id == OPT_CONTINUE_AT {

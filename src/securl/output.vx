@@ -3,6 +3,7 @@
 // This file cannot open a file, because it never gets a `&Files`. `main` opens each output
 // file and gives the open `File` to `file_output`. It writes to standard output and standard
 // error only with the rights in a `Console`, which `main` makes from its `Root`.
+import core::mem;
 import core::option;
 import core::result;
 import std::fs;
@@ -54,6 +55,11 @@ struct Output {
   delivered : i64,
   // `--max-filesize` for the body, or 0.
   limit : i64,
+  // A file that is not open yet: the tool opens it when the transfer needs it, as curl opens
+  // its output file only when the first bytes arrive, and with `-J` only once the response
+  // names it. Until then the bytes wait in `held`.
+  pending : bool,
+  held : Vec<u8>,
 }
 
 // libcurl hands the body to the output in pieces of at most this size (CURL_MAX_WRITE_SIZE),
@@ -71,8 +77,17 @@ pub fn stdout_output() -> Output {
     in_body : false,
     raw_in : 0i64,
     delivered : 0i64,
-    limit : 0i64
+    limit : 0i64,
+    pending : false,
+    held : Vec<u8>::new()
   };
+}
+
+/// An output to a file that the tool opens later, through the opener that the transfer gets.
+pub fn pending_output() -> Output {
+  let mut out = null_output();
+  out.pending = true;
+  return out;
 }
 
 /// An output to `file`, which `main` opened.
@@ -86,7 +101,9 @@ pub fn file_output(file : File) -> Output {
     in_body : false,
     raw_in : 0i64,
     delivered : 0i64,
-    limit : 0i64
+    limit : 0i64,
+    pending : false,
+    held : Vec<u8>::new()
   };
 }
 
@@ -101,7 +118,9 @@ pub fn null_output() -> Output {
     in_body : false,
     raw_in : 0i64,
     delivered : 0i64,
-    limit : 0i64
+    limit : 0i64,
+    pending : false,
+    held : Vec<u8>::new()
   };
 }
 
@@ -223,6 +242,26 @@ impl Output {
     return Result<Vec<u8>, Failure>::Ok(data);
   }
 
+  /// Whether this output is a file that is not open yet.
+  pub fn is_pending(self : &Output) -> bool {
+    return self.pending;
+  }
+
+  /// Whether bytes wait for the file of a pending output.
+  pub fn has_held(self : &Output) -> bool {
+    return self.held.len() > 0;
+  }
+
+  /// The file of a pending output, now open. The bytes that waited go to it first.
+  pub fn attach(self : &mut Output, file : File) -> Result<i32, Failure> {
+    let mut open = file;
+    let held = replace(&mut self.held, Vec<u8>::new());
+    self.pending = false;
+    let result = write_all_to_file(&mut open, &held);
+    self.file = Option<File>::Some(open);
+    return result;
+  }
+
   /// The most bytes that the next body may have, before and after decoding, or 0 for no limit.
   pub fn limit_body(self : &mut Output, limit : i64) -> void {
     self.limit = limit;
@@ -298,6 +337,10 @@ impl Output {
       if !console.to_stdout(bytes) {
         return Result<i32, Failure>::Err(write_error());
       }
+      return Result<i32, Failure>::Ok(0);
+    }
+    if self.pending {
+      append(&mut self.held, bytes);
       return Result<i32, Failure>::Ok(0);
     }
     // Vx has no `ref mut` pattern yet, so move the file out and put it back.

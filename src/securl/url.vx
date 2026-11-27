@@ -488,6 +488,22 @@ pub fn remote_file_name(u : &Url) -> Vec<u8> {
   if q >= 0 {
     path = range_of(&path, 0, q);
   }
+  // As curl 8.23's `get_url_file_name`: the separators at the end do not count, and a
+  // backslash after the last slash separates too. An empty name is "curl_response", for which
+  // the caller warns.
+  let mut end = path.len();
+  while end > 0 && (path.get(end - 1) == 47u8 || path.get(end - 1) == 92u8) {
+    end = end - 1;
+  }
+  path = range_of(&path, 0, end);
   let slash = rfind_byte(&path, 47u8);
-  return rest_from(&path, slash + 1);
+  if slash < 0 {
+    return lit("curl_response");
+  }
+  let mut name = rest_from(&path, slash + 1);
+  let back = rfind_byte(&name, 92u8);
+  if back >= 0 {
+    name = rest_from(&name, back + 1);
+  }
+  return name;
 }

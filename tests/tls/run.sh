@@ -470,6 +470,38 @@ stderr_has "  with curl's message" "HTTP server does not seem to support byte ra
 check "-C with -d" 43 "" -sS -C 5 -d x "http://127.0.0.1:$http/ranged"
 stderr_has "  with curl's message" "HTTP upload cannot be resumed"
 
+# -J: the file name comes from the Content-Disposition, in --output-dir, and an existing file
+# with that name stays as it is.
+rm -rf "$work/jdir" && mkdir -p "$work/jdir"
+check "-J -O takes the name of Content-Disposition" 0 "$work/jdir/named.txt" -s -J -O \
+  --output-dir "$work/jdir" -w '%{filename_effective}' "http://127.0.0.1:$http/cd/file"
+if [ "$(cat "$work/jdir/named.txt")" = "named" ] && [ ! -e "$work/jdir/file" ]; then
+  echo "ok     with the body, and no file of the URL name"
+else
+  echo "FAIL   the files of -J are wrong"
+  fail=1
+fi
+echo "older" > "$work/jdir/named.txt"
+check "  and does not write over an existing file" 23 "" -s -J -O --output-dir "$work/jdir" \
+  "http://127.0.0.1:$http/cd/file"
+if [ "$(cat "$work/jdir/named.txt")" = "older" ]; then
+  echo "ok     which keeps its bytes"
+else
+  echo "FAIL   -J wrote over the file"
+  fail=1
+fi
+# The output file opens when the first bytes arrive, so a transfer that fails before leaves an
+# existing file alone.
+echo "precious" > "$work/kept"
+check "a failed transfer leaves an existing -o file alone" 7 "" -s -o "$work/kept" \
+  "http://127.0.0.1:1/"
+if [ "$(cat "$work/kept")" = "precious" ]; then
+  echo "ok     with its bytes"
+else
+  echo "FAIL   the file is '$(cat "$work/kept")'"
+  fail=1
+fi
+
 # --tr-encoding: gzip as a transfer coding. Without it, curl refuses one that it did not ask for.
 check "--tr-encoding decodes Transfer-Encoding: gzip" 0 "203890" -s --tr-encoding \
   -w '%{size_delivered}' -o "$work/te" "http://127.0.0.1:$http/te-gzip"

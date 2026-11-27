@@ -232,6 +232,10 @@ fn variable(name : &Vec<u8>, info : &TransferInfo, ctx : &WriteOutContext, out :
     push_i64(out, info.num_redirects as i64);
     return true;
   }
+  if eq_lit(name, "filename_effective") {
+    append(out, &info.filename_effective);
+    return true;
+  }
   if eq_lit(name, "num_retries") {
     push_i64(out, info.num_retries as i64);
     return true;

@@ -5,6 +5,7 @@
 import core::option;
 import core::result;
 import core::time;
+import std::fs;
 import std::net;
 import std::sync::wait;
 import std::time;
@@ -67,6 +68,13 @@ struct TransferInfo {
   retry_after : i64,
   // How many times `--retry` tried the transfer again.
   num_retries : i32,
+  // `-J`: the file name that a Content-Disposition or the Location of a redirect gave, and
+  // whether a Content-Disposition gave it, after which no header changes it.
+  header_name : Vec<u8>,
+  has_header_name : bool,
+  header_name_final : bool,
+  // The file that the output went to, for `%{filename_effective}`, or empty.
+  filename_effective : Vec<u8>,
 }
 
 /// A `TransferInfo` before the transfer starts.
@@ -97,7 +105,11 @@ pub fn new_info() -> TransferInfo {
     expected_size : -1i64,
     received_http10 : false,
     retry_after : 0i64,
-    num_retries : 0
+    num_retries : 0,
+    header_name : Vec<u8>::new(),
+    has_header_name : false,
+    header_name_final : false,
+    filename_effective : Vec<u8>::new()
   };
 }
 
@@ -598,8 +610,8 @@ struct Hop {
 fn one_hop(network : &Network, tls : &TlsSettings, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
 req_kind : i32, body : &Vec<u8>, creds : &Credentials, same_host : bool, has_referer : bool,
 referer : &Vec<u8>, deadline : Instant, form_boundary : &Vec<u8>, auth : &mut AuthContext,
-session : &mut Session, console : &mut Console, sinks : &mut Sinks, info : &mut TransferInfo)
--> Result<Hop, Failure> {
+session : &mut Session, console : &mut Console, sinks : &mut Sinks, info : &mut TransferInfo,
+opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
   let secure = eq_lit(&u.scheme, "https");
   let resume = sinks.resume_from;
   if resume != 0i64 && (req_kind == REQ_POST || req_kind == REQ_PUT) {
@@ -851,6 +863,9 @@ session : &mut Session, console : &mut Console, sinks : &mut Sinks, info : &mut 
     return Result<Hop, Failure>::Err(fail_lit(RANGE_ERROR,
       "Cannot resume: remote file size differs from offset"));
   }
+  if cfg.remote_header_name && head.status >= 200 && head.status < 400 {
+    take_header_name(&head, info);
+  }
   let failed = !retry && !(resumed_get && head.status == 416)
     && auth_should_fail(head.status, cfg.fail || cfg.fail_with_body, allowed, proxy_allowed,
     auth.problem);
@@ -883,6 +898,12 @@ session : &mut Session, console : &mut Console, sinks : &mut Sinks, info : &mut 
           "HTTP server does not seem to support byte ranges. Cannot resume."));
       }
     }
+  }
+  if !again && sinks.body.is_pending() {
+    // The response that the output is for: the tool opens the file now, as curl does when the
+    // body starts, with the name that a Content-Disposition or a Location gave for `-J`.
+    let file = opener(&info.header_name, info.has_header_name)?;
+    let _a = sinks.body.attach(file)?;
   }
   if !has_no_body(head.status, req_kind) && !skip_body {
     if again {
@@ -1453,14 +1474,15 @@ fn credentials_of(cfg : &Config, u : &Url) -> Credentials {
 /// included, has that time limit.
 pub fn run_transfer(network : &Network, tls : &TlsSettings, cfg : &Config, headers : &Vec<Vec<u8>>,
 url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>, session : &mut Session,
-console : &mut Console, sinks : &mut Sinks, info : &mut TransferInfo) -> Result<i32, Failure> {
+console : &mut Console, sinks : &mut Sinks, info : &mut TransferInfo,
+opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<i32, Failure> {
   let started = Instant::now();
   let mut deadline = Instant::never();
   if cfg.max_time_ms > 0i64 {
     deadline = deadline_after(Duration::from_millis(cfg.max_time_ms as u64));
   }
   match follow_redirects(network, tls, cfg, headers, url_text, body, kind, deadline, form_boundary,
-    session, console, sinks, info) {
+    session, console, sinks, info, opener) {
     Result<i32, Failure>::Ok(n) => {
       return Result<i32, Failure>::Ok(n);
     },
@@ -1492,7 +1514,8 @@ fn timeout_message(f : Failure, started : &Instant, info : &TransferInfo) -> Fai
 fn follow_redirects(network : &Network, tls : &TlsSettings, cfg : &Config,
 headers : &Vec<Vec<u8>>, url_text : &Vec<u8>, body : &Vec<u8>, kind : i32, deadline : Instant,
 form_boundary : &Vec<u8>, session : &mut Session, console : &mut Console, sinks : &mut Sinks,
-info : &mut TransferInfo) -> Result<i32, Failure> {
+info : &mut TransferInfo,
+opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<i32, Failure> {
   let parsed = parse_url(url_text, cfg.path_as_is)?;
   let first = hsts_upgrade(console, cfg, &mut session.hsts, parsed);
   let mut creds = credentials_of(cfg, &first);
@@ -1524,7 +1547,7 @@ info : &mut TransferInfo) -> Result<i32, Failure> {
     }
     let hop = one_hop(network, tls, cfg, headers, &u, req_kind, body, &creds, same_host, has_referer,
       &referer, deadline, form_boundary, &mut auth, session, console, sinks,
-      info)?;
+      info, opener)?;
     if hop.retry && auth_rounds < MAX_AUTH_ROUNDS {
       auth_rounds = auth_rounds + 1;
       continue;
@@ -1726,4 +1749,116 @@ fn leading_number(v : &Vec<u8>, at : i32) -> i64 {
     i = i + 1;
   }
   return n;
+}
+
+/// `-J`: the file name of a response head, as curl's `content_disposition`: the Location of a
+/// redirect gives one until a Content-Disposition with a `filename=` gives the last one.
+fn take_header_name(head : &ResponseHead, info : &mut TransferInfo) -> void {
+  for line in head.headers.iter() {
+    if info.header_name_final {
+      return;
+    }
+    if head.status >= 300 && starts_lit_nocase(line, "Location:") {
+      let value = trim_start_blanks(&rest_from(line, 9));
+      match file_name_of(&value, 0u8) {
+        Option<Vec<u8>>::Some(name) => {
+          info.header_name = name;
+          info.has_header_name = true;
+        },
+        Option<Vec<u8>>::None() => {}
+      }
+      continue;
+    }
+    if line.len() > 20 && starts_lit_nocase(line, "Content-disposition:") {
+      // The `filename=` parameter. Encoded names (`filename*=`) are not taken, as in curl.
+      let mut p = 20;
+      loop {
+        while p < line.len() && !is_alpha(line.get(p)) {
+          p = p + 1;
+        }
+        if p + 9 > line.len() {
+          break;
+        }
+        if !eq_lit(&range_of(line, p, p + 9), "filename=") {
+          while p < line.len() && line.get(p) != 59u8 {
+            p = p + 1;
+          }
+          if p < line.len() {
+            continue;
+          }
+          break;
+        }
+        let value = trim_start_blanks(&rest_from(line, p + 9));
+        match file_name_of(&value, 59u8) {
+          Option<Vec<u8>>::Some(name) => {
+            info.header_name = name;
+            info.has_header_name = true;
+            info.header_name_final = true;
+          },
+          Option<Vec<u8>>::None() => {}
+        }
+        break;
+      }
+    }
+  }
+}
+
+fn is_alpha(b : u8) -> bool {
+  return (b >= 65u8 && b <= 90u8) || (b >= 97u8 && b <= 122u8);
+}
+
+fn trim_start_blanks(v : &Vec<u8>) -> Vec<u8> {
+  let mut i = 0;
+  while i < v.len() && (v.get(i) == 32u8 || v.get(i) == 9u8) {
+    i = i + 1;
+  }
+  return rest_from(v, i);
+}
+
+/// The file name in the value `v` of a header, as curl's `parse_filename`: for a
+/// Content-Disposition (`stop` is `;`), up to the stop byte or the end of its quotes; for a
+/// Location (`stop` is 0), without the query and the fragment. Only the part after the last
+/// `/` or `\\` counts. None for an empty name, `.` or `..`.
+fn file_name_of(v : &Vec<u8>, stop : u8) -> Option<Vec<u8>> {
+  let mut p = clone_bytes(v);
+  if stop != 0u8 {
+    let mut end_byte = stop;
+    if p.len() > 0 && (p.get(0) == 39u8 || p.get(0) == 34u8) {
+      end_byte = p.get(0);
+      p = rest_from(&p, 1);
+    }
+    let q = find_byte(&p, end_byte, 0);
+    if q >= 0 {
+      p = range_of(&p, 0, q);
+    }
+  } else {
+    let q = find_byte(&p, 63u8, 0);
+    if q >= 0 {
+      p = range_of(&p, 0, q);
+    }
+    let h = find_byte(&p, 35u8, 0);
+    if h >= 0 {
+      p = range_of(&p, 0, h);
+    }
+  }
+  let slash = rfind_byte(&p, 47u8);
+  if slash >= 0 {
+    p = rest_from(&p, slash + 1);
+  }
+  let back = rfind_byte(&p, 92u8);
+  if back >= 0 {
+    p = rest_from(&p, back + 1);
+  }
+  let cr = find_byte(&p, 13u8, 0);
+  if cr >= 0 {
+    p = range_of(&p, 0, cr);
+  }
+  let lf = find_byte(&p, 10u8, 0);
+  if lf >= 0 {
+    p = range_of(&p, 0, lf);
+  }
+  if p.len() == 0 || eq_lit(&p, ".") || eq_lit(&p, "..") {
+    return Option<Vec<u8>>::None();
+  }
+  return Option<Vec<u8>>::Some(p);
 }

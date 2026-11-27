@@ -63,9 +63,9 @@ Vx main 12f3786c8.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 510 of 757 (67%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 460 of 545 (84%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 199 of 199 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 538 of 757 (71%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 488 of 569 (85%) |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 205 of 205 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 12 of 12 |
 
@@ -91,8 +91,8 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 15,740 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 1,367 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 15,948 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 1,440 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 13 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,451 | 52 `extern` functions, 100 `unsafe` blocks |
 
@@ -318,7 +318,8 @@ missing options that block the most tests.
 `--connect-timeout` `--compressed` `--tr-encoding` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay`
 `--limit-rate` `--max-filesize` `--remove-on-error` `--next` (`-:`) `-K` (`--config`)
 `--retry` `--retry-delay` `--retry-max-time` `--retry-connrefused` `--retry-all-errors` `-C`
-(`--continue-at`) `-M` (`--manual`, which says that the manual is not built in) `-h`
+(`--continue-at`) `-J` (`--remote-header-name`) `-M` (`--manual`, which says that the manual
+is not built in) `-h`
 `-V`, and the options that runtests.pl adds: `-q` `--trace-ascii` `--trace-time`. As in curl,
 a long option may take its value in the same word, as `--max-time=2`, and `--` ends the
 options.
@@ -382,11 +383,17 @@ decoded body of `--compressed` goes in pieces of 16 KiB, each checked before it 
 a small compressed body that decodes to a large one ("a compression bomb") fails with "Would
 have exceeded max file size". The body of a redirect that curl follows does not count.
 
-curl makes an `-o` file when the first byte of the body arrives. The transfer code of securl
-cannot open files, so the tool opens the file before the transfer. When a transfer fails before
-a byte arrives, the tool removes the empty file that it made, so a failed connect leaves no
-file, as in curl. An existing file is emptied, though, where curl leaves it alone; Vx #4132 asks
-for the right to open one file later, which the tool could give the transfer.
+curl opens an `-o` or `-O` file only when the first bytes arrive, and with `-J` only once the
+response names it. The transfer code of securl cannot open files, so the tool gives it a
+closure that opens the one output file and nothing else, `|&Vec<u8>, bool| -> Result<File,
+Failure>`: the transfer calls it at the response that the output is for, with the name of its
+Content-Disposition (or of the Location of a redirect) for `-J`, and holds what comes before,
+such as the head of `-i`, until then. A transfer that fails before leaves an existing file
+alone, as curl does. With `-J -O`, the file is the Content-Disposition name in the output
+folder, and one that exists already stays as it is: the transfer fails with curl's "Failed to
+open the file NAME: File exists" and exit 23. `%{filename_effective}` gives the file. As in
+curl 8.23, `-O` of a URL whose path ends with `/` takes the last part before it, and one with
+no name takes `curl_response`, with curl's warning.
 `--remove-on-error` removes the file of a failed transfer, only when it is a regular file, with
 curl's note and warnings. `std::fs` cannot remove a file or tell a regular file yet, so
 `src/sys/files.vx` calls `unlink` and `statx`.
@@ -402,7 +409,7 @@ In order of how much users need them:
 1. Connection reuse (and with it, HTTP/2 multiplexing),
    `--unix-socket`, the
    `Upgrade: h2c` of `--http2` on plain HTTP, and HTTP/2 through an HTTP proxy.
-1. URL globbing (`{a,b}` and `[1-9]`), `-J`, `--variable`, `--no-clobber`, resume of a
+1. URL globbing (`{a,b}` and `[1-9]`), `--variable`, `--no-clobber`, `-R`, resume of a
    retry (`--retry` with `-C -`),
    `--netrc`, a default `.curlrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
    encoders, `--preproxy`, SOCKS5 with GSS-API, `--proxy-http2` and client certificates for an
@@ -444,7 +451,8 @@ The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #
 - [#4131](https://github.com/vx-lang/Vx/issues/4131) `std::net` has no Unix-domain socket, so
   securl has no `--unix-socket` yet.
 - [#4132](https://github.com/vx-lang/Vx/issues/4132) `std::fs` cannot remove a file, tell its
-  kind, or give the right to open one file later.
+  kind, or give the right to open one file later. For the last, the tool now hands the transfer
+  a closure that opens the output file; `src/sys/files.vx` still removes files.
 - [#4142](https://github.com/vx-lang/Vx/issues/4142) A `return` from inside an `if` that moves a
   field out of a local, such as `return step.file;`, frees that field twice. The new parser of
   `-K` hit it, and copies the field instead. Vx PR #4149 fixes it.

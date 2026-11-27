@@ -29,7 +29,7 @@ they include zstd bodies, and with the brotli library of the system (libbrotlien
 `/sts?VALUE` sends a Strict-Transport-Security header with
 the decoded VALUE, for `--hsts`. A path under `/flaky/` answers 503 the first time and 200 after
 that, for `--retry`. `/ranged` and `/no-ranges` send the text of `ENCODED` with and without
-Range requests, for `-C`.
+Range requests, for `-C`. A path under `/cd/` names its file in a Content-Disposition, for `-J`.
 
 It runs until it is killed.
 """
@@ -164,6 +164,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+        elif self.path.startswith("/cd/"):
+            # A body with a Content-Disposition file name, for -J.
+            self.send_response(200)
+            self.send_header("Content-Disposition", 'attachment; filename="named.txt"')
+            self.send_header("Content-Length", "6")
+            self.end_headers()
+            self.wfile.write(b"named\n")
         elif self.path in ("/ranged", "/no-ranges"):
             # TEXT, with Range requests on /ranged and without them on /no-ranges, for -C.
             rng = self.headers.get("Range", "")
