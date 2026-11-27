@@ -59,7 +59,7 @@ make test-h2    # HTTP/2 tests against a local server (makes a virtualenv with h
 
 Measured with curl's own test suite: curl's `runtests.pl` and its test servers, pointed at
 `build/securl` with `-c`. The tests come from curl commit 2f5c657, and the compiler is vxc from
-Vx main 0c0120e49.
+Vx main 375403e18.
 
 | Test set | Passed |
 |---|---|
@@ -472,6 +472,9 @@ The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #
 - [#4142](https://github.com/vx-lang/Vx/issues/4142) A `return` from inside an `if` that moves a
   field out of a local, such as `return step.file;`, freed that field twice. The new parser of
   `-K` hit it and copied the field instead, until Vx #4149 fixed it.
+- [#4172](https://github.com/vx-lang/Vx/issues/4172) The AST code generator panics with
+  "Undefined variable" on a `match` of `f()?` whose arm binds a name. `fetch.vx` gives the
+  value a name first, in two places.
 
 ## License
 
