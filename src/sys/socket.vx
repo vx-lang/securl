@@ -29,7 +29,7 @@ fn set_option(fd : i32, level : i32, name : i32, value : i32) -> bool {
 /// Send small packets at once, without Nagle's wait for more data (TCP_NODELAY), as libcurl
 /// does by default.
 pub fn set_nodelay(tcp : &TcpStream) -> void {
-  let fd = unsafe { vx_tcp_stream_fd(tcp.ptr) };
+  let fd = tcp.fd();
   let _set = set_option(fd, IPPROTO_TCP, TCP_NODELAY, 1);
 }
 
@@ -38,7 +38,7 @@ pub fn set_nodelay(tcp : &TcpStream) -> void {
 /// after `count` probes with no answer. As in libcurl, a failure only leaves the defaults of
 /// the system.
 pub fn set_keepalive(tcp : &TcpStream, idle : i32, interval : i32, count : i32) -> void {
-  let fd = unsafe { vx_tcp_stream_fd(tcp.ptr) };
+  let fd = tcp.fd();
   // libcurl sets the times only when the system took SO_KEEPALIVE.
   if !set_option(fd, SOL_SOCKET, SO_KEEPALIVE, 1) {
     return;

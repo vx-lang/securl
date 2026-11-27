@@ -281,7 +281,7 @@ enum Socket {
 fn socket_fd(sock : &Socket) -> i32 {
   match sock {
     Socket::Tcp(t) => {
-      return unsafe { vx_tcp_stream_fd(t.ptr) };
+      return t.fd();
     }
     Socket::Unix(u) => {
       return u.fd();

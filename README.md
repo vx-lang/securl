@@ -59,12 +59,12 @@ make test-h2    # HTTP/2 tests against a local server (makes a virtualenv with h
 
 Measured with curl's own test suite: curl's `runtests.pl` and its test servers, pointed at
 `build/securl` with `-c`. The tests come from curl commit 2f5c657, and the compiler is vxc from
-Vx main 95a733384.
+Vx main 98e8df6d5.
 
 | Test set | Passed |
 |---|---|
 | The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 568 of 762 (74%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 511 of 569 (89%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 510 of 569 (89%) |
 | TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 286 of 286 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 12 of 12 |
@@ -84,8 +84,8 @@ program of the curl build, linked with curl's own libcurl, so they never run sec
 the counts above included them by mistake: 152 of them passed, and the table said 522 of 874.
 Test 1070 depends on timing: the test server closes the connection while securl sends the
 body. It passes in some runs, between one in four and one in twelve, with and without recent
-changes. It passed in the run of the table above, so the counts have one test more than a
-run where it fails. Test 1849 (two HTTPS transfers through a
+changes. In the runs of the table above, it passed in the run of all tests and failed in the
+run of the supported ones. Test 1849 (two HTTPS transfers through a
 proxy) fails in about one run in three, and did so before the latest changes too: the log of the
 test server sometimes lacks the second request. It passed in that run too.
 
@@ -99,9 +99,9 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 | `src/securl/` (the package with all protocol code) | 17,142 | none, and `--no-trusted-code` enforces this |
 | `src/cli/` (the tool) and `src/disk/` (its files) | 1,519 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 14 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
-| `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,355 | 48 `extern` functions, 90 `unsafe` blocks |
+| `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,355 | 48 `extern` functions, 87 `unsafe` blocks |
 
-Of the trusted code in `src/sys/`, 130 of the 138 items are the OpenSSL bindings: TLS (with the
+Of the trusted code in `src/sys/`, 129 of the 135 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
 `hash.vx`.
 `lit` and `push_lit` of `sys` are safe to call, and read a string literal through its raw
@@ -113,7 +113,7 @@ literal stays the only pointer that the other packages can have, `tools/check-no
 refuses `as_mut_ptr`, `as_ptr`, pointer casts and `core::ptr` outside `src/sys`. Each build,
 `make audit` and the GitHub workflow in `.github/workflows/checks.yml` run it.
 
-`core` and `std` have trusted code too: the audit counts 1,021 `unsafe` blocks and 104 `extern`
+`core` and `std` have trusted code too: the audit counts 1,023 `unsafe` blocks and 104 `extern`
 functions in the modules that the program uses. That is the trusted base of the language, as
 Rust's `std` is for a Rust program. OpenSSL itself is C.
 
@@ -545,6 +545,10 @@ The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #
 - [#4172](https://github.com/vx-lang/Vx/issues/4172) The AST code generator panicked with
   "Undefined variable" on a `match` of `f()?` whose arm binds a name, and `fetch.vx` gave the
   value a name first, in two places. Vx #4173 fixed it, and securl no longer works around it.
+- [#4181](https://github.com/vx-lang/Vx/issues/4181) `TcpStream` gave no file descriptor, so
+  `src/sys/tls.vx` and `src/sys/socket.vx` read it with `vx_tcp_stream_fd` in three `unsafe`
+  blocks, for OpenSSL, `poll` and the socket options. Vx #4183 added `TcpStream::fd`, and
+  securl uses it.
 
 ## License
 
