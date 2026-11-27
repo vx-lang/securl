@@ -119,7 +119,7 @@ fn add_entry(h : &mut Hpack, name : &Vec<u8>, value : &Vec<u8>) -> void {
 
 /// The entry `index` of the static table (1 to 61) or of the dynamic table (62 on, newest
 /// first).
-fn lookup(h : &Hpack, index : i64) -> Option<HeaderField> {
+fn table_entry(h : &Hpack, index : i64) -> Option<HeaderField> {
   if index >= 1i64 && index <= 61i64 {
     let i = (index - 1i64) as i32;
     return Option<HeaderField>::Some(HeaderField {
@@ -294,7 +294,7 @@ pub fn decode_block(h : &mut Hpack, s : &Vec<u8>) -> Result<Vec<HeaderField>, Fa
       if n.next < 0 || n.value == 0i64 {
         return Result<Vec<HeaderField>, Failure>::Err(hpack_error("bad index"));
       }
-      match lookup(h, n.value) {
+      match table_entry(h, n.value) {
         Option<HeaderField>::Some(f) => {
           total = total + entry_size(&f.name, &f.value);
           fields.push(f);
@@ -330,7 +330,7 @@ pub fn decode_block(h : &mut Hpack, s : &Vec<u8>) -> Result<Vec<HeaderField>, Fa
         pos = n.next;
         let mut name = Vec<u8>::new();
         if n.value > 0i64 {
-          match lookup(h, n.value) {
+          match table_entry(h, n.value) {
             Option<HeaderField>::Some(f) => {
               name = f.name;
             },

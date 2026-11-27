@@ -1,32 +1,22 @@
 // String literals as byte lists.
 //
-// TRUSTED CODE. A Vx string literal is a `*const i8` that ends in a NUL byte, and it does not
-// carry its length yet (Vx#532). So reading its bytes needs `unsafe`. `lit` uses the default
-// method `core::fmt::Write::write_c_str`, which reads until the NUL. It is correct for a string
-// literal. It is not correct for any other pointer, and nothing checks that yet: core has the
-// same gap. Pass only string literals to `lit` and `push_lit`.
-import core::fmt;
-import core::result;
+// TRUSTED CODE. A Vx string literal is a `*const i8` that ends in a NUL byte, and a function
+// that gets one as a parameter does not get its length (Vx#532). So `lit` reads the bytes in an
+// `unsafe` block, up to the NUL. That is correct for a string literal. It is not correct for any
+// other pointer, and nothing checks that yet. Pass only string literals to `lit` and `push_lit`.
 import std::vec;
-
-struct Sink {
-  bytes : Vec<u8>,
-}
-
-impl Write for Sink {
-  fn write_u8(self : &mut Sink, b : u8) -> Result<i32, Error> {
-    self.bytes.push(b);
-    return Result<i32, Error>::Ok(0);
-  }
-}
 
 /// The bytes of the string literal `s`, without its NUL.
 pub fn lit(s : *const i8) -> Vec<u8> {
-  let mut sink = Sink {
-    bytes : Vec<u8>::new()
-  };
-  let _done = sink.write_c_str(s);
-  return sink.bytes;
+  let mut out = Vec<u8>::new();
+  let mut i = 0;
+  let mut b = unsafe { s[0] };
+  while b != 0i8 {
+    out.push(b as u8);
+    i = i + 1;
+    b = unsafe { s[i] };
+  }
+  return out;
 }
 
 /// Add the bytes of the string literal `s` to the end of `dst`.

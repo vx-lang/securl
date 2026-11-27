@@ -35,7 +35,6 @@ import securl::fetch;
 import securl::url;
 import securl::writeout;
 import disk::files;
-import sys::files;
 
 /// The words of the command line after the program name, as bytes, which securl parses as curl
 /// does.
@@ -588,7 +587,7 @@ fn clean_failed_output(console : &mut Console, files : &Files, cfg : &Config, st
   }
   if !state.written {
     if state.created && is_regular_file(files, &state.path) {
-      let _gone = remove_file(files, &state.path);
+      let _gone = delete_file(files, &state.path);
     }
     return;
   }
@@ -603,7 +602,7 @@ fn clean_failed_output(console : &mut Console, files : &Files, cfg : &Config, st
     }
     return;
   }
-  let removed = remove_file(files, &state.path);
+  let removed = delete_file(files, &state.path);
   if removed && (cfg.verbose || cfg.has_trace) && !quiet {
     console.to_stderr(&message_lines("Note: ", &lit_then("Removed output file: ", &state.path),
       cfg.columns));

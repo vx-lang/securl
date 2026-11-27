@@ -1645,7 +1645,7 @@ impl ArgParser {
           return Result<WordsStop, Failure>::Ok(WordsStop {
             at : i,
             has_config : true,
-            config_file : clone_bytes(&step.config_file),
+            config_file : step.config_file,
             config_option : clone_bytes(word),
             finished : false
           });

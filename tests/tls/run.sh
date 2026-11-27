@@ -296,6 +296,13 @@ check "SOCKS5 takes the IPv6 address of a name first" 97 "" -sS -x "socks5://$s"
   "http://localhost:$http/"
 logged "  and sends it" "SOCKS5 atyp=4 ::1:$http user="
 stderr_has "  with curl's message" "cannot complete SOCKS5 connection to localhost. (5)"
+# Any other name goes to the resolver of the system. ip6-localhost is ::1 in the /etc/hosts of
+# Debian and Ubuntu, and the proxy cannot reach it either.
+if getent hosts ip6-localhost > /dev/null 2>&1; then
+  check "SOCKS5 looks up a name with the resolver" 97 "" -sS -x "socks5://$s" \
+    "http://ip6-localhost:$http/"
+  stderr_has "  and sends its address" "cannot complete SOCKS5 connection to ip6-localhost. (5)"
+fi
 check "SOCKS5h sends the name" 0 "hello over tls" -sS -x "socks5h://$s" "http://localhost:$http/"
 logged "  to the proxy" "SOCKS5 atyp=3 localhost:$http user="
 check "  and so does --socks5-hostname" 0 "hello over tls" -sS --socks5-hostname "$s" \

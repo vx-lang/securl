@@ -224,3 +224,49 @@ pub fn append_to_file(files : &Files, name : &Vec<u8>, add : bool, bytes : &Vec<
     }
   }
 }
+
+/// Whether `name` is a regular file, after symbolic links, as curl's `stat` and `S_ISREG` check
+/// before it removes an output file. A device such as `/dev/null` is not one.
+pub fn is_regular_file(files : &Files, name : &Vec<u8>) -> bool {
+  match path_string(name) {
+    Option<String>::Some(path) => {
+      match file_kind(files, &path) {
+        Result<FileKind, FileError>::Ok(kind) => {
+          match kind {
+            FileKind::Regular() => {
+              return true;
+            },
+            _ => {
+              return false;
+            }
+          }
+        },
+        Result<FileKind, FileError>::Err(_e) => {
+          return false;
+        }
+      }
+    },
+    Option<String>::None() => {
+      return false;
+    }
+  }
+}
+
+/// Remove the file `name`. False when the system says no.
+pub fn delete_file(files : &Files, name : &Vec<u8>) -> bool {
+  match path_string(name) {
+    Option<String>::Some(path) => {
+      match remove_file(files, &path) {
+        Result<i32, FileError>::Ok(_n) => {
+          return true;
+        },
+        Result<i32, FileError>::Err(_e) => {
+          return false;
+        }
+      }
+    },
+    Option<String>::None() => {
+      return false;
+    }
+  }
+}

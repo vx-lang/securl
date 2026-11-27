@@ -342,6 +342,31 @@ fn resolve_rule(cfg : &Config, name : &Vec<u8>, port : i32) -> Result<Vec<u8>, F
   return Result<Vec<u8>, Failure>::Ok(host);
 }
 
+/// The addresses of the host name `name`, from the resolver of the system: 4 bytes for IPv4 and
+/// 16 for IPv6, in its order. None when the lookup fails, or for a name that is not UTF-8 or
+/// holds a NUL byte. A lookup can send the name to the network, so it needs the network right.
+fn lookup_addresses(network : &Network, name : &Vec<u8>) -> Option<Vec<Vec<u8>>> {
+  match to_string(name) {
+    Option<String>::Some(host) => {
+      match lookup(network, &host) {
+        Result<Vec<IpAddress>, NetError>::Ok(found) => {
+          let mut out = Vec<Vec<u8>>::new();
+          for a in found.iter() {
+            out.push(clone_bytes(&a.bytes));
+          }
+          return Option<Vec<Vec<u8>>>::Some(out);
+        },
+        Result<Vec<IpAddress>, NetError>::Err(_e) => {
+          return Option<Vec<Vec<u8>>>::None();
+        }
+      }
+    },
+    Option<String>::None() => {
+      return Option<Vec<Vec<u8>>>::None();
+    }
+  }
+}
+
 /// What the SOCKS proxy `proxy` needs to connect to the server of `u`. SOCKS4 and SOCKS5 send
 /// the address of the server, so this looks it up: with `--resolve`, or as an address, or else
 /// with the network right.
@@ -365,11 +390,11 @@ fn socks_request(network : &Network, cfg : &Config, u : &Url, proxy : &Proxy)
             if is_localhost_name(&name) {
               addresses = localhost_addresses();
             } else {
-              match lookup_host(network, &name) {
-                Result<Vec<Vec<u8>>, i32>::Ok(found) => {
+              match lookup_addresses(network, &name) {
+                Option<Vec<Vec<u8>>>::Some(found) => {
                   addresses = found;
                 },
-                Result<Vec<Vec<u8>>, i32>::Err(_code) => {
+                Option<Vec<Vec<u8>>>::None() => {
                   lookup_failed = true;
                 }
               }

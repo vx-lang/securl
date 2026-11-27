@@ -91,22 +91,24 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 15,948 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 1,440 | none, and `--no-trusted-code` enforces this |
-| `src/main.vx` (hands `Root` and the command line to `cli`) | 13 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
-| `src/sys/` (OpenSSL calls, socket options, name lookup and time limits, shims for what `std` lacks) | 1,451 | 52 `extern` functions, 100 `unsafe` blocks |
+| `src/securl/` (the package with all protocol code) | 15,973 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 1,485 | none, and `--no-trusted-code` enforces this |
+| `src/main.vx` (hands `Root` and the command line to `cli`) | 14 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
+| `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,301 | 48 `extern` functions, 92 `unsafe` blocks |
 
-Of the trusted code in `src/sys/`, 132 of the 152 items are the OpenSSL bindings: TLS (with the
+Of the trusted code in `src/sys/`, 132 of the 140 items are the OpenSSL bindings: TLS (with the
 ALPN choice for HTTP/2) in `tls.vx`, and the hash functions and random bytes of Digest in
 `hash.vx`.
-Two safe functions of `sys` read through a raw pointer with no check, `lit` and `push_lit`,
-because a Vx string literal is a `*const i8` with no length yet
-([Vx#532](https://github.com/vx-lang/Vx/issues/532)). They are correct for a literal. So that a
+`lit` and `push_lit` of `sys` are safe to call, and read a string literal through its raw
+pointer up to the NUL, in an `unsafe` block, because a Vx string literal that a function gets
+has no length yet ([Vx#532](https://github.com/vx-lang/Vx/issues/532)). They are correct for a
+literal. They used `core::fmt::Write::write_c_str`, a safe method that read the same way, until
+Vx #4148 took it out of `core` because it let safe code read past the end of a `Vec`. So that a
 literal stays the only pointer that the other packages can have, `tools/check-no-pointers.sh`
 refuses `as_mut_ptr`, `as_ptr`, pointer casts and `core::ptr` outside `src/sys`. Each build,
 `make audit` and the GitHub workflow in `.github/workflows/checks.yml` run it.
 
-`core` and `std` have trusted code too: the audit counts 994 `unsafe` blocks and 89 `extern`
+`core` and `std` have trusted code too: the audit counts 1,001 `unsafe` blocks and 93 `extern`
 functions in the modules that the program uses. That is the trusted base of the language, as
 Rust's `std` is for a Rust program. OpenSSL itself is C.
 
@@ -369,8 +371,8 @@ A proxy URL with the scheme `socks4`, `socks4a`, `socks5` or `socks5h`, or the o
 `src/securl/socks.vx` speaks the protocols as libcurl does, with its messages and exit code 97,
 and the user name and password of RFC 1929 for SOCKS5. SOCKS4a and SOCKS5h send the host name to
 the proxy. SOCKS4 and SOCKS5 send its address, so securl looks the name up: with `--resolve`, or
-as libcurl does for `localhost` (::1 first, then 127.0.0.1), or else with `getaddrinfo` in
-`src/sys/socket.vx`, which takes the network right. `std` has no lookup of its own yet.
+as libcurl does for `localhost` (::1 first, then 127.0.0.1), or else with `std::net::lookup`,
+which takes the network right.
 
 `--limit-rate` takes curl's sizes, such as `500`, `2k` or `1.5M`, and holds each direction of
 the transfer to that many bytes per second after the connect, as curl does: a read waits until
@@ -395,8 +397,7 @@ open the file NAME: File exists" and exit 23. `%{filename_effective}` gives the 
 curl 8.23, `-O` of a URL whose path ends with `/` takes the last part before it, and one with
 no name takes `curl_response`, with curl's warning.
 `--remove-on-error` removes the file of a failed transfer, only when it is a regular file, with
-curl's note and warnings. `std::fs` cannot remove a file or tell a regular file yet, so
-`src/sys/files.vx` calls `unlink` and `statx`.
+curl's note and warnings, with `std::fs::file_kind` and `std::fs::remove_file`.
 
 The 2025 curl user survey asked for each user's favourite option. securl accepts 19 of the top
 20 answers. It does not have `--libcurl`. `-vv` and `-vvv` work as `-v`, and `-w` has no
@@ -446,16 +447,19 @@ The Vx project tracks these. Vx main has fixed #4000 (with #4025), #4010 (with #
   builds with no new error.
 - [#4119](https://github.com/vx-lang/Vx/issues/4119) `main` cannot get a command-line word that
   is not UTF-8, so securl cannot either.
-- [#4120](https://github.com/vx-lang/Vx/issues/4120) `std::net` has no name lookup, so
-  `src/sys/socket.vx` calls `getaddrinfo` for SOCKS4 and SOCKS5.
+- [#4120](https://github.com/vx-lang/Vx/issues/4120) `std::net` had no name lookup, so
+  `src/sys/socket.vx` called `getaddrinfo` for SOCKS4 and SOCKS5. Vx #4154 added
+  `std::net::lookup`, and securl uses it.
 - [#4131](https://github.com/vx-lang/Vx/issues/4131) `std::net` has no Unix-domain socket, so
   securl has no `--unix-socket` yet.
-- [#4132](https://github.com/vx-lang/Vx/issues/4132) `std::fs` cannot remove a file, tell its
-  kind, or give the right to open one file later. For the last, the tool now hands the transfer
-  a closure that opens the output file; `src/sys/files.vx` still removes files.
+- [#4132](https://github.com/vx-lang/Vx/issues/4132) `std::fs` could not remove a file, tell its
+  kind, or give the right to open one file later, so `src/sys/files.vx` called `unlink` and
+  `statx`. Vx #4156 added `remove_file`, `file_kind` and `PendingFile`, and securl uses the first
+  two. `-J` picks its file name from the response, so the tool gives the transfer a closure that
+  opens it rather than a `PendingFile` of one path.
 - [#4142](https://github.com/vx-lang/Vx/issues/4142) A `return` from inside an `if` that moves a
-  field out of a local, such as `return step.file;`, frees that field twice. The new parser of
-  `-K` hit it, and copies the field instead. Vx PR #4149 fixes it.
+  field out of a local, such as `return step.file;`, freed that field twice. The new parser of
+  `-K` hit it and copied the field instead, until Vx #4149 fixed it.
 
 ## License
 
