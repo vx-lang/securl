@@ -63,8 +63,8 @@ Vx main 95a733384.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 557 of 762 (73%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 500 of 569 (87%) |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 568 of 762 (74%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 511 of 569 (89%) |
 | TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 286 of 286 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 12 of 12 |
@@ -84,7 +84,8 @@ program of the curl build, linked with curl's own libcurl, so they never run sec
 the counts above included them by mistake: 152 of them passed, and the table said 522 of 874.
 Test 1070 depends on timing: the test server closes the connection while securl sends the
 body. It passes in some runs, between one in four and one in twelve, with and without recent
-changes. It failed in both runs of the table above. Test 1849 (two HTTPS transfers through a
+changes. It passed in the run of the table above, so the counts have one test more than a
+run where it fails. Test 1849 (two HTTPS transfers through a
 proxy) fails in about one run in three, and did so before the latest changes too: the log of the
 test server sometimes lacks the second request. It passed in that run too.
 
@@ -95,7 +96,7 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 17,031 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 17,142 | none, and `--no-trusted-code` enforces this |
 | `src/cli/` (the tool) and `src/disk/` (its files) | 1,519 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 14 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,355 | 48 `extern` functions, 90 `unsafe` blocks |

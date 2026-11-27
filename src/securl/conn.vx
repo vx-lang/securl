@@ -36,6 +36,9 @@ struct Conn {
   remote_address : Vec<u8>,
   // An earlier request used the connection, which then waited in the pool (securl::pool).
   reused : bool,
+  // The HTTP version of the last response on the connection (10 or 11), or 0. After HTTP/1.0,
+  // the next request on it goes as HTTP/1.0, as in libcurl (curl's test 1074).
+  version_seen : i32,
 }
 
 /// A limit of bytes per second for one direction of a connection.
@@ -256,7 +259,8 @@ fn conn_of(net : NetStream, deadline : Instant) -> Conn {
     send_limit : no_limit(),
     id : 0,
     remote_address : Vec<u8>::new(),
-    reused : false
+    reused : false,
+    version_seen : 0
   };
 }
 

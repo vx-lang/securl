@@ -435,8 +435,13 @@ const MAX_HEADER_COUNT : i32 = 5000;
 /// counts the header bytes of all responses of the transfer, which libcurl also limits.
 ///
 /// A status line or header line longer than 100 KiB fails with the text of CURLE_TOO_LARGE, as
-/// in curl, where libcurl gives that error with no message of its own.
-fn read_head(c : &mut Conn, raw : bool, tr_encoding : bool, total : &mut i64)
+/// in curl, where libcurl gives that error with no message of its own. `bad_status` is the
+/// failure when the first line is no status line.
+///
+/// As in libcurl, a line that starts with a blank continues the header line before it, and
+/// each whole header line is checked before it counts: `head.raw` holds the lines before a bad
+/// one, which curl writes with `-i` before it stops.
+fn read_head(c : &mut Conn, raw : bool, tr_encoding : bool, total : &mut i64, bad_status : Failure)
 -> Result<ResponseHead, Failure> {
   let mut head = empty_head();
   head.tr_encoding = tr_encoding;
@@ -447,22 +452,37 @@ fn read_head(c : &mut Conn, raw : bool, tr_encoding : bool, total : &mut i64)
     return Result<ResponseHead, Failure>::Err(fail_lit(GOT_NOTHING, "Empty reply from server"));
   }
   if !parse_status_line(&line, &mut head) {
-    return Result<ResponseHead, Failure>::Err(fail_lit(UNSUPPORTED_PROTOCOL,
-      "Received HTTP/0.9 when not allowed"));
+    return Result<ResponseHead, Failure>::Err(bad_status);
   }
-  if head.error_code != 0 {
+  if head.error_code != 0 || !line_is_clean(&line, &mut head) {
     return Result<ResponseHead, Failure>::Ok(head);
   }
   append(&mut head.raw, &line);
   let mut size : i64 = line.len() as i64;
   let mut index = 1;
+  // The header line that the next line may continue, and its number.
+  let mut pending = Vec<u8>::new();
+  let mut pending_index = 0;
   loop {
     let mut h = Vec<u8>::new();
     let got = c.read_line(&mut h, MAX_HEADER_LINE, TOO_LARGE,
       "A value or data field grew larger than allowed")?;
-    if got == 0 {
-      // The peer closed the connection inside the headers.
-      return Result<ResponseHead, Failure>::Ok(head);
+    let last = got == 0 || eq_lit(&h, "\r\n") || eq_lit(&h, "\n");
+    if pending.len() > 0 && !last && is_blank(h.get(0)) {
+      pending = unfold(&pending, &h);
+    } else {
+      if pending.len() > 0 {
+        parse_header_line(&pending, pending_index, raw, &mut head);
+        if head.error_code != 0 {
+          return Result<ResponseHead, Failure>::Ok(head);
+        }
+        append(&mut head.raw, &pending);
+        pending = Vec<u8>::new();
+      }
+      if got == 0 {
+        // The peer closed the connection inside the headers.
+        return Result<ResponseHead, Failure>::Ok(head);
+      }
     }
     index = index + 1;
     size = size + (h.len() as i64);
@@ -477,15 +497,14 @@ fn read_head(c : &mut Conn, raw : bool, tr_encoding : bool, total : &mut i64)
       push_lit(&mut m, " > 307200");
       return Result<ResponseHead, Failure>::Err(fail_with(RECV_ERROR, m));
     }
-    if eq_lit(&h, "\r\n") || eq_lit(&h, "\n") {
+    if last {
       append(&mut head.raw, &h);
       return Result<ResponseHead, Failure>::Ok(head);
     }
-    parse_header_line(&h, index, raw, &mut head);
-    if head.error_code != 0 {
-      return Result<ResponseHead, Failure>::Ok(head);
+    if pending.len() == 0 {
+      pending = h;
+      pending_index = index;
     }
-    append(&mut head.raw, &h);
   }
 }
 
@@ -536,6 +555,28 @@ fn read_to_close(c : &mut Conn, out : &mut Output, console : &mut Console, info 
     }
     let _w = write_body(out, console, &part, info)?;
   }
+}
+
+/// The trailer line `t` as libcurl gives it: checked as a header line, and with CRLF at its end
+/// even when the server sent only LF (curl's tests 1417 and 2106). A CR ends the line in
+/// libcurl, so a CR that no LF follows is a bad chunk.
+fn trailer_line(t : &Vec<u8>) -> Result<Vec<u8>, Failure> {
+  let mut line = trim_newline(t);
+  let nul = find_byte(&line, 0u8, 0);
+  let cr = find_byte(&line, 13u8, 0);
+  if cr >= 0 && (nul < 0 || cr < nul) {
+    return Result<Vec<u8>, Failure>::Err(fail_lit(RECV_ERROR,
+      "Malformed encoding found in chunked-encoding"));
+  }
+  push_lit(&mut line, "\r\n");
+  let mut check = empty_head();
+  if !line_is_clean(&line, &mut check) {
+    return Result<Vec<u8>, Failure>::Err(fail_with(check.error_code, clone_bytes(&check.error)));
+  }
+  if !is_blank(line.get(0)) && find_byte(&line, 58u8, 0) < 0 {
+    return Result<Vec<u8>, Failure>::Err(fail_lit(WEIRD_SERVER_REPLY, "Header without colon"));
+  }
+  return Result<Vec<u8>, Failure>::Ok(line);
 }
 
 fn bad_chunk() -> Failure {
@@ -596,7 +637,8 @@ trailers : &mut Vec<u8>, raw : bool) -> Result<i32, Failure> {
           return Result<i32, Failure>::Ok(0);
         }
         if !raw {
-          append(trailers, &t);
+          let line = trailer_line(&t)?;
+          append(trailers, &line);
         }
       }
     }
@@ -782,7 +824,7 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
     }
     let _w = write_head(console, sinks, cfg.include, &head.raw)?;
     head = next_head(&mut c, &mut h2, use_h2, cfg.raw, cfg.tr_encoding,
-      &mut info.size_header_total)?;
+      &mut info.size_header_total, true)?;
     set_cookies = take_cookies(&mut session.jar, &head, &cookie_host, &cookie_path,
       secure_context, set_cookies);
     take_hsts(console, cfg, &mut session.hsts, &head, u, secure);
@@ -793,9 +835,6 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
       let _w = sinks.body.write(console, &head.raw)?;
     }
     return Result<Hop, Failure>::Err(fail_with(head.error_code, clone_bytes(&head.error)));
-  }
-  if head.bad_length && !has_no_body(head.status, req_kind) {
-    return Result<Hop, Failure>::Err(fail_lit(WEIRD_SERVER_REPLY, "Invalid Content-Length: value"));
   }
   if head.length_overflow && cfg.max_filesize > 0i64 && !has_no_body(head.status, req_kind) {
     return Result<Hop, Failure>::Err(fail_lit(FILESIZE_EXCEEDED, "Maximum file size exceeded"));
@@ -1378,6 +1417,9 @@ console : &mut Console) -> Result<ResponseHead, Failure> {
   }
   // HTTP/2 when TLS chose it with ALPN, or with `--http2-prior-knowledge` on plain TCP.
   *use_h2 = c.is_h2() || (cfg.h2_prior_knowledge && !secure && !via_proxy);
+  if c.version_seen == 10 {
+    req_info.http10 = true;
+  }
   if *use_h2 {
     req_info.h2 = true;
     req_info.chunked = false;
@@ -1411,7 +1453,7 @@ console : &mut Console) -> Result<ResponseHead, Failure> {
     }
   }
   info.size_request = info.size_request + info.size_upload;
-  return next_head(c, h2, *use_h2, cfg.raw, cfg.tr_encoding, &mut info.size_header_total);
+  return next_head(c, h2, *use_h2, cfg.raw, cfg.tr_encoding, &mut info.size_header_total, false);
 }
 
 /// Whether a request on a reused connection failed as when the server closed the connection
@@ -1694,7 +1736,9 @@ console : &mut Console, sinks : &mut Sinks) -> Result<i32, Failure> {
     verbose_lines(console, "> ", &request);
   }
   let _sent = c.send(&request)?;
-  let head = read_head(c, false, false, &mut info.size_header_total)?;
+  // A reply that is no HTTP/1 status line is curl's "Invalid response header" (test 750).
+  let head = read_head(c, false, false, &mut info.size_header_total,
+    fail_lit(WEIRD_SERVER_REPLY, "Invalid response header"))?;
   if cfg.verbose {
     verbose_lines(console, "< ", &head.raw);
   }
@@ -1853,14 +1897,24 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<i32, Failure> {
   }
 }
 
-/// The next response head, over HTTP/2 or HTTP/1.
+/// The next response head, over HTTP/2 or HTTP/1. `informational` says that a 1xx response
+/// came before it.
 fn next_head(c : &mut Conn, h2 : &mut H2, use_h2 : bool, raw : bool, tr_encoding : bool,
-total : &mut i64)
+total : &mut i64, informational : bool)
 -> Result<ResponseHead, Failure> {
   if use_h2 {
     return h2_read_head(h2, c);
   }
-  return read_head(c, raw, tr_encoding, total);
+  // A response that is no HTTP/1 response may be HTTP/0.9, which curl refuses. After a 1xx
+  // response, or on a reused connection, it cannot be, so it is a bad response (curl's tests
+  // 1479 and 1480).
+  let mut bad_status = fail_lit(UNSUPPORTED_PROTOCOL, "Received HTTP/0.9 when not allowed");
+  if informational || c.reused {
+    bad_status = fail_lit(WEIRD_SERVER_REPLY, "Invalid status line");
+  }
+  let head = read_head(c, raw, tr_encoding, total, bad_status)?;
+  c.version_seen = head.version;
+  return Result<ResponseHead, Failure>::Ok(head);
 }
 
 /// Copy the body of the response to `out`, over HTTP/2 or HTTP/1. The trailers go to

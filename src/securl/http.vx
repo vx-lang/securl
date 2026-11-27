@@ -437,8 +437,6 @@ struct ResponseHead {
   // A Content-Length header held a number too large for 63 bits. libcurl then reads to the end
   // of the connection, or fails with `--max-filesize`.
   length_overflow : bool,
-  // A Content-Length header held something that is not a number, or two lengths disagree.
-  bad_length : bool,
   // The headers, without the status line, each without its line end. For `-w %header{}`.
   headers : Vec<Vec<u8>>,
   // Not 0 when the head is bad: the exit code, with `error` as the message.
@@ -468,7 +466,6 @@ pub fn empty_head() -> ResponseHead {
     proxy_keep_alive : false,
     proxy_close : false,
     length_overflow : false,
-    bad_length : false,
     headers : Vec<Vec<u8>>::new(),
     error_code : 0,
     error : Vec<u8>::new(),
@@ -483,6 +480,53 @@ fn set_error(head : &mut ResponseHead, code : i32, message : Vec<u8>) -> void {
     head.error_code = code;
     head.error = message;
   }
+}
+
+/// Whether the header line `line`, with its line end, has no CR but the one before its LF and
+/// no NUL byte, as libcurl's `Curl_verify_header` checks each line of a head and each trailer.
+/// Else it sets the error of `head`.
+pub fn line_is_clean(line : &Vec<u8>, head : &mut ResponseHead) -> bool {
+  let nul = find_byte(line, 0u8, 0);
+  let mut limit = line.len();
+  if nul >= 0 {
+    limit = nul;
+  }
+  let cr = find_byte(&range_of(line, 0, limit), 13u8, 0);
+  if cr >= 0 && cr < line.len() - 2 {
+    set_error(head, WEIRD_SERVER_REPLY, lit("Carriage return found in header"));
+    return false;
+  }
+  if nul >= 0 {
+    set_error(head, WEIRD_SERVER_REPLY, lit("NUL byte in header"));
+    return false;
+  }
+  return true;
+}
+
+/// Join the folded line `more`, which starts with a blank, to the header line `line`, as
+/// libcurl does: `line` loses its line end and its trailing blanks, and one space takes the
+/// place of the blanks at the start of `more` (curl's test 1274).
+pub fn unfold(line : &Vec<u8>, more : &Vec<u8>) -> Vec<u8> {
+  let mut end = line.len();
+  if end > 0 && line.get(end - 1) == 10u8 {
+    end = end - 1;
+  }
+  if end > 0 && line.get(end - 1) == 13u8 {
+    end = end - 1;
+  }
+  while end > 0 && is_blank(line.get(end - 1)) {
+    end = end - 1;
+  }
+  let mut out = range_of(line, 0, end);
+  let mut start = 0;
+  while start < more.len() && is_blank(more.get(start)) {
+    start = start + 1;
+  }
+  if start < more.len() {
+    push_lit(&mut out, " ");
+  }
+  append_range(&mut out, more, start, more.len());
+  return out;
 }
 
 /// Read the status line `line` into `head`. Gives false when it is not an HTTP/1.x status line.
@@ -597,11 +641,10 @@ fn parse_transfer_encoding(value : &Vec<u8>, raw : bool, head : &mut ResponseHea
 /// 1. A bad header sets the error of `head`, as libcurl's checks do.
 pub fn parse_header_line(line : &Vec<u8>, index : i32, raw : bool, head : &mut ResponseHead)
 -> void {
-  let t = trim_newline(line);
-  if find_byte(&t, 0u8, 0) >= 0 {
-    set_error(head, WEIRD_SERVER_REPLY, lit("NUL byte in header"));
+  if !line_is_clean(line, head) {
     return;
   }
+  let t = trim_newline(line);
   let folded = index > 2 && t.len() > 0 && is_blank(t.get(0));
   let colon = find_byte(&t, 58u8, 0);
   if colon < 0 && !folded {
@@ -615,6 +658,12 @@ pub fn parse_header_line(line : &Vec<u8>, index : i32, raw : bool, head : &mut R
   let name = range_of(&t, 0, colon);
   let value = trim_blanks(&rest_from(&t, colon + 1));
   if eq_lit_nocase(&name, "Content-Length") {
+    // A response with no body has no length to check: 1xx, 204 and 304, as libcurl's
+    // `http_bodyless`. After a Transfer-Encoding other than chunked, libcurl ignores it too.
+    if (head.status >= 100 && head.status < 200) || head.status == 204 || head.status == 304
+       || (head.has_transfer_encoding && !head.chunked) {
+      return;
+    }
     // curl takes a list such as `6, 6` when all values are the same, as browsers do.
     let mut start = 0;
     while start <= value.len() {
@@ -628,15 +677,19 @@ pub fn parse_header_line(line : &Vec<u8>, index : i32, raw : bool, head : &mut R
         head.length_overflow = true;
         return;
       }
+      // A negative length, rubbish, or two lengths that disagree: libcurl stops at this header,
+      // after it wrote the headers before it (curl's tests 178 and 415).
       match parse_u64(&part) {
         Option<u64>::Some(n) => {
           if head.content_length >= 0i64 && head.content_length != (n as i64) {
-            head.bad_length = true;
+            set_error(head, WEIRD_SERVER_REPLY, lit("Invalid Content-Length: value"));
+            return;
           }
           head.content_length = n as i64;
         },
         Option<u64>::None() => {
-          head.bad_length = true;
+          set_error(head, WEIRD_SERVER_REPLY, lit("Invalid Content-Length: value"));
+          return;
         }
       }
       start = end + 1;
