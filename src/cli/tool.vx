@@ -27,6 +27,7 @@ import securl::bytes;
 import securl::cookie;
 import securl::failure;
 import securl::form;
+import securl::glob;
 import securl::hsts;
 import securl::http;
 import securl::options;
@@ -418,12 +419,13 @@ struct OutputPlan {
   remote : bool,
 }
 
-/// The output of transfer number `index`: a `-o` file, a `-O` file, or standard output.
-fn plan_output(console : &mut Console, cfg : &Config, index : i32, url_text : &Vec<u8>)
--> Result<OutputPlan, Failure> {
-  if index < cfg.outputs.len() {
-    let name = cfg.outputs.get_ref(index);
-    if eq_lit(name, "-") {
+/// The output of a transfer of the URL node `node` for `url_text`: the `-o` file `name`, whose
+/// globs are filled in, a `-O` file, or standard output.
+fn plan_output(console : &mut Console, cfg : &Config, node : &UrlNode, name : &Vec<u8>,
+url_text : &Vec<u8>) -> Result<OutputPlan, Failure> {
+  if node.has_out && !node.remote {
+    // `-o -`, or `--no-remote-name` after `--remote-name-all`, which leaves no name.
+    if eq_lit(name, "-") || name.len() == 0 {
       return Result<OutputPlan, Failure>::Ok(stdout_plan());
     }
     return Result<OutputPlan, Failure>::Ok(OutputPlan {
@@ -432,7 +434,7 @@ fn plan_output(console : &mut Console, cfg : &Config, index : i32, url_text : &V
       remote : false
     });
   }
-  if cfg.remote_name_all || index - cfg.outputs.len() < cfg.remote_names {
+  if node.remote {
     let u = parse_url(url_text, cfg.path_as_is)?;
     let name = remote_file_name(&u);
     if eq_lit(&name, "curl_response") && !ends_with_lit(&u.path, "curl_response") && !cfg.silent {
@@ -678,10 +680,36 @@ fn open_header_output(files : &Files, cfg : &Config, retrying : bool) -> Result<
   return Result<Output, Failure>::Ok(file_output(file));
 }
 
+/// Whether the upload file `name` of `-T` is standard input: `-`, or `.`, which curl reads
+/// without blocking.
+fn is_stdin_upload(name : &Vec<u8>) -> bool {
+  return eq_lit(name, "-") || eq_lit(name, ".");
+}
+
+/// Whether some node of `cfg` uploads standard input.
+fn uploads_stdin(cfg : &Config) -> bool {
+  for n in cfg.nodes.iter() {
+    if n.has_upload && is_stdin_upload(&n.upload) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Whether some node of `cfg` has an `-o`, `-O` or `-T` but no URL.
+fn has_node_without_url(cfg : &Config) -> bool {
+  for n in cfg.nodes.iter() {
+    if !n.has_url {
+      return true;
+    }
+  }
+  return false;
+}
+
 /// The URL of an upload: curl adds the name of the file when the URL ends in `/`.
 fn upload_url(url_text : &Vec<u8>, file_name : &Vec<u8>) -> Vec<u8> {
   let mut out = clone_bytes(url_text);
-  if eq_lit(file_name, "-") || url_text.len() == 0 {
+  if is_stdin_upload(file_name) || url_text.len() == 0 {
     return out;
   }
   let slash = rfind_byte(file_name, 47u8);
@@ -748,7 +776,7 @@ groups : &Vec<Config>) -> i32 {
 /// Run the transfers of one group of the command line, and give the exit code of the last one.
 fn run_group(network : &Network, files : &Files, stdin : &mut Stdin, console : &mut Console,
 cfg : &Config, session : &mut Session) -> i32 {
-  if cfg.urls.len() == 0 {
+  if !has_url(cfg) {
     console.to_stderr(&lit("curl: (2) no URL specified\ncurl: try 'curl --help' for more information\n"));
     return FAILED_INIT;
   }
@@ -837,39 +865,22 @@ cfg : &Config, session : &mut Session) -> i32 {
     }
   }
 
-  if cfg.outputs.len() > cfg.urls.len() && !cfg.silent {
+  if has_node_without_url(cfg) && !cfg.silent {
     console.to_stderr(&message_lines("Warning: ", &lit("Got more output options than URLs"), cfg.columns));
   }
-  if cfg.has_upload && cfg.http10 && eq_lit(&cfg.upload, "-") && !has_custom(&headers, "Content-Length") {
+  if cfg.http10 && uploads_stdin(cfg) && !has_custom(&headers, "Content-Length") {
     let f = fail_lit(UPLOAD_FAILED, "Chunky upload is not supported by HTTP 1.0");
     report(console, cfg, &f);
     return f.code;
   }
 
-  // The kind of request for the first URL. `-T` uploads only to the first URL, so the other
-  // URLs get the kind of request that the other options ask for.
+  // The kind of request of a URL with no `-T`. One with `-T` is a PUT.
   let mut other_kind = REQ_GET;
   if cfg.head {
     other_kind = REQ_HEAD;
   } else {
     if (cfg.data.len() > 0 && !cfg.get_data) || cfg.forms.len() > 0 {
       other_kind = REQ_POST;
-    }
-  }
-  let mut kind = other_kind;
-  let mut upload_body = Vec<u8>::new();
-  if !cfg.head {
-    if cfg.has_upload {
-      kind = REQ_PUT;
-      match read_file(files, stdin, &cfg.upload) {
-        Result<Vec<u8>, Failure>::Ok(bytes) => {
-          upload_body = bytes;
-        },
-        Result<Vec<u8>, Failure>::Err(f) => {
-          report(console, cfg, &f);
-          return f.code;
-        }
-      }
     }
   }
 
@@ -933,8 +944,8 @@ cfg : &Config, session : &mut Session) -> i32 {
             server : tls,
             proxy : p
           };
-          let code = run_all(network, files, console, &settings, cfg, &headers, &request_body,
-            &upload_body, kind, other_kind, &form_boundary, session, hsts_too_long);
+          let code = run_all(network, files, stdin, console, &settings, cfg, &headers,
+            &request_body, other_kind, &form_boundary, session, hsts_too_long);
           save_jar(console, files, cfg, &mut session.jar);
           save_hsts(files, cfg, &session.hsts);
           return code;
@@ -1032,118 +1043,269 @@ fn effective_url(text : &Vec<u8>, path_as_is : bool) -> Vec<u8> {
 }
 
 /// Run the transfer of each URL, and give the exit code of the last one.
-fn run_all(network : &Network, files : &Files, console : &mut Console, tls : &TlsSettings, cfg : &Config,
-headers : &Vec<Vec<u8>>, request_body : &Vec<u8>, upload_body : &Vec<u8>, kind : i32,
+fn run_all(network : &Network, files : &Files, stdin : &mut Stdin, console : &mut Console,
+tls : &TlsSettings, cfg : &Config, headers : &Vec<Vec<u8>>, request_body : &Vec<u8>,
 other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first : bool) -> i32 {
+  // As curl's `create_transfer`: for each URL node, each upload file of its `-T` glob, and for
+  // each of those, each URL of its URL glob, the last glob changing fastest.
   let mut exit_code = 0;
-  let mut i = 0;
-  while i < cfg.urls.len() {
-    let mut url_text = clone_bytes(cfg.urls.get_ref(i));
-    if cfg.get_data && cfg.data.len() > 0 {
-      if find_byte(&url_text, 63u8, 0) >= 0 {
-        url_text.push(38u8);
-      } else {
-        url_text.push(63u8);
-      }
-      append(&mut url_text, request_body);
-    }
-    let mut this_kind = other_kind;
-    if i == 0 {
-      this_kind = kind;
-    }
-    if cfg.has_upload && i == 0 {
-      url_text = upload_url(&url_text, &cfg.upload);
-    }
-
-    let mut info = new_info();
-    let mut state = empty_output_state();
-    let mut code = 0;
-    let mut message = Vec<u8>::new();
-    // `--retry`: the tries left, the wait that doubles, and when the first try started.
-    let mut retry_left = cfg.retry;
-    let mut retry_sleep = cfg.retry_delay_ms;
-    let retry_start = Instant::now();
-    let mut retries = 0;
-    let mut created = false;
-    let mut keep = false;
-    loop {
-      info = new_info();
-      state = empty_output_state();
-      state.keep = keep;
-      state.retrying = retries > 0;
-      code = 0;
-      message = Vec<u8>::new();
-      let mut refused = false;
-      let mut result = Result<i32, Failure>::Ok(0);
-      if i == 0 && fail_first {
-        info.url_effective = effective_url(&url_text, cfg.path_as_is);
-        result = Result<i32, Failure>::Err(fail_lit(TOO_LARGE,
-          "A value or data field grew larger than allowed"));
-      } else if this_kind == REQ_PUT {
-        result = transfer_one(network, files, console, tls, cfg, headers, &url_text, upload_body,
-          this_kind, form_boundary, session, i, &mut info, &mut state);
-      } else {
-        result = transfer_one(network, files, console, tls, cfg, headers, &url_text, request_body,
-          this_kind, form_boundary, session, i, &mut info, &mut state);
-      }
-      created = created || state.created;
-      match result {
-        Result<i32, Failure>::Ok(_v) => {},
-        Result<i32, Failure>::Err(f) => {
-          report(console, cfg, &f);
-          code = f.code;
-          message = f.message;
-          refused = f.refused;
-        }
-      }
-      let elapsed = retry_start.elapsed().as_millis() as i64;
-      if retry_left > 0i64 && (cfg.retry_max_time_ms == 0i64 || elapsed < cfg.retry_max_time_ms) {
-        let wait = retry_wait(console, cfg, code, refused, &info, &mut retry_sleep, retry_left,
-          elapsed);
-        if wait >= 0i64 {
-          retry_left = retry_left - 1i64;
-          retries = retries + 1;
-          if state.bytes > 0i64 && state.path.len() > 0 && (cfg.verbose || cfg.has_trace)
-             && !cfg.silent {
-            // The next try writes the file again from its start.
-            let mut m = lit("Throwing away ");
-            push_i64(&mut m, state.bytes);
-            push_lit(&mut m, " bytes");
-            console.to_stderr(&message_lines("Note: ", &m, cfg.columns));
-          }
-          keep = state.bytes == 0i64;
-          let _slept = sleep(Duration::from_millis(wait as u64));
-          continue;
-        }
-      }
-      break;
-    }
-    info.num_retries = retries;
-    state.created = created;
-    if code != 0 {
-      clean_failed_output(console, files, cfg, &state);
-    }
-    if cfg.has_write_out {
-      let ctx = WriteOutContext {
-        exit_code : code,
-        error : message,
-        url_index : i
-      };
-      let mut warnings = Vec<u8>::new();
-      let pieces = format_write_out(&cfg.write_out, &info, &ctx, &mut warnings);
-      if warnings.len() > 0 {
-        console.to_stderr(&warnings);
-      }
-      write_pieces(console, files, &pieces);
-    }
-    // As curl: the exit code is the one of the last transfer, and a fatal error stops the rest.
-    exit_code = code;
-    if code == FAILED_INIT {
+  let mut first = true;
+  for node in cfg.nodes.iter() {
+    if !node.has_url {
+      // curl stops at a node with no URL, after its warning.
       return exit_code;
     }
-    i = i + 1;
+    let uploads = node.has_upload && node.upload.len() > 0;
+    let mut up_glob = no_glob();
+    if uploads && !cfg.globoff {
+      match parse_glob(&node.upload) {
+        Result<Glob, GlobError>::Ok(g) => {
+          up_glob = g;
+        },
+        Result<Glob, GlobError>::Err(e) => {
+          let f = glob_failure(&e, &node.upload);
+          report(console, cfg, &f);
+          return f.code;
+        }
+      }
+    }
+    let mut up_round = 0;
+    loop {
+      let mut upload_name = Vec<u8>::new();
+      if up_glob.literal {
+        if up_round > 0 {
+          break;
+        }
+        upload_name = clone_bytes(&node.upload);
+      } else {
+        match up_glob.next_text() {
+          Option<Vec<u8>>::Some(t) => {
+            upload_name = t;
+          },
+          Option<Vec<u8>>::None() => {
+            break;
+          }
+        }
+      }
+      up_round = up_round + 1;
+      let mut url_glob = no_glob();
+      if !cfg.globoff {
+        match parse_glob(&node.url) {
+          Result<Glob, GlobError>::Ok(g) => {
+            url_glob = g;
+          },
+          Result<Glob, GlobError>::Err(e) => {
+            let f = glob_failure(&e, &node.url);
+            report(console, cfg, &f);
+            return f.code;
+          }
+        }
+      }
+      let mut url_round = 0;
+      loop {
+        let mut url_text = Vec<u8>::new();
+        if url_glob.literal {
+          if url_round > 0 {
+            break;
+          }
+          url_text = clone_bytes(&node.url);
+        } else {
+          match url_glob.next_text() {
+            Option<Vec<u8>>::Some(t) => {
+              url_text = t;
+            },
+            Option<Vec<u8>>::None() => {
+              break;
+            }
+          }
+        }
+        url_round = url_round + 1;
+        let step = run_url(network, files, stdin, console, tls, cfg, headers, request_body,
+          other_kind, form_boundary, session, first && fail_first, node, &url_text, uploads,
+          &upload_name, &url_glob, &up_glob);
+        first = false;
+        exit_code = step.code;
+        if step.stop {
+          return exit_code;
+        }
+      }
+    }
   }
   return exit_code;
+}
+
+/// What one transfer gave: its exit code, and whether the run stops there.
+struct UrlStep {
+  code : i32,
+  stop : bool,
+}
+
+/// The transfer of `url` for the node `node`, which uploads `upload_name` when `uploads`, with
+/// its retries and its `-w` output. `url_glob` and `up_glob` are the globs of the URL and of
+/// the upload now, for the `#1` and `#<name>` of `-o`.
+fn run_url(network : &Network, files : &Files, stdin : &mut Stdin, console : &mut Console,
+tls : &TlsSettings, cfg : &Config, headers : &Vec<Vec<u8>>, request_body : &Vec<u8>,
+other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first : bool,
+node : &UrlNode, url : &Vec<u8>, uploads : bool, upload_name : &Vec<u8>, url_glob : &Glob,
+up_glob : &Glob) -> UrlStep {
+  // The output, from the URL before the upload name and the data of `-G` go into it, as curl's
+  // `setup_outfile` comes first.
+  let mut out_name = clone_bytes(&node.out);
+  if node.has_out && !node.remote && node.out.len() > 0 && !eq_lit(&node.out, "-")
+     && !cfg.globoff {
+    match glob_output(&node.out, url_glob, uploads, up_glob) {
+      Result<Vec<u8>, GlobError>::Ok(name) => {
+        out_name = name;
+      },
+      Result<Vec<u8>, GlobError>::Err(e) => {
+        let f = glob_failure(&e, &node.out);
+        report(console, cfg, &f);
+        return UrlStep {
+          code : f.code,
+          stop : true
+        };
+      }
+    }
+    if out_name.len() == 0 {
+      if !cfg.silent {
+        console.to_stderr(&message_lines("Warning: ", &lit("output glob produces empty string"),
+          cfg.columns));
+      }
+      return UrlStep {
+        code : WRITE_ERROR,
+        stop : true
+      };
+    }
+  }
+  let plan = match plan_output(console, cfg, node, &out_name, url) {
+    Result<OutputPlan, Failure>::Ok(p) => { p },
+    Result<OutputPlan, Failure>::Err(f) => {
+      report(console, cfg, &f);
+      return UrlStep {
+        code : f.code,
+        stop : f.code == FAILED_INIT
+      };
+    }
+  };
+  let mut url_text = clone_bytes(url);
+  let mut this_kind = other_kind;
+  let mut upload_body = Vec<u8>::new();
+  let from_stdin = uploads && is_stdin_upload(upload_name);
+  if uploads && !cfg.head {
+    this_kind = REQ_PUT;
+    let mut source = clone_bytes(upload_name);
+    if from_stdin {
+      source = lit("-");
+    }
+    match read_file(files, stdin, &source) {
+      Result<Vec<u8>, Failure>::Ok(bytes) => {
+        upload_body = bytes;
+      },
+      Result<Vec<u8>, Failure>::Err(f) => {
+        report(console, cfg, &f);
+        return UrlStep {
+          code : f.code,
+          stop : true
+        };
+      }
+    }
+    url_text = upload_url(&url_text, upload_name);
+  }
+  if cfg.get_data && cfg.data.len() > 0 {
+    if find_byte(&url_text, 63u8, 0) >= 0 {
+      url_text.push(38u8);
+    } else {
+      url_text.push(63u8);
+    }
+    append(&mut url_text, request_body);
+  }
+
+  let mut info = new_info();
+  let mut state = empty_output_state();
+  let mut code = 0;
+  let mut message = Vec<u8>::new();
+  // `--retry`: the tries left, the wait that doubles, and when the first try started.
+  let mut retry_left = cfg.retry;
+  let mut retry_sleep = cfg.retry_delay_ms;
+  let retry_start = Instant::now();
+  let mut retries = 0;
+  let mut created = false;
+  let mut keep = false;
+  loop {
+    info = new_info();
+    state = empty_output_state();
+    state.keep = keep;
+    state.retrying = retries > 0;
+    code = 0;
+    message = Vec<u8>::new();
+    let mut refused = false;
+    let mut result = Result<i32, Failure>::Ok(0);
+    if fail_first {
+      info.url_effective = effective_url(&url_text, cfg.path_as_is);
+      result = Result<i32, Failure>::Err(fail_lit(TOO_LARGE,
+        "A value or data field grew larger than allowed"));
+    } else if this_kind == REQ_PUT {
+      result = transfer_one(network, files, console, tls, cfg, headers, &url_text, &upload_body,
+        this_kind, form_boundary, session, &plan, from_stdin, &mut info, &mut state);
+    } else {
+      result = transfer_one(network, files, console, tls, cfg, headers, &url_text, request_body,
+        this_kind, form_boundary, session, &plan, from_stdin, &mut info, &mut state);
+    }
+    created = created || state.created;
+    match result {
+      Result<i32, Failure>::Ok(_v) => {},
+      Result<i32, Failure>::Err(f) => {
+        report(console, cfg, &f);
+        code = f.code;
+        message = f.message;
+        refused = f.refused;
+      }
+    }
+    let elapsed = retry_start.elapsed().as_millis() as i64;
+    if retry_left > 0i64 && (cfg.retry_max_time_ms == 0i64 || elapsed < cfg.retry_max_time_ms) {
+      let wait = retry_wait(console, cfg, code, refused, &info, &mut retry_sleep, retry_left,
+        elapsed);
+      if wait >= 0i64 {
+        retry_left = retry_left - 1i64;
+        retries = retries + 1;
+        if state.bytes > 0i64 && state.path.len() > 0 && (cfg.verbose || cfg.has_trace)
+           && !cfg.silent {
+          // The next try writes the file again from its start.
+          let mut m = lit("Throwing away ");
+          push_i64(&mut m, state.bytes);
+          push_lit(&mut m, " bytes");
+          console.to_stderr(&message_lines("Note: ", &m, cfg.columns));
+        }
+        keep = state.bytes == 0i64;
+        let _slept = sleep(Duration::from_millis(wait as u64));
+        continue;
+      }
+    }
+    break;
+  }
+  info.num_retries = retries;
+  state.created = created;
+  if code != 0 {
+    clean_failed_output(console, files, cfg, &state);
+  }
+  if cfg.has_write_out {
+    let ctx = WriteOutContext {
+      exit_code : code,
+      error : message,
+      url_index : node.num
+    };
+    let mut warnings = Vec<u8>::new();
+    let pieces = format_write_out(&cfg.write_out, &info, &ctx, &mut warnings);
+    if warnings.len() > 0 {
+      console.to_stderr(&warnings);
+    }
+    write_pieces(console, files, &pieces);
+  }
+  // As curl: a fatal error stops the rest.
+  return UrlStep {
+    code : code,
+    stop : code == FAILED_INIT
+  };
 }
 
 /// Write each piece of `-w` text where it goes. A `%output{file}` piece goes to a file, which
@@ -1176,8 +1338,8 @@ fn transfer_one(network : &Network, files : &Files, console : &mut Console, tls 
 cfg : &Config,
 headers : &Vec<Vec<u8>>,
 url_text : &Vec<u8>, request_body : &Vec<u8>, kind : i32, form_boundary : &Vec<u8>,
-session : &mut Session, index : i32, info : &mut TransferInfo, state : &mut OutputState)
--> Result<i32, Failure> {
+session : &mut Session, plan : &OutputPlan, upload_from_stdin : bool, info : &mut TransferInfo,
+state : &mut OutputState) -> Result<i32, Failure> {
   // curl refuses to resume a POST of `-d` or `-F` before it starts.
   if kind == REQ_POST && cfg.use_resume && (cfg.resume_from != 0i64 || cfg.resume_current) {
     return Result<i32, Failure>::Err(fail_lit(BAD_FUNCTION_ARGUMENT, "HTTP upload cannot be resumed"));
@@ -1194,7 +1356,6 @@ session : &mut Session, index : i32, info : &mut TransferInfo, state : &mut Outp
       state.resume_current = false;
     }
   }
-  let plan = plan_output(console, cfg, index, url_text)?;
   let mut body_output = stdout_output();
   if !plan.to_stdout {
     // The file opens when the transfer needs it, as curl's does.
@@ -1212,12 +1373,13 @@ session : &mut Session, index : i32, info : &mut TransferInfo, state : &mut Outp
     body : body_output,
     headers : header_output,
     has_headers : cfg.has_dump_header,
-    resume_from : state.resume
+    resume_from : state.resume,
+    upload_from_stdin : upload_from_stdin
   };
   // The right to open this one output file, which is all of the file right that the transfer
   // gets.
   let opener = |name : &Vec<u8>, from_server : bool| -> Result<File, Failure> {
-    open_planned(files, cfg, state, &plan, name, from_server)
+    open_planned(files, cfg, state, plan, name, from_server)
   };
   let mut result = run_transfer(network, tls, cfg, headers, url_text, request_body, kind,
     form_boundary, session, console, &mut sinks, info,

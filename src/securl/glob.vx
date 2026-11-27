@@ -1,0 +1,656 @@
+// URL globbing of the curl tool, as curl's src/tool_urlglob.c does it.
+//
+// A URL, or the file name of `-T`, can hold sets such as `{one,two}` and ranges such as
+// `[1-9]`, `[001-100:10]` and `[a-z:2]`. Each combination of their values is one transfer, the
+// last glob changing fastest. `-o` takes the value of a glob of the transfer with `#1` for the
+// first glob, or `#<name>` for a glob written `{<name>a,b}`. `\` before a bracket or a brace
+// keeps it as text, and an IPv6 address in brackets stays as it is.
+import core::mem;
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import securl::address;
+import securl::bytes;
+import securl::failure;
+
+// The kinds of pattern: text, or a set, a range of letters or a range of numbers.
+const GLOB_FIXED : i32 = 0;
+const GLOB_SET : i32 = 1;
+const GLOB_ASCII : i32 = 2;
+const GLOB_NUM : i32 = 3;
+
+// curl's limits: 100000 elements in a set, 255 patterns, a name of 64 bytes.
+const MAX_GLOB_SET : i32 = 100000;
+const MAX_GLOB_PATTERNS : i32 = 255;
+const MAX_GLOB_NAME : i32 = 64;
+const MAX_GLOB_NUMBER : i64 = 9223372036854775807i64;
+
+/// One part of a glob: text, a set or a range.
+struct Pattern {
+  kind : i32,
+  // The number of the glob for `#N`, from 0, or -1 for text.
+  index : i32,
+  has_name : bool,
+  name : Vec<u8>,
+  // The elements of a set, or the one text of a fixed pattern.
+  elements : Vec<Vec<u8>>,
+  // A range: its first and last value, its step, and for numbers the width that leading zeros
+  // fill.
+  min : i64,
+  max : i64,
+  step : i64,
+  pad : i32,
+}
+
+/// A URL or a file name with its globs, and the combination of the transfer now.
+struct Glob {
+  // No glob syntax at all: the text is used as it is.
+  literal : bool,
+  patterns : Vec<Pattern>,
+  // For each pattern: the element of a set, or the value of a range, now.
+  current : Vec<i64>,
+  // How many combinations there are.
+  count : i64,
+  started : bool,
+}
+
+/// What is wrong with a glob: curl's message, and the column of the text where it found it, or
+/// 0 for none.
+struct GlobError {
+  code : i32,
+  message : Vec<u8>,
+  pos : i32,
+}
+
+fn glob_error(code : i32, message : *const i8, pos : i32) -> GlobError {
+  return GlobError {
+    code : code,
+    message : lit(message),
+    pos : pos
+  };
+}
+
+/// curl's text for the error `e` in the glob `text`: the message, and when it has a column, the
+/// text with a `^` under that column.
+pub fn glob_error_text(e : &GlobError, text : &Vec<u8>) -> Vec<u8> {
+  let mut out = clone_bytes(&e.message);
+  if e.pos > 0 {
+    push_lit(&mut out, " in position ");
+    push_u64(&mut out, e.pos as u64);
+    push_lit(&mut out, ":\n");
+    append(&mut out, text);
+    push_lit(&mut out, "\n");
+    // curl prints "%*s^" with a width of pos - 1 for one space.
+    let mut i = 0;
+    while i < e.pos - 1 || i == 0 {
+      push_lit(&mut out, " ");
+      i = i + 1;
+    }
+    push_lit(&mut out, "^");
+  }
+  return out;
+}
+
+/// The failure that curl reports for the error `e` in the glob `text`.
+pub fn glob_failure(e : &GlobError, text : &Vec<u8>) -> Failure {
+  return fail_with(e.code, glob_error_text(e, text));
+}
+
+fn new_pattern(kind : i32, index : i32) -> Pattern {
+  return Pattern {
+    kind : kind,
+    index : index,
+    has_name : false,
+    name : Vec<u8>::new(),
+    elements : Vec<Vec<u8>>::new(),
+    min : 0i64,
+    max : 0i64,
+    step : 1i64,
+    pad : 0
+  };
+}
+
+/// `amount * with`, or None when it does not fit in 63 bits.
+fn multiply(amount : i64, with : i64) -> Option<i64> {
+  if with <= 0i64 || amount <= 0i64 {
+    return Option<i64>::Some(0i64);
+  }
+  if amount > MAX_GLOB_NUMBER / with {
+    return Option<i64>::None();
+  }
+  return Option<i64>::Some(amount * with);
+}
+
+fn is_alpha(b : u8) -> bool {
+  return (b >= 65u8 && b <= 90u8) || (b >= 97u8 && b <= 122u8);
+}
+
+/// The decimal number at `at` of `s`, as curl's `curlx_str_number` reads one: at least one
+/// digit, and no more than fits in 63 bits. Gives the number and the offset after it.
+fn number_at(s : &Vec<u8>, at : i32) -> Option<NumberAt> {
+  let mut i = at;
+  let mut n = 0i64;
+  while i < s.len() && is_digit(s.get(i)) {
+    let d = (s.get(i) - 48u8) as i64;
+    if n > (MAX_GLOB_NUMBER - d) / 10i64 {
+      return Option<NumberAt>::None();
+    }
+    n = n * 10i64 + d;
+    i = i + 1;
+  }
+  if i == at {
+    return Option<NumberAt>::None();
+  }
+  return Option<NumberAt>::Some(NumberAt {
+    value : n,
+    end : i
+  });
+}
+
+struct NumberAt {
+  value : i64,
+  end : i32,
+}
+
+/// A glob that is its text as it is: one transfer. `-g` turns globbing off this way.
+pub fn no_glob() -> Glob {
+  return Glob {
+    literal : true,
+    patterns : Vec<Pattern>::new(),
+    current : Vec<i64>::new(),
+    count : 1i64,
+    started : false
+  };
+}
+
+/// The glob of `text`. A text with no `{`, `}`, `[` or `]` is literal: one transfer, as it is.
+pub fn parse_glob(text : &Vec<u8>) -> Result<Glob, GlobError> {
+  let mut g = Glob {
+    literal : false,
+    patterns : Vec<Pattern>::new(),
+    current : Vec<i64>::new(),
+    count : 1i64,
+    started : false
+  };
+  if find_byte(text, 123u8, 0) < 0 && find_byte(text, 125u8, 0) < 0
+     && find_byte(text, 91u8, 0) < 0 && find_byte(text, 93u8, 0) < 0 {
+    g.literal = true;
+    return Result<Glob, GlobError>::Ok(g);
+  }
+  let mut at = 0;
+  // The column for messages, from 1, as curl counts it.
+  let mut pos = 1;
+  let mut globs = 0;
+  let mut buf = Vec<u8>::new();
+  while at < text.len() {
+    // Text, up to the next set or range.
+    let mut more = true;
+    while more && at < text.len() && text.get(at) != 123u8 {
+      let c = text.get(at);
+      if c == 91u8 {
+        // An IPv6 address, or `[]`, stays as text.
+        let skip = ipv6_length(text, at);
+        if skip > 0 {
+          append_range(&mut buf, text, at, at + skip);
+          at = at + skip;
+        } else {
+          if at + 1 < text.len() && text.get(at + 1) == 93u8 {
+            append_range(&mut buf, text, at, at + 2);
+            at = at + 2;
+          } else {
+            more = false;
+          }
+        }
+      } else {
+        if c == 125u8 || c == 93u8 {
+          return Result<Glob, GlobError>::Err(glob_error(URL_MALFORMAT,
+            "unmatched close brace/bracket", pos));
+        }
+        // Only a bracket or a brace can be escaped.
+        if c == 92u8 && at + 1 < text.len() {
+          let n = text.get(at + 1);
+          if n == 123u8 || n == 91u8 || n == 125u8 || n == 93u8 {
+            at = at + 1;
+            pos = pos + 1;
+          }
+        }
+        buf.push(text.get(at));
+        at = at + 1;
+        pos = pos + 1;
+      }
+    }
+    if buf.len() > 0 {
+      let mut p = new_pattern(GLOB_FIXED, -1);
+      p.elements.push(replace(&mut buf, Vec<u8>::new()));
+      let _added = add_pattern(&mut g, p, pos)?;
+    } else {
+      if at >= text.len() {
+        return Result<Glob, GlobError>::Ok(g);
+      }
+      let set = text.get(at) == 123u8;
+      at = at + 1;
+      pos = pos + 1;
+      let start = at;
+      // `<name>` right after the brace names the glob.
+      let mut has_name = false;
+      let mut name = Vec<u8>::new();
+      if at < text.len() && text.get(at) == 60u8 {
+        let close = find_byte(text, 62u8, at + 1);
+        if close > at + 1 && close - at - 1 <= MAX_GLOB_NAME {
+          has_name = true;
+          name = range_of(text, at + 1, close);
+          at = close + 1;
+        }
+      }
+      if has_name {
+        if find_name(&g, &name) >= 0 {
+          return Result<Glob, GlobError>::Err(glob_error(URL_MALFORMAT, "Duplicate glob name",
+            at));
+        }
+        pos = pos + (at - start);
+      }
+      let mut p = new_pattern(GLOB_SET, globs);
+      if set {
+        at = glob_set(text, at, &mut pos, &mut p, &mut g.count)?;
+      } else {
+        at = glob_range(text, at, &mut pos, &mut p, &mut g.count)?;
+      }
+      p.index = globs;
+      p.has_name = has_name;
+      p.name = name;
+      globs = globs + 1;
+      let _added = add_pattern(&mut g, p, pos)?;
+    }
+  }
+  return Result<Glob, GlobError>::Ok(g);
+}
+
+fn add_pattern(g : &mut Glob, p : Pattern, pos : i32) -> Result<i32, GlobError> {
+  if g.patterns.len() >= MAX_GLOB_PATTERNS {
+    return Result<i32, GlobError>::Err(glob_error(URL_MALFORMAT, "too many {} sets", pos));
+  }
+  // A range starts at its first value, and a set at its first element.
+  let mut first = 0i64;
+  if p.kind == GLOB_ASCII || p.kind == GLOB_NUM {
+    first = p.min;
+  }
+  g.patterns.push(p);
+  g.current.push(first);
+  return Result<i32, GlobError>::Ok(0);
+}
+
+/// The length of the IPv6 address in brackets at `at` of `text`, with its brackets, or 0.
+fn ipv6_length(text : &Vec<u8>, at : i32) -> i32 {
+  let close = find_byte(text, 93u8, at);
+  if close < 0 || close - at + 1 >= 128 {
+    return 0;
+  }
+  let mut inside = range_of(text, at + 1, close);
+  // A zone, as in `[fe80::1%25eth0]`.
+  let zone = find_byte(&inside, 37u8, 0);
+  if zone >= 0 {
+    inside = range_of(&inside, 0, zone);
+  }
+  match parse_ipv6(&inside) {
+    Option<Vec<u8>>::Some(_a) => {
+      return close - at + 1;
+    },
+    Option<Vec<u8>>::None() => {
+      return 0;
+    }
+  }
+}
+
+fn find_name(g : &Glob, name : &Vec<u8>) -> i32 {
+  let mut i = 0;
+  while i < g.patterns.len() {
+    let p = g.patterns.get_ref(i);
+    if p.has_name && same_bytes(&p.name, name) {
+      return i;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+/// The set that starts at `at`, after its `{`. Gives the offset after its `}`.
+fn glob_set(text : &Vec<u8>, from : i32, pos : &mut i32, p : &mut Pattern, count : &mut i64)
+-> Result<i32, GlobError> {
+  p.kind = GLOB_SET;
+  let mut at = from;
+  let mut buf = Vec<u8>::new();
+  loop {
+    if at >= text.len() {
+      return Result<i32, GlobError>::Err(glob_error(URL_MALFORMAT, "unmatched brace", *pos));
+    }
+    let c = text.get(at);
+    if c == 123u8 || c == 91u8 {
+      return Result<i32, GlobError>::Err(glob_error(URL_MALFORMAT, "nested brace", *pos));
+    }
+    if c == 93u8 {
+      return Result<i32, GlobError>::Err(glob_error(URL_MALFORMAT, "unexpected close bracket",
+        *pos));
+    }
+    if c == 125u8 || c == 44u8 {
+      let done = c == 125u8;
+      if done {
+        if at == from {
+          return Result<i32, GlobError>::Err(glob_error(URL_MALFORMAT,
+            "empty string within braces", *pos));
+        }
+        match multiply(*count, (p.elements.len() + 1) as i64) {
+          Option<i64>::Some(n) => {
+            *count = n;
+          },
+          Option<i64>::None() => {
+            return Result<i32, GlobError>::Err(glob_error(URL_MALFORMAT, "range overflow", 0));
+          }
+        }
+      }
+      if p.elements.len() >= MAX_GLOB_SET {
+        return Result<i32, GlobError>::Err(glob_error(URL_MALFORMAT, "range overflow", 0));
+      }
+      p.elements.push(replace(&mut buf, Vec<u8>::new()));
+      at = at + 1;
+      if done {
+        return Result<i32, GlobError>::Ok(at);
+      }
+      *pos = *pos + 1;
+    } else {
+      // `\` keeps the next byte as it is.
+      if c == 92u8 && at + 1 < text.len() {
+        at = at + 1;
+        *pos = *pos + 1;
+      }
+      buf.push(text.get(at));
+      at = at + 1;
+      *pos = *pos + 1;
+    }
+  }
+}
+
+/// The range that starts at `at`, after its `[`. Gives the offset after its `]`.
+fn glob_range(text : &Vec<u8>, from : i32, pos : &mut i32, p : &mut Pattern, count : &mut i64)
+-> Result<i32, GlobError> {
+  let mut at = from;
+  if at < text.len() && is_alpha(text.get(at)) {
+    p.kind = GLOB_ASCII;
+    let mut ok = false;
+    let mut step = 1i64;
+    let mut min = 0i64;
+    let mut max = 0i64;
+    if at + 3 < text.len() && text.get(at + 1) == 45u8 {
+      min = text.get(at) as i64;
+      max = text.get(at + 2) as i64;
+      let end = text.get(at + 3);
+      ok = true;
+      if end == 58u8 {
+        step = 0i64;
+        match number_at(text, at + 4) {
+          Option<NumberAt>::Some(n) => {
+            if n.value <= 256i64 && n.end < text.len() && text.get(n.end) == 93u8 {
+              step = n.value;
+              at = n.end + 1;
+            } else {
+              at = n.end;
+            }
+          },
+          Option<NumberAt>::None() => {
+            at = at + 4;
+          }
+        }
+      } else {
+        if end != 93u8 {
+          ok = false;
+        } else {
+          at = at + 4;
+        }
+      }
+    }
+    *pos = *pos + (at - from);
+    if !ok || step == 0i64 || (min == max && step != 1i64)
+       || (min != max && (min > max || step > max - min || max - min > 25i64)) {
+      return Result<i32, GlobError>::Err(glob_error(URL_MALFORMAT, "bad range", *pos));
+    }
+    p.min = min;
+    p.max = max;
+    p.step = step;
+    return range_count(p, count, *pos, at);
+  }
+  if at < text.len() && is_digit(text.get(at)) {
+    p.kind = GLOB_NUM;
+    if text.get(at) == 48u8 {
+      // Leading zeros: each value has as many digits as the first one.
+      let mut i = at;
+      while i < text.len() && is_digit(text.get(i)) {
+        p.pad = p.pad + 1;
+        i = i + 1;
+      }
+    }
+    let mut min = 0i64;
+    let mut max = 0i64;
+    let mut step = 0i64;
+    match number_at(text, at) {
+      Option<NumberAt>::Some(first) => {
+        min = first.value;
+        at = first.end;
+        if at < text.len() && text.get(at) == 45u8 {
+          at = at + 1;
+          while at < text.len() && is_blank(text.get(at)) {
+            at = at + 1;
+          }
+          match number_at(text, at) {
+            Option<NumberAt>::Some(last) => {
+              max = last.value;
+              at = last.end;
+              if at < text.len() && text.get(at) == 93u8 {
+                step = 1i64;
+                at = at + 1;
+              } else {
+                if at < text.len() && text.get(at) == 58u8 {
+                  match number_at(text, at + 1) {
+                    Option<NumberAt>::Some(s) => {
+                      at = s.end;
+                      if at < text.len() && text.get(at) == 93u8 {
+                        step = s.value;
+                        at = at + 1;
+                      }
+                    },
+                    Option<NumberAt>::None() => {
+                      at = at + 1;
+                    }
+                  }
+                }
+              }
+            },
+            Option<NumberAt>::None() => {}
+          }
+        }
+      },
+      Option<NumberAt>::None() => {}
+    }
+    *pos = *pos + (at - from);
+    if step == 0i64 || (min == max && step != 1i64)
+       || (min != max && (min > max || step > max - min)) {
+      return Result<i32, GlobError>::Err(glob_error(URL_MALFORMAT, "bad range", *pos));
+    }
+    if MAX_GLOB_NUMBER - step < max {
+      return Result<i32, GlobError>::Err(glob_error(URL_MALFORMAT, "range end/step overflow",
+        *pos));
+    }
+    p.min = min;
+    p.max = max;
+    p.step = step;
+    return range_count(p, count, *pos, at);
+  }
+  return Result<i32, GlobError>::Err(glob_error(URL_MALFORMAT, "bad range specification",
+    *pos));
+}
+
+fn range_count(p : &Pattern, count : &mut i64, pos : i32, at : i32) -> Result<i32, GlobError> {
+  match multiply(*count, (p.max - p.min) / p.step + 1i64) {
+    Option<i64>::Some(n) => {
+      *count = n;
+      return Result<i32, GlobError>::Ok(at);
+    },
+    Option<i64>::None() => {
+      return Result<i32, GlobError>::Err(glob_error(URL_MALFORMAT, "range overflow", pos));
+    }
+  }
+}
+
+impl Glob {
+  /// The number of transfers of the glob.
+  pub fn amount(self : &Glob) -> i64 {
+    return self.count;
+  }
+
+  /// The text of the next combination, or None after the last one. A literal glob gives
+  /// nothing: its text is the one that the caller has.
+  pub fn next_text(self : &mut Glob) -> Option<Vec<u8>> {
+    if self.literal {
+      return Option<Vec<u8>>::None();
+    }
+    if !self.started {
+      self.started = true;
+    } else {
+      // Count up from the last pattern, as an odometer.
+      let mut carry = true;
+      let mut i = self.patterns.len() - 1;
+      while carry && i >= 0 {
+        carry = false;
+        let kind = self.patterns.get_ref(i).kind;
+        let now = self.current.get(i);
+        if kind == GLOB_SET {
+          let size = self.patterns.get_ref(i).elements.len() as i64;
+          if now + 1i64 >= size {
+            let _s = self.current.set(i, 0i64);
+            carry = true;
+          } else {
+            let _s = self.current.set(i, now + 1i64);
+          }
+        }
+        if kind == GLOB_ASCII || kind == GLOB_NUM {
+          let step = self.patterns.get_ref(i).step;
+          let max = self.patterns.get_ref(i).max;
+          let min = self.patterns.get_ref(i).min;
+          if now + step > max {
+            let _s = self.current.set(i, min);
+            carry = true;
+          } else {
+            let _s = self.current.set(i, now + step);
+          }
+        }
+        if kind == GLOB_FIXED {
+          carry = true;
+        }
+        i = i - 1;
+      }
+      if carry {
+        return Option<Vec<u8>>::None();
+      }
+    }
+    let mut out = Vec<u8>::new();
+    let mut i = 0;
+    while i < self.patterns.len() {
+      append(&mut out, &self.value_of(i));
+      i = i + 1;
+    }
+    return Option<Vec<u8>>::Some(out);
+  }
+
+  /// The text of the pattern `i` in the combination now.
+  fn value_of(self : &Glob, i : i32) -> Vec<u8> {
+    let p = self.patterns.get_ref(i);
+    let now = self.current.get(i);
+    if p.kind == GLOB_FIXED {
+      return clone_bytes(p.elements.get_ref(0));
+    }
+    if p.kind == GLOB_SET {
+      return clone_bytes(p.elements.get_ref(now as i32));
+    }
+    let mut out = Vec<u8>::new();
+    if p.kind == GLOB_ASCII {
+      out.push(now as u8);
+      return out;
+    }
+    let mut digits = Vec<u8>::new();
+    push_i64(&mut digits, now);
+    let mut n = digits.len();
+    while n < p.pad {
+      out.push(48u8);
+      n = n + 1;
+    }
+    append(&mut out, &digits);
+    return out;
+  }
+
+  /// The pattern of the glob number `n`, from 0, or -1.
+  fn glob_number(self : &Glob, n : i64) -> i32 {
+    let mut i = 0;
+    while i < self.patterns.len() {
+      if self.patterns.get_ref(i).index as i64 == n {
+        return i;
+      }
+      i = i + 1;
+    }
+    return -1;
+  }
+}
+
+/// The file name of `-o` for the combination now: `#N` takes the value of the glob number N of
+/// `url`, and `#<name>` the value of the glob with that name in `url` or else in `upload`, as
+/// curl's `glob_match_url`. A `#N` with no such glob stays as it is. A `#<name>` with no such
+/// glob is an error.
+pub fn glob_output(name : &Vec<u8>, url : &Glob, has_upload : bool, upload : &Glob)
+-> Result<Vec<u8>, GlobError> {
+  let mut out = Vec<u8>::new();
+  let mut at = 0;
+  while at < name.len() {
+    let c = name.get(at);
+    let mut done = false;
+    if c == 35u8 && at + 1 < name.len() && is_digit(name.get(at + 1)) {
+      match number_at(name, at + 1) {
+        Option<NumberAt>::Some(n) => {
+          if n.value >= 1i64 && n.value <= url.patterns.len() as i64 {
+            let i = url.glob_number(n.value - 1i64);
+            if i >= 0 {
+              append(&mut out, &url.value_of(i));
+              at = n.end;
+              done = true;
+            }
+          }
+        },
+        Option<NumberAt>::None() => {}
+      }
+    } else {
+      if c == 35u8 && at + 1 < name.len() && name.get(at + 1) == 60u8 {
+        let close = find_byte(name, 62u8, at + 2);
+        if close > at + 2 && close - at - 2 <= MAX_GLOB_NAME {
+          let wanted = range_of(name, at + 2, close);
+          let mut i = find_name(url, &wanted);
+          if i >= 0 {
+            append(&mut out, &url.value_of(i));
+          } else {
+            if has_upload {
+              i = find_name(upload, &wanted);
+            }
+            if i < 0 {
+              return Result<Vec<u8>, GlobError>::Err(glob_error(BAD_FUNCTION_ARGUMENT,
+                "no glob exists with this name", close + 1));
+            }
+            append(&mut out, &upload.value_of(i));
+          }
+          at = close + 1;
+          done = true;
+        }
+      }
+    }
+    if !done {
+      out.push(c);
+      at = at + 1;
+    }
+  }
+  return Result<Vec<u8>, GlobError>::Ok(out);
+}

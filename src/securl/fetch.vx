@@ -136,6 +136,8 @@ struct Sinks {
   has_headers : bool,
   // `-C`: the body goes on from this byte of the file, or -1 for an upload that asks for it.
   resume_from : i64,
+  // The upload of `-T` comes from standard input, so its length is not known before.
+  upload_from_stdin : bool,
 }
 
 /// Write the header lines `raw` to the output when `to_body` (`-i`), and to the file of `-D`.
@@ -707,7 +709,7 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
   // A `-H "Transfer-Encoding: chunked"` header, or an upload from standard input, whose
   // length curl does not know, sends the body in chunks.
   let custom_chunked = custom_header_has(headers, "Transfer-Encoding", "chunked");
-  let unknown_length = req_kind == REQ_PUT && eq_lit(&cfg.upload, "-")
+  let unknown_length = req_kind == REQ_PUT && sinks.upload_from_stdin
     && !has_custom(headers, "Content-Length");
   if unknown_length && info.received_http10 {
     // The server speaks HTTP/1.0, which has no chunks.

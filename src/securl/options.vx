@@ -40,14 +40,32 @@ struct EnvVar {
   value : Vec<u8>,
 }
 
+/// One URL of the command line and what goes with it, as curl's `struct getout`. A URL, an
+/// `-o` or `-O`, and a `-T` each fill the first node that has none yet, so that the first `-o`
+/// goes with the first URL in whatever order they come.
+struct UrlNode {
+  has_url : bool,
+  url : Vec<u8>,
+  // `-o NAME`, or `-O` (`remote`), came for this node.
+  has_out : bool,
+  out : Vec<u8>,
+  // The file name comes from the URL: `-O`, or `--remote-name-all` before the node.
+  remote : bool,
+  // `-T FILE` came for this node. `-T ""` uploads nothing.
+  has_upload : bool,
+  upload : Vec<u8>,
+  // The number of the node on the command line, from 0, for `%{urlnum}`.
+  num : i32,
+}
+
 /// What the command line asks for.
 struct Config {
-  urls : Vec<Vec<u8>>,
-  // The `-o` file names in order. The first goes with the first URL, and so on.
-  outputs : Vec<Vec<u8>>,
-  // How many `-O` options were given. Each takes the next URL that has no `-o`.
-  remote_names : i32,
+  // The URLs, each with its output and upload.
+  nodes : Vec<UrlNode>,
+  // `--remote-name-all`: each node from here on names its file after its URL.
   remote_name_all : bool,
+  // `-g`: no URL globbing.
+  globoff : bool,
   has_method : bool,
   method : Vec<u8>,
   headers : Vec<Vec<u8>>,
@@ -77,8 +95,8 @@ struct Config {
   has_dump_header : bool,
   dump_header : Vec<u8>,
   http10 : bool,
+  // Some node uploads a file (`-T`).
   has_upload : bool,
-  upload : Vec<u8>,
   has_range : bool,
   range : Vec<u8>,
   resolve : Vec<Vec<u8>>,
@@ -197,10 +215,9 @@ struct Config {
 /// A `Config` with curl's defaults.
 pub fn default_config() -> Config {
   return Config {
-    urls : Vec<Vec<u8>>::new(),
-    outputs : Vec<Vec<u8>>::new(),
-    remote_names : 0,
+    nodes : Vec<UrlNode>::new(),
     remote_name_all : false,
+    globoff : false,
     has_method : false,
     method : Vec<u8>::new(),
     headers : Vec<Vec<u8>>::new(),
@@ -231,7 +248,6 @@ pub fn default_config() -> Config {
     dump_header : Vec<u8>::new(),
     http10 : false,
     has_upload : false,
-    upload : Vec<u8>::new(),
     has_range : false,
     range : Vec<u8>::new(),
     resolve : Vec<Vec<u8>>::new(),
@@ -969,7 +985,10 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     return done();
   }
   if id == OPT_OUTPUT {
-    cfg.outputs.push(clone_bytes(value));
+    let at = out_slot(cfg);
+    cfg.nodes[at].has_out = true;
+    cfg.nodes[at].out = clone_bytes(value);
+    cfg.nodes[at].remote = false;
     return done();
   }
   if id == OPT_RANGE {
@@ -981,8 +1000,12 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     return done();
   }
   if id == OPT_UPLOAD_FILE {
-    cfg.has_upload = true;
-    cfg.upload = clone_bytes(value);
+    let at = upload_slot(cfg);
+    cfg.nodes[at].has_upload = true;
+    cfg.nodes[at].upload = clone_bytes(value);
+    if value.len() > 0 {
+      cfg.has_upload = true;
+    }
     return done();
   }
   if id == OPT_USER {
@@ -1001,7 +1024,7 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     return done();
   }
   if id == OPT_URL {
-    cfg.urls.push(clone_bytes(value));
+    add_url(cfg, value);
     return done();
   }
   if id == OPT_MAX_REDIRS {
@@ -1280,7 +1303,13 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     return done();
   }
   if id == OPT_REMOTE_NAME {
-    cfg.remote_names = cfg.remote_names + 1;
+    // `--no-remote-name` matters only after `--remote-name-all`, as in curl.
+    if enable || cfg.remote_name_all {
+      let at = out_slot(cfg);
+      cfg.nodes[at].has_out = true;
+      cfg.nodes[at].out = Vec<u8>::new();
+      cfg.nodes[at].remote = enable;
+    }
     return done();
   }
   if id == OPT_REMOTE_NAME_ALL {
@@ -1363,10 +1392,83 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     cfg.remove_on_error = enable;
     return done();
   }
+  if id == OPT_GLOBOFF {
+    cfg.globoff = enable;
+    return done();
+  }
   // OPT_DISABLE,
-  // OPT_GLOBOFF, OPT_TRACE_TIME, OPT_PROGRESS_BAR, OPT_NO_PROGRESS_METER and OPT_NO_BUFFER
-  // change nothing that securl does.
+  // OPT_TRACE_TIME, OPT_PROGRESS_BAR, OPT_NO_PROGRESS_METER and OPT_NO_BUFFER change nothing
+  // that securl does.
   return Result<i32, Failure>::Ok(0);
+}
+
+fn new_node(remote : bool) -> UrlNode {
+  return UrlNode {
+    has_url : false,
+    url : Vec<u8>::new(),
+    has_out : false,
+    out : Vec<u8>::new(),
+    remote : remote,
+    has_upload : false,
+    upload : Vec<u8>::new(),
+    num : 0
+  };
+}
+
+/// The first node with no URL, made when there is none.
+fn url_slot(cfg : &mut Config) -> i32 {
+  let mut i = 0;
+  while i < cfg.nodes.len() {
+    if !cfg.nodes.get_ref(i).has_url {
+      return i;
+    }
+    i = i + 1;
+  }
+  cfg.nodes.push(new_node(cfg.remote_name_all));
+  return cfg.nodes.len() - 1;
+}
+
+/// The first node with no `-o` or `-O`, made when there is none.
+fn out_slot(cfg : &mut Config) -> i32 {
+  let mut i = 0;
+  while i < cfg.nodes.len() {
+    if !cfg.nodes.get_ref(i).has_out {
+      return i;
+    }
+    i = i + 1;
+  }
+  cfg.nodes.push(new_node(cfg.remote_name_all));
+  return cfg.nodes.len() - 1;
+}
+
+/// The first node with no `-T`, made when there is none.
+fn upload_slot(cfg : &mut Config) -> i32 {
+  let mut i = 0;
+  while i < cfg.nodes.len() {
+    if !cfg.nodes.get_ref(i).has_upload {
+      return i;
+    }
+    i = i + 1;
+  }
+  cfg.nodes.push(new_node(cfg.remote_name_all));
+  return cfg.nodes.len() - 1;
+}
+
+/// Put the URL `url` in the first node that has none.
+fn add_url(cfg : &mut Config, url : &Vec<u8>) -> void {
+  let at = url_slot(cfg);
+  cfg.nodes[at].has_url = true;
+  cfg.nodes[at].url = clone_bytes(url);
+}
+
+/// Whether some node of `cfg` has a URL.
+pub fn has_url(cfg : &Config) -> bool {
+  for n in cfg.nodes.iter() {
+    if n.has_url {
+      return true;
+    }
+  }
+  return false;
 }
 
 /// `bits` with `bit` set when `enable`, and cleared when not (curl's `togglebit`).
@@ -1640,7 +1742,7 @@ impl ArgParser {
 
   /// Start a new group after `--next`. False when the current group has no URL yet.
   fn next_group(self : &mut ArgParser) -> bool {
-    if self.current.urls.len() == 0 {
+    if !has_url(&self.current) {
       return false;
     }
     let group = replace(&mut self.current, default_config());
@@ -1703,7 +1805,7 @@ impl ArgParser {
           return Result<WordsStop, Failure>::Ok(stop);
         }
       } else {
-        self.current.urls.push(clone_bytes(word));
+        add_url(&mut self.current, word);
         i = i + 1;
       }
     }
@@ -1744,7 +1846,13 @@ impl ArgParser {
     let last = replace(&mut self.current, default_config());
     self.groups.push(last);
     let mut groups = replace(&mut self.groups, Vec<Config>::new());
+    // curl numbers the nodes in the order it makes them, across the groups.
+    let mut num = 0;
     for g in groups.iter_mut() {
+      for n in g.nodes.iter_mut() {
+        n.num = num;
+        num = num + 1;
+      }
       g.silent = self.globals.silent;
       g.show_error = self.globals.show_error;
       g.verbose = self.globals.verbose;

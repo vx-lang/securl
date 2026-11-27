@@ -63,11 +63,11 @@ Vx main 98e8df6d5.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 568 of 762 (74%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 510 of 569 (89%) |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 594 of 762 (77%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 535 of 569 (94%) |
 | TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 286 of 286 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
-| Unit tests (`tests/unit`) | 12 of 12 |
+| Unit tests (`tests/unit`) | 13 of 13 |
 
 `CURL=/path/to/curl tests/tls/run.sh` runs the checks of `tests/tls` against another curl, and
 `tests/h2/run.sh` takes `CURL` too. curl 8.23.1-DEV, built from the same curl commit, passes all
@@ -84,8 +84,7 @@ program of the curl build, linked with curl's own libcurl, so they never run sec
 the counts above included them by mistake: 152 of them passed, and the table said 522 of 874.
 Test 1070 depends on timing: the test server closes the connection while securl sends the
 body. It passes in some runs, between one in four and one in twelve, with and without recent
-changes. In the runs of the table above, it passed in the run of all tests and failed in the
-run of the supported ones. Test 1849 (two HTTPS transfers through a
+changes. It failed in both runs of the table above. Test 1849 (two HTTPS transfers through a
 proxy) fails in about one run in three, and did so before the latest changes too: the log of the
 test server sometimes lacks the second request. It passed in that run too.
 
@@ -96,8 +95,8 @@ curl's test suite"). `stunnel` and `nghttpx` let it run its HTTPS and HTTP/2 tes
 
 | Part | Lines | Trusted code |
 |---|---|---|
-| `src/securl/` (the package with all protocol code) | 17,142 | none, and `--no-trusted-code` enforces this |
-| `src/cli/` (the tool) and `src/disk/` (its files) | 1,519 | none, and `--no-trusted-code` enforces this |
+| `src/securl/` (the package with all protocol code) | 17,908 | none, and `--no-trusted-code` enforces this |
+| `src/cli/` (the tool) and `src/disk/` (its files) | 1,681 | none, and `--no-trusted-code` enforces this |
 | `src/main.vx` (hands `Root` and the command line to `cli`) | 14 | none. `--no-trusted-code` names only packages, but `make audit` lists any |
 | `src/sys/` (OpenSSL calls, socket options, string literals, and `SIGPIPE`) | 1,355 | 48 `extern` functions, 87 `unsafe` blocks |
 
@@ -367,7 +366,7 @@ missing options that block the most tests.
 `--json` `-F` (with `@file`, `<file`, `type=`, `filename=` and `headers=`) `--form-string`
 `--form-escape` `-D` `-e` (with `;auto`) `-f` `--fail-with-body` `-G` `-H` (with the `name:` and
 `name;` forms) `-I` `-i` `-k` `--cacert` `--capath` `-E` (`--cert`) `--cert-type` `--key` `--key-type` `--pass` `-L` `--location-trusted` `--max-redirs`
-`-o` `-O` `--remote-name-all` `--output-dir` `-r` `-s` `-S` `-T` `-u` `--digest` `--basic`
+`-o` `-O` `--remote-name-all` `--output-dir` `-g` (`--globoff`) `-r` `-s` `-S` `-T` `-u` `--digest` `--basic`
 `--anyauth` `-v` `-w` (most variables, `%header{}`, `%{header_json}`, `%output{}`, `%{stderr}`)
 `-X` `-x` `-U` `-p` `--proxytunnel` `--suppress-connect-headers` `--proxy-insecure`
 `--proxy-cacert` `--proxy-capath` `--socks4` `--socks4a` `--socks5` `--socks5-hostname` `--hsts`
@@ -381,6 +380,15 @@ is not built in) `-h`
 `-V`, and the options that runtests.pl adds: `-q` `--trace-ascii` `--trace-time`. As in curl,
 a long option may take its value in the same word, as `--max-time=2`, and `--` ends the
 options.
+
+A URL, and the file of `-T`, can hold globs, as in curl: sets such as `{one,two}` and ranges
+such as `[1-10]`, `[001-100:5]` and `[a-z]`, which make one transfer for each combination, the
+last glob changing fastest, and for each upload file each URL. `-o` takes the value of a glob
+with `#1` for the first one, or `#<name>` for one written `{<name>a,b}`, and `-g` turns
+globbing off. `src/securl/glob.vx` is a port of curl's `src/tool_urlglob.c`, with its error
+messages and their columns. As in curl, each URL goes with the `-o` or `-O`, and with the `-T`,
+of the same position on the command line, so `-T a URL1 -T b URL2` uploads `a` to `URL1` and `b`
+to `URL2`.
 
 `--next` starts a new group of options and URLs. As in curl, `-v`, `-s`, `-S` and the trace
 options hold for every group wherever they come, the groups share the cookies and the HSTS
@@ -489,7 +497,7 @@ In order of how much users need them:
 
 1. Reuse of HTTP/2 connections (and with it, multiplexing), the `Upgrade: h2c` of `--http2`
    on plain HTTP, and HTTP/2 through an HTTP proxy.
-1. URL globbing (`{a,b}` and `[1-9]`), `--variable`, `--no-clobber`, `-R`, resume of a
+1. `--url @FILE`, `--variable`, `--no-clobber`, `-R`, resume of a
    retry (`--retry` with `-C -`),
    `--netrc`, a default `.curlrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
    encoders, `--preproxy`, `--abstract-unix-socket`, the progress meter and `-#` (securl
@@ -573,6 +581,7 @@ src/disk/files.vx    reads and creates files; each function takes `&Files`
 src/sys/             trusted code: OpenSSL (tls.vx), arguments, standard output, literals
 src/securl/          the protocol code; no trusted code
   options.vx           the command line
+  glob.vx              the URL globs of the tool: {a,b}, [1-9], and #1 in -o
   url.vx               URLs and redirects
   auth.vx              credentials and where they may go; Basic and Digest
   hsts.vx              the HSTS cache of --hsts

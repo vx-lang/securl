@@ -1,0 +1,144 @@
+// Checks securl::glob, the URL globbing of the curl tool, against what curl's
+// src/tool_urlglob.c gives for the same patterns.
+import core::option;
+import core::result;
+import std::string;
+import std::vec;
+import sys::text;
+import securl::bytes;
+import securl::glob;
+
+fn show(m : &Vec<u8>) -> void {
+  match String::from_utf8(m) {
+    Result<String, Utf8Error>::Ok(text) => {
+      eprintln!("{}", text);
+    },
+    Result<String, Utf8Error>::Err(_e) => {}
+  }
+}
+
+/// The texts of every combination of `pattern`, each followed by a space.
+fn all_of(pattern : *const i8) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  match parse_glob(&lit(pattern)) {
+    Result<Glob, GlobError>::Ok(g) => {
+      let mut glob = g;
+      loop {
+        match glob.next_text() {
+          Option<Vec<u8>>::Some(t) => {
+            append(&mut out, &t);
+            push_lit(&mut out, " ");
+          },
+          Option<Vec<u8>>::None() => {
+            return out;
+          }
+        }
+      }
+    },
+    Result<Glob, GlobError>::Err(e) => {
+      push_lit(&mut out, "error: ");
+      append(&mut out, &glob_error_text(&e, &lit(pattern)));
+      return out;
+    }
+  }
+}
+
+fn expect(got : &Vec<u8>, want : *const i8) -> void {
+  if !eq_lit(got, want) {
+    let mut m = lit("got:  [");
+    append(&mut m, got);
+    push_lit(&mut m, "]\nwant: [");
+    append(&mut m, &lit(want));
+    push_lit(&mut m, "]");
+    show(&m);
+    panic("a glob gives the wrong text");
+  }
+}
+
+fn count_of(pattern : *const i8) -> i64 {
+  match parse_glob(&lit(pattern)) {
+    Result<Glob, GlobError>::Ok(g) => {
+      return g.amount();
+    },
+    Result<Glob, GlobError>::Err(_e) => {
+      return -1i64;
+    }
+  }
+}
+
+/// The `-o` name `name` for the second combination of `pattern`.
+fn output_of(pattern : *const i8, name : *const i8) -> Vec<u8> {
+  let mut glob = match parse_glob(&lit(pattern)) {
+    Result<Glob, GlobError>::Ok(g) => { g },
+    Result<Glob, GlobError>::Err(_e) => {
+      return lit("parse error");
+    }
+  };
+  let _first = glob.next_text();
+  let _second = glob.next_text();
+  let none = match parse_glob(&lit("x")) {
+    Result<Glob, GlobError>::Ok(g) => { g },
+    Result<Glob, GlobError>::Err(_e) => {
+      return lit("parse error");
+    }
+  };
+  match glob_output(&lit(name), &glob, false, &none) {
+    Result<Vec<u8>, GlobError>::Ok(o) => {
+      return o;
+    },
+    Result<Vec<u8>, GlobError>::Err(e) => {
+      let mut m = lit("error: ");
+      append(&mut m, &glob_error_text(&e, &lit(name)));
+      return m;
+    }
+  }
+}
+
+fn main() -> i32 {
+  expect(&all_of("http://h/{a,b,c}"), "http://h/a http://h/b http://h/c ");
+  expect(&all_of("h/{a,b}{1,2}"), "h/a1 h/a2 h/b1 h/b2 ");
+  expect(&all_of("h/[1-3]"), "h/1 h/2 h/3 ");
+  expect(&all_of("h/[08-11]"), "h/08 h/09 h/10 h/11 ");
+  expect(&all_of("h/[1-10:4]"), "h/1 h/5 h/9 ");
+  expect(&all_of("h/[a-e:2]x"), "h/ax h/cx h/ex ");
+  expect(&all_of("h/[a-a][1-1][b-b:1][2-2:1]/t"), "h/a1b2/t ");
+  expect(&all_of("h/0[0-1]/t"), "h/00/t h/01/t ");
+  // An empty element after a comma is fine, and `\` keeps a brace.
+  expect(&all_of("h/{a,}"), "h/a h/ ");
+  expect(&all_of("h/\\{\\}\\/x"), "h/{}\\/x ");
+  // IPv6 addresses and `[]` are text.
+  expect(&all_of("http://[::1]:80/{a,b}"), "http://[::1]:80/a http://[::1]:80/b ");
+  expect(&all_of("h/[]{a}"), "h/[]a ");
+  // Names are not part of the text.
+  expect(&all_of("h/{<n>x,y}"), "h/x h/y ");
+  if count_of("h/{a,b}[1-3]") != 6i64 {
+    panic("the count of {a,b}[1-3] is 6");
+  }
+  if count_of("http://h/plain") != 1i64 {
+    panic("a literal URL is one transfer");
+  }
+
+  // curl's errors, with the column it shows, as curl 8.23 prints them.
+  expect(&all_of("h/{a"), "error: unmatched brace in position 5:\nh/{a\n    ^");
+  expect(&all_of("h/{a,{b}}"), "error: nested brace in position 6:\nh/{a,{b}}\n     ^");
+  expect(&all_of("h/{}"), "error: empty string within braces in position 4:\nh/{}\n   ^");
+  expect(&all_of("h/a}"), "error: unmatched close brace/bracket in position 4:\nh/a}\n   ^");
+  expect(&all_of("h/[3-1]"), "error: bad range in position 8:\nh/[3-1]\n       ^");
+  expect(&all_of("h/{a]"), "error: unexpected close bracket in position 5:\nh/{a]\n    ^");
+  expect(&all_of("h/[a-z:0]"), "error: bad range in position 10:\nh/[a-z:0]\n         ^");
+  expect(&all_of("h/[1-2:x]"), "error: bad range in position 8:\nh/[1-2:x]\n       ^");
+  expect(&all_of("h/[-1]"), "error: bad range specification in position 4:\nh/[-1]\n   ^");
+  expect(&all_of("http://ur%20[0-60000000000000000000"),
+    "error: bad range in position 16:\nhttp://ur%20[0-60000000000000000000\n               ^");
+  expect(&all_of("h/{<n>a}{<n>b}"),
+    "error: Duplicate glob name in position 12:\nh/{<n>a}{<n>b}\n           ^");
+
+  // -o with #N and #<name>.
+  expect(&output_of("h/{a,b}/[1-2]", "f#1-#2"), "fa-2");
+  expect(&output_of("h/[1-2]", "f#2.dump"), "f#2.dump");
+  expect(&output_of("h/{<test>a,b}", "d-#<test>"), "d-b");
+  expect(&output_of("h/{<test>A,B}{<moo>C,D}", "somewhere/#<foo>"),
+    "error: no glob exists with this name in position 16:\nsomewhere/#<foo>\n               ^");
+  expect(&output_of("h/{a,b}", "x#<broken"), "x#<broken");
+  return 0;
+}

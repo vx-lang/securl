@@ -17,6 +17,14 @@ fn words(a : *const i8, b : *const i8, c : *const i8, d : *const i8, e : *const 
   return v;
 }
 
+fn words7(a : *const i8, b : *const i8, c : *const i8, d : *const i8, e : *const i8,
+f : *const i8, g : *const i8) -> Vec<Vec<u8>> {
+  let mut v = words(a, b, c, d, e);
+  v.push(lit(f));
+  v.push(lit(g));
+  return v;
+}
+
 fn parsed(args : &Vec<Vec<u8>>) -> Config {
   match parse_args(args) {
     Result<Config, Failure>::Ok(c) => {
@@ -43,9 +51,25 @@ fn error_of(args : &Vec<Vec<u8>>) -> Vec<u8> {
 fn main() -> i32 {
   let a = parsed(&words("-sSL", "-ofile.txt", "-H", "X-A: 1", "http://h/"));
   assert(a.silent && a.show_error && a.follow, "a cluster of short options");
-  assert(a.outputs.len() == 1 && eq_lit(a.outputs.get_ref(0), "file.txt"), "-o glued value");
+  assert(a.nodes.len() == 1 && eq_lit(&a.nodes.get_ref(0).out, "file.txt"), "-o glued value");
   assert(a.headers.len() == 1 && eq_lit(a.headers.get_ref(0), "X-A: 1"), "-H value");
-  assert(a.urls.len() == 1 && eq_lit(a.urls.get_ref(0), "http://h/"), "one URL");
+  assert(a.nodes.get_ref(0).has_url && eq_lit(&a.nodes.get_ref(0).url, "http://h/"), "one URL");
+
+  // Each URL, -o or -O, and -T fills the first node that has none, as curl's nodes.
+  let n = parsed(&words7("-O", "http://a/", "-T", "up", "-o", "x", "http://b/"));
+  assert(n.nodes.len() == 2, "two nodes");
+  assert(n.nodes.get_ref(0).remote && eq_lit(&n.nodes.get_ref(0).url, "http://a/")
+    && n.nodes.get_ref(0).has_upload && eq_lit(&n.nodes.get_ref(0).upload, "up"),
+    "-O and -T go with the first URL");
+  assert(!n.nodes.get_ref(1).remote && eq_lit(&n.nodes.get_ref(1).out, "x")
+    && eq_lit(&n.nodes.get_ref(1).url, "http://b/") && !n.nodes.get_ref(1).has_upload,
+    "-o goes with the second URL");
+  assert(n.has_upload, "some node uploads");
+  let r = parsed(&words("--remote-name-all", "--no-remote-name", "http://a/", "http://b/", "-s"));
+  assert(!r.nodes.get_ref(0).remote && r.nodes.get_ref(0).has_out && r.nodes.get_ref(1).remote,
+    "--no-remote-name takes back --remote-name-all for one URL");
+  let g0 = parsed(&words("-g", "http://h/{a}", "-s", "-s", "-s"));
+  assert(g0.globoff, "-g");
 
   let b = parsed(&words("--location", "--no-location", "-d", "a=1", "-i"));
   assert(b.include, "-i");
@@ -86,7 +110,7 @@ fn main() -> i32 {
   // `--name=value`, as in curl. A boolean option ignores its value.
   let g = parsed(&words("--max-filesize=2k", "--max-time=1.5", "--location=no", "-s", "http://h/"));
   assert(g.max_filesize == 2048i64 && g.max_time_ms == 1500i64, "a value after =");
-  assert(g.follow && g.urls.len() == 1, "a boolean option with = and no word taken");
+  assert(g.follow && g.nodes.len() == 1, "a boolean option with = and no word taken");
   assert(eq_lit(&error_of(&words("--max-filesize=x", "a", "b", "c", "d")),
     "option --max-filesize=x: expected a proper numerical parameter"), "the word as it was given");
   assert(eq_lit(&error_of(&words("--bogus=1", "a", "b", "c", "d")), "option --bogus=1: is unknown"),
