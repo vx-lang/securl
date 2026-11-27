@@ -1,0 +1,54 @@
+// libFuzzer target: the decoders of --compressed: gzip, deflate, brotli and zstd, securl::decoder. The first byte picks the coding, and the rest goes in two pieces. tools/build-fuzzers.sh builds it, and `make fuzz` runs it.
+// A panic, which stops the program, is a crash for libFuzzer.
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import securl::bytes;
+import securl::decoder;
+import securl::failure;
+
+/// The input of libFuzzer as bytes.
+fn input_of(data : *const u8, len : i64) -> Vec<u8> {
+  let mut bytes = Vec<u8>::new();
+  let mut i = 0i64;
+  while i < len {
+    bytes.push(unsafe { data[i] });
+    i = i + 1i64;
+  }
+  return bytes;
+}
+
+extern fn vx_fuzz_one(data : *const u8, len : i64) -> i32 {
+  let input = input_of(data, len);
+  if input.len() == 0 {
+    return 0;
+  }
+  let pick = input.get(0) % 4u8;
+  let mut name = lit("gzip");
+  if pick == 1u8 {
+    name = lit("deflate");
+  }
+  if pick == 2u8 {
+    name = lit("br");
+  }
+  if pick == 3u8 {
+    name = lit("zstd");
+  }
+  let mut d = new_decoder(coding_of(&name));
+  let half = (input.len() + 1) / 2;
+  let first = range_of(&input, 1, half);
+  let second = rest_from(&input, half);
+  match d.feed(&first) {
+    Result<Vec<u8>, Failure>::Ok(_a) => {
+      match d.feed(&second) {
+        Result<Vec<u8>, Failure>::Ok(_b) => {
+          let _f = d.finish();
+        },
+        Result<Vec<u8>, Failure>::Err(_e) => {}
+      }
+    },
+    Result<Vec<u8>, Failure>::Err(_e) => {}
+  }
+  return 0;
+}

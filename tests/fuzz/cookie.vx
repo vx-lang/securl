@@ -1,0 +1,29 @@
+// libFuzzer target: the cookie engine: Set-Cookie lines and cookie files, securl::cookie. tools/build-fuzzers.sh builds it, and `make fuzz` runs it.
+// A panic, which stops the program, is a crash for libFuzzer.
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import securl::cookie;
+
+/// The input of libFuzzer as bytes.
+fn input_of(data : *const u8, len : i64) -> Vec<u8> {
+  let mut bytes = Vec<u8>::new();
+  let mut i = 0i64;
+  while i < len {
+    bytes.push(unsafe { data[i] });
+    i = i + 1i64;
+  }
+  return bytes;
+}
+
+extern fn vx_fuzz_one(data : *const u8, len : i64) -> i32 {
+  let input = input_of(data, len);
+  let mut jar = new_jar(true);
+  add_cookie(&mut jar, &input, true, &lit("www.example.com"), &lit("/a/b"), 0);
+  load_cookie_text(&mut jar, &input, false);
+  start_jar(&mut jar);
+  let _h = cookie_header(&jar, &lit("www.example.com"), &lit("/a/b/c"), true);
+  let _t = jar_text(&mut jar);
+  return 0;
+}

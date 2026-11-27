@@ -7,6 +7,7 @@
 #   make test-supported   only the curl tests that use options securl has
 #   make test-tls   the HTTPS tests against local servers (needs python3)
 #   make test-h2    the HTTP/2 tests against a local server (needs python3 and the h2 package)
+#   make fuzz       run the libFuzzer targets of tests/fuzz (needs clang with libFuzzer)
 #
 # securl needs a vxc built from Vx main. Put the settings of your machine in config.mk, which
 # git ignores. For example:
@@ -72,6 +73,13 @@ unit: $(TLS_DEPS)
 test: build/securl
 	./tests/run-curl-tests.sh $(CURL_SRC) $(TESTS)
 
+# Build the libFuzzer targets of tests/fuzz, and run each for FUZZ_TIME seconds.
+FUZZ_TIME ?= 60
+fuzz: $(TLS_DEPS)
+	VXC="$(VXC)" VX_LIBDIR="$(VX_LIBDIR)" LLVM_BIN="$(LLVM_BIN)" TLS_LIBS="$(TLS_LIBS)" \
+	  tools/build-fuzzers.sh
+	tools/run-fuzzers.sh $(FUZZ_TIME)
+
 # The TLS tests, against local servers with the test certificates in tests/tls/certs.
 test-tls: build/securl
 	./tests/tls/run.sh
@@ -110,4 +118,4 @@ clean:
 distclean:
 	rm -rf build
 
-.PHONY: all audit unit test test-supported test-tls test-h2 clean distclean openssl openssl-dev
+.PHONY: all audit unit test test-supported test-tls test-h2 fuzz clean distclean openssl openssl-dev

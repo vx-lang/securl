@@ -1,0 +1,37 @@
+// libFuzzer target: the WWW-Authenticate challenges of Basic and Digest, and the Digest response, securl::auth. tools/build-fuzzers.sh builds it, and `make fuzz` runs it.
+// A panic, which stops the program, is a crash for libFuzzer.
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import securl::auth;
+import securl::failure;
+import securl::url;
+
+/// The input of libFuzzer as bytes.
+fn input_of(data : *const u8, len : i64) -> Vec<u8> {
+  let mut bytes = Vec<u8>::new();
+  let mut i = 0i64;
+  while i < len {
+    bytes.push(unsafe { data[i] });
+    i = i + 1i64;
+  }
+  return bytes;
+}
+
+extern fn vx_fuzz_one(data : *const u8, len : i64) -> i32 {
+  let input = input_of(data, len);
+  let mut a = new_auth_state(AUTH_ANY);
+  let mut d = new_digest_state();
+  let mut problem = false;
+  match parse_url(&lit("http://example.com/p"), false) {
+    Result<Url, Failure>::Ok(u) => {
+      take_challenge(&input, &mut a, &mut d, &u, &mut problem);
+      if d.has_nonce {
+        let _r = digest_response(&mut d, &lit("user"), &lit("pass"), &lit("GET"), &lit("/p"));
+      }
+    },
+    Result<Url, Failure>::Err(_f) => {}
+  }
+  return 0;
+}

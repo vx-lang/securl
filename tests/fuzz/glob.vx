@@ -1,0 +1,43 @@
+// libFuzzer target: the URL globs of the tool, securl::glob. tools/build-fuzzers.sh builds it, and `make fuzz` runs it.
+// A panic, which stops the program, is a crash for libFuzzer.
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import securl::glob;
+
+/// The input of libFuzzer as bytes.
+fn input_of(data : *const u8, len : i64) -> Vec<u8> {
+  let mut bytes = Vec<u8>::new();
+  let mut i = 0i64;
+  while i < len {
+    bytes.push(unsafe { data[i] });
+    i = i + 1i64;
+  }
+  return bytes;
+}
+
+extern fn vx_fuzz_one(data : *const u8, len : i64) -> i32 {
+  let input = input_of(data, len);
+  match parse_glob(&input) {
+    Result<Glob, GlobError>::Ok(g) => {
+      let mut glob = g;
+      let _n = glob.amount();
+      let mut k = 0;
+      while k < 64 {
+        match glob.next_text() {
+          Option<Vec<u8>>::Some(_t) => {},
+          Option<Vec<u8>>::None() => {
+            k = 64;
+          }
+        }
+        k = k + 1;
+      }
+      let _o = glob_output(&input, &glob, false, &no_glob());
+    },
+    Result<Glob, GlobError>::Err(e) => {
+      let _m = glob_error_text(&e, &input);
+    }
+  }
+  return 0;
+}

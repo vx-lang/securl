@@ -68,6 +68,7 @@ Vx main 98e8df6d5.
 | TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 290 of 290 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 13 of 13 |
+| Fuzzing with libFuzzer (`tests/fuzz`): 9 parsers, 2 minutes each, about 50 million inputs | no crash, hang or memory error |
 
 `CURL=/path/to/curl tests/tls/run.sh` runs the checks of `tests/tls` against another curl, and
 `tests/h2/run.sh` takes `CURL` too. curl 8.23.1-DEV, built from the same curl commit, passes all
@@ -359,6 +360,22 @@ protocols and of features such as compression.
 `tests/scan-supported-tests.py` lists the tests that use only options securl has, and the
 missing options that block the most tests.
 
+## Fuzzing
+
+`make fuzz` runs libFuzzer on the parsers that read bytes from the network or the command
+line: URLs and redirects, the lines of a response head, HPACK, cookies, dates, the globs of the
+tool, the gzip, deflate, brotli and zstd decoders, the challenges of Basic and Digest, and HSTS.
+Each target in `tests/fuzz` is a small Vx file that exports `vx_fuzz_one`, which libFuzzer
+calls with each input, and has its seeds in `tests/fuzz/corpus`. `FUZZ_TIME=600 make fuzz`
+runs each for 10 minutes.
+
+vxc has no fuzzer option, so `tools/build-fuzzers.sh` builds each target through LLVM: vxc
+writes the LLVM dialect of MLIR (`--action emit-llvm`), `mlir-translate` makes LLVM IR, and
+clang adds the coverage of libFuzzer (`-fsanitize=fuzzer`). In securl, a bug such as an index
+past the end of a `Vec` is a panic, which stops the program, so libFuzzer sees it as a crash
+and keeps the input in `build/fuzz`. A check with a target that reads past the end of a `Vec`
+showed that it does.
+
 ## Options
 
 `-A` `-b` (a cookie string or a cookie file) `-c` `-j` `-d` `--data-ascii` `--data-raw`
@@ -604,6 +621,8 @@ LICENSE              curl's license, with the copyright of securl and of curl
 tests/unit/          unit tests of the parsers
 tests/tls/           HTTPS tests against local servers, with test certificates
 tests/run-curl-tests.sh   runs curl's runtests.pl against build/securl
+tests/fuzz/          libFuzzer targets of the parsers, with their seeds
 tools/check-no-pointers.sh  refuses code that makes a raw pointer outside src/sys
 tools/check-secrets.sh      refuses code that reads a password outside auth.vx
+tools/build-fuzzers.sh      builds the targets of tests/fuzz; tools/run-fuzzers.sh runs them
 ```

@@ -1,0 +1,1 @@
+Basic realm="x", Digest realm="y", nonce="n", algorithm=MD5-sess, userhash=true
