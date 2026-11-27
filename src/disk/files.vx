@@ -141,6 +141,29 @@ pub fn create_file(files : &Files, name : &Vec<u8>) -> Result<File, Failure> {
   }
 }
 
+/// Open the file `name` to write after the bytes that it has, or make it.
+pub fn open_to_append(files : &Files, name : &Vec<u8>) -> Result<File, Failure> {
+  let mut m = lit("Failed to open the file ");
+  append(&mut m, name);
+  match path_string(name) {
+    Option<String>::Some(path) => {
+      match File::open(files, &path, OpenMode::ReadWriteCreate()) {
+        Result<File, FileError>::Ok(f) => {
+          let mut file = f;
+          let _end = file.seek(0i64, 2);
+          return Result<File, Failure>::Ok(file);
+        },
+        Result<File, FileError>::Err(_e) => {
+          return Result<File, Failure>::Err(fail_with(WRITE_ERROR, m));
+        }
+      }
+    },
+    Option<String>::None() => {
+      return Result<File, Failure>::Err(fail_with(WRITE_ERROR, m));
+    }
+  }
+}
+
 /// Write `bytes` to the file `name`. With `add`, they go after the bytes the file has, and else
 /// the file starts empty.
 pub fn append_to_file(files : &Files, name : &Vec<u8>, add : bool, bytes : &Vec<u8>)

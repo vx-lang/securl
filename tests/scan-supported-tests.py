@@ -27,7 +27,8 @@ proxy-basic proxy-anyauth form form-string form-escape cookie-jar junk-session-c
 http2 http2-prior-knowledge tcp-nodelay keepalive keepalive-time keepalive-cnt proxytunnel
 socks4 socks4a socks5 socks5-hostname cert cert-type key key-type pass compressed tr-encoding hsts
 suppress-connect-headers proxy-insecure proxy-cacert proxy-capath remove-on-error limit-rate
-max-filesize next config
+max-filesize next config retry retry-delay retry-max-time retry-connrefused
+retry-all-errors
 """.split())
 SUPPORTED_SHORT = set("AbcdDeFHjmorTuwXxU0fGiIkLOqsSvVhg#NpE:K")
 # The short options that take a value: the rest of the word is that value.

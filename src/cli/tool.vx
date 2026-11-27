@@ -8,12 +8,14 @@
 // connection, nor read the environment, and the compiler checks that.
 import core::option;
 import core::result;
+import core::time;
 import std::env;
 import std::fs;
 import std::io;
 import std::net;
 import std::root;
 import std::string;
+import std::time;
 import std::vec;
 import sys::console;
 import sys::hash;
@@ -400,17 +402,130 @@ struct OutputState {
   path : Vec<u8>,
   // securl made the file: it was not there before.
   created : bool,
-  // A byte went to the file.
+  // A byte went to the file, and how many bytes of the body.
   written : bool,
+  bytes : i64,
+  // A try of `--retry` after one that wrote no byte of the body: as curl, it adds to the file
+  // instead of making it empty. A try of `--retry` adds to the file of `-D` in any case.
+  keep : bool,
+  retrying : bool,
+}
+
+fn empty_output_state() -> OutputState {
+  return OutputState {
+    path : Vec<u8>::new(),
+    created : false,
+    written : false,
+    bytes : 0i64,
+    keep : false,
+    retrying : false
+  };
+}
+
+/// Whether `--retry` tries the transfer again after it ended with exit code `code`, as curl's
+/// `retrycheck`: on a time-out or a host that has no address, on a refused connection with
+/// `--retry-connrefused`, on an HTTP response that says to come back later, and on any error
+/// with `--retry-all-errors`. Gives how many milliseconds to wait first, after curl's warning,
+/// or -1 for no retry. `sleep` is the wait that doubles from 1 second.
+fn retry_wait(console : &mut Console, cfg : &Config, code : i32, refused : bool,
+info : &TransferInfo, sleep : &mut i64, left : i64, elapsed : i64) -> i64 {
+  let mut reason = lit("");
+  let mut http = false;
+  if code == OPERATION_TIMEDOUT || code == COULDNT_RESOLVE_HOST || code == 5 {
+    reason = lit(": timeout");
+  } else if cfg.retry_connrefused && code == COULDNT_CONNECT {
+    if refused {
+      reason = lit(": connection refused");
+    }
+  } else if code == 0 || ((cfg.fail || cfg.fail_with_body) && code == HTTP_RETURNED_ERROR) {
+    let s = info.http_code;
+    if s == 408 || s == 429 || s == 500 || s == 502 || s == 503 || s == 504 || s == 522
+       || s == 524 {
+      reason = lit(": HTTP error");
+      http = true;
+    }
+  }
+  if code != 0 && reason.len() == 0 && cfg.retry_all_errors {
+    reason = lit("(retrying all errors)");
+  }
+  if reason.len() == 0 {
+    return -1i64;
+  }
+  let mut wait = 0i64;
+  if http && info.retry_after > 0i64 {
+    wait = info.retry_after * 1000i64;
+    if cfg.retry_max_time_ms > 0i64 && elapsed + wait > cfg.retry_max_time_ms {
+      if !cfg.silent {
+        console.to_stderr(&message_lines("Warning: ", &lit("The Retry-After: time would make this command line exceed the maximum allowed time for retries."),
+          cfg.columns));
+      }
+      return -1i64;
+    }
+  }
+  if wait == 0i64 && cfg.retry_delay_ms == 0i64 {
+    if *sleep == 0i64 {
+      *sleep = 1000i64;
+    } else {
+      *sleep = *sleep * 2i64;
+    }
+    if *sleep > 600000i64 {
+      *sleep = 600000i64;
+    }
+  }
+  if wait == 0i64 {
+    wait = *sleep;
+  }
+  if !cfg.silent {
+    let mut m = lit("Problem ");
+    append(&mut m, &reason);
+    push_lit(&mut m, ". Retrying in ");
+    push_i64(&mut m, wait / 1000i64);
+    if wait % 1000i64 != 0i64 {
+      m.push(46u8);
+      let ms = wait % 1000i64;
+      if ms < 100i64 {
+        m.push(48u8);
+      }
+      if ms < 10i64 {
+        m.push(48u8);
+      }
+      push_i64(&mut m, ms);
+    }
+    push_lit(&mut m, " second");
+    if wait != 1000i64 {
+      push_lit(&mut m, "s");
+    }
+    push_lit(&mut m, ". ");
+    push_i64(&mut m, left);
+    if left > 1i64 {
+      push_lit(&mut m, " retries left.");
+    } else {
+      push_lit(&mut m, " retry left.");
+    }
+    console.to_stderr(&message_lines("Warning: ", &m, cfg.columns));
+  }
+  return wait;
 }
 
 /// Create the output file `path`, and note it in `state`.
 fn create_output_file(files : &Files, path : &Vec<u8>, state : &mut OutputState)
 -> Result<File, Failure> {
   state.created = !file_exists(files, path);
-  let file = create_file(files, path)?;
+  let mut file = Option<File>::None();
+  if state.keep {
+    file = Option<File>::Some(open_to_append(files, path)?);
+  } else {
+    file = Option<File>::Some(create_file(files, path)?);
+  }
   state.path = clone_bytes(path);
-  return Result<File, Failure>::Ok(file);
+  match file {
+    Option<File>::Some(f) => {
+      return Result<File, Failure>::Ok(f);
+    },
+    Option<File>::None() => {
+      return Result<File, Failure>::Err(fail_lit(WRITE_ERROR, "no file"));
+    }
+  }
 }
 
 /// Clean up the output file of a transfer that failed. curl opens its output file only when the
@@ -465,13 +580,18 @@ fn in_output_dir(cfg : &Config, name : &Vec<u8>) -> Vec<u8> {
   return out;
 }
 
-/// Open the output of `-D`, or an output that drops what it gets.
-fn open_header_output(files : &Files, cfg : &Config) -> Result<Output, Failure> {
+/// Open the output of `-D`, or an output that drops what it gets. A try of `--retry` adds to
+/// the file.
+fn open_header_output(files : &Files, cfg : &Config, retrying : bool) -> Result<Output, Failure> {
   if !cfg.has_dump_header {
     return Result<Output, Failure>::Ok(null_output());
   }
   if eq_lit(&cfg.dump_header, "-") {
     return Result<Output, Failure>::Ok(stdout_output());
+  }
+  if retrying {
+    let kept = open_to_append(files, &cfg.dump_header)?;
+    return Result<Output, Failure>::Ok(file_output(kept));
   }
   let file = create_file(files, &cfg.dump_header)?;
   return Result<Output, Failure>::Ok(file_output(file));
@@ -848,33 +968,72 @@ other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first :
     }
 
     let mut info = new_info();
-    let mut state = OutputState {
-      path : Vec<u8>::new(),
-      created : false,
-      written : false
-    };
+    let mut state = empty_output_state();
     let mut code = 0;
     let mut message = Vec<u8>::new();
-    let mut result = Result<i32, Failure>::Ok(0);
-    if i == 0 && fail_first {
-      info.url_effective = effective_url(&url_text, cfg.path_as_is);
-      result = Result<i32, Failure>::Err(fail_lit(TOO_LARGE,
-        "A value or data field grew larger than allowed"));
-    } else if this_kind == REQ_PUT {
-      result = transfer_one(network, files, console, tls, cfg, headers, &url_text, upload_body, this_kind,
-        form_boundary, session, i, &mut info, &mut state);
-    } else {
-      result = transfer_one(network, files, console, tls, cfg, headers, &url_text, request_body, this_kind,
-        form_boundary, session, i, &mut info, &mut state);
-    }
-    match result {
-      Result<i32, Failure>::Ok(_v) => {},
-      Result<i32, Failure>::Err(f) => {
-        report(console, cfg, &f);
-        code = f.code;
-        message = f.message;
-        clean_failed_output(console, files, cfg, &state);
+    // `--retry`: the tries left, the wait that doubles, and when the first try started.
+    let mut retry_left = cfg.retry;
+    let mut retry_sleep = cfg.retry_delay_ms;
+    let retry_start = Instant::now();
+    let mut retries = 0;
+    let mut created = false;
+    let mut keep = false;
+    loop {
+      info = new_info();
+      state = empty_output_state();
+      state.keep = keep;
+      state.retrying = retries > 0;
+      code = 0;
+      message = Vec<u8>::new();
+      let mut refused = false;
+      let mut result = Result<i32, Failure>::Ok(0);
+      if i == 0 && fail_first {
+        info.url_effective = effective_url(&url_text, cfg.path_as_is);
+        result = Result<i32, Failure>::Err(fail_lit(TOO_LARGE,
+          "A value or data field grew larger than allowed"));
+      } else if this_kind == REQ_PUT {
+        result = transfer_one(network, files, console, tls, cfg, headers, &url_text, upload_body,
+          this_kind, form_boundary, session, i, &mut info, &mut state);
+      } else {
+        result = transfer_one(network, files, console, tls, cfg, headers, &url_text, request_body,
+          this_kind, form_boundary, session, i, &mut info, &mut state);
       }
+      created = created || state.created;
+      match result {
+        Result<i32, Failure>::Ok(_v) => {},
+        Result<i32, Failure>::Err(f) => {
+          report(console, cfg, &f);
+          code = f.code;
+          message = f.message;
+          refused = f.refused;
+        }
+      }
+      let elapsed = retry_start.elapsed().as_millis() as i64;
+      if retry_left > 0i64 && (cfg.retry_max_time_ms == 0i64 || elapsed < cfg.retry_max_time_ms) {
+        let wait = retry_wait(console, cfg, code, refused, &info, &mut retry_sleep, retry_left,
+          elapsed);
+        if wait >= 0i64 {
+          retry_left = retry_left - 1i64;
+          retries = retries + 1;
+          if state.bytes > 0i64 && state.path.len() > 0 && (cfg.verbose || cfg.has_trace)
+             && !cfg.silent {
+            // The next try writes the file again from its start.
+            let mut m = lit("Throwing away ");
+            push_i64(&mut m, state.bytes);
+            push_lit(&mut m, " bytes");
+            console.to_stderr(&message_lines("Note: ", &m, cfg.columns));
+          }
+          keep = state.bytes == 0i64;
+          let _slept = sleep(Duration::from_millis(wait as u64));
+          continue;
+        }
+      }
+      break;
+    }
+    info.num_retries = retries;
+    state.created = created;
+    if code != 0 {
+      clean_failed_output(console, files, cfg, &state);
     }
     if cfg.has_write_out {
       let ctx = WriteOutContext {
@@ -932,7 +1091,7 @@ url_text : &Vec<u8>, request_body : &Vec<u8>, kind : i32, form_boundary : &Vec<u
 session : &mut Session, index : i32, info : &mut TransferInfo, state : &mut OutputState)
 -> Result<i32, Failure> {
   let body_output = open_output(files, cfg, index, url_text, state)?;
-  let header_output = open_header_output(files, cfg)?;
+  let header_output = open_header_output(files, cfg, state.retrying)?;
   let mut sinks = Sinks {
     body : body_output,
     headers : header_output,
@@ -941,5 +1100,6 @@ session : &mut Session, index : i32, info : &mut TransferInfo, state : &mut Outp
   let result = run_transfer(network, tls, cfg, headers, url_text, request_body, kind,
     form_boundary, session, console, &mut sinks, info);
   state.written = sinks.body.written > 0i64;
+  state.bytes = sinks.body.delivered;
   return result;
 }

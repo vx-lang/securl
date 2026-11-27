@@ -169,6 +169,14 @@ struct Config {
   limit_rate : i64,
   // `--max-filesize`: the most bytes of a body, before and after decoding, or 0.
   max_filesize : i64,
+  // `--retry` and its options: how many times to try a transfer again after a transient
+  // error, the wait between tries (0 for curl's 1 second that doubles), the most time for all
+  // tries (0 for no limit), and whether a refused connection or any error counts too.
+  retry : i64,
+  retry_delay_ms : i64,
+  retry_max_time_ms : i64,
+  retry_connrefused : bool,
+  retry_all_errors : bool,
   hsts : Vec<u8>,
   // The proxy variables of the environment that are set, such as `https_proxy`. The tool
   // reads them. This package gets their values, and not the right to read the environment.
@@ -270,6 +278,11 @@ pub fn default_config() -> Config {
     columns : 79,
     limit_rate : 0i64,
     max_filesize : 0i64,
+    retry : 0i64,
+    retry_delay_ms : 0i64,
+    retry_max_time_ms : 0i64,
+    retry_connrefused : false,
+    retry_all_errors : false,
     hsts : Vec<u8>::new(),
     proxy_env : Vec<EnvVar>::new()
   };
@@ -371,6 +384,11 @@ const OPT_MAX_FILESIZE : i32 = 93;
 // `--next` and `-K`, which the parser handles itself.
 const OPT_NEXT : i32 = 94;
 const OPT_CONFIG : i32 = 95;
+const OPT_RETRY : i32 = 96;
+const OPT_RETRY_DELAY : i32 = 97;
+const OPT_RETRY_MAX_TIME : i32 = 98;
+const OPT_RETRY_CONNREFUSED : i32 = 99;
+const OPT_RETRY_ALL_ERRORS : i32 = 100;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -473,6 +491,11 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "max-filesize") { return OPT_MAX_FILESIZE; }
   if eq_lit(name, "next") { return OPT_NEXT; }
   if eq_lit(name, "config") { return OPT_CONFIG; }
+  if eq_lit(name, "retry") { return OPT_RETRY; }
+  if eq_lit(name, "retry-delay") { return OPT_RETRY_DELAY; }
+  if eq_lit(name, "retry-max-time") { return OPT_RETRY_MAX_TIME; }
+  if eq_lit(name, "retry-connrefused") { return OPT_RETRY_CONNREFUSED; }
+  if eq_lit(name, "retry-all-errors") { return OPT_RETRY_ALL_ERRORS; }
   return OPT_UNKNOWN;
 }
 
@@ -526,7 +549,8 @@ fn takes_value(id : i32) -> bool {
     || id == OPT_FORM || id == OPT_FORM_STRING || id == OPT_COOKIE_JAR
     || id == OPT_KEEPALIVE_TIME || id == OPT_KEEPALIVE_CNT
     || (id >= OPT_SOCKS4 && id <= OPT_PASS) || id == OPT_HSTS || id == OPT_PROXY_CACERT
-    || id == OPT_PROXY_CAPATH || id == OPT_LIMIT_RATE || id == OPT_MAX_FILESIZE || id == OPT_CONFIG;
+    || id == OPT_PROXY_CAPATH || id == OPT_LIMIT_RATE || id == OPT_MAX_FILESIZE || id == OPT_CONFIG
+    || (id >= OPT_RETRY && id <= OPT_RETRY_MAX_TIME);
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -542,6 +566,10 @@ pub fn seconds_to_ms(text : &Vec<u8>) -> Option<i64> {
   if whole.len() > 0 {
     match parse_u64(&whole) {
       Option<u64>::Some(s) => {
+        // As curl's `secs2ms`: at most LONG_MAX / 1000 - 1 seconds.
+        if s > 9223372036854774u64 {
+          return Option<i64>::None();
+        }
         ms = (s as i64) * 1000i64;
       },
       Option<u64>::None() => {
@@ -1083,6 +1111,33 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
   }
   if id == OPT_MAX_FILESIZE {
     cfg.max_filesize = size_arg(value, shown)?;
+    return done();
+  }
+  if id == OPT_RETRY {
+    cfg.retry = unsigned_arg(value, shown)?;
+    return done();
+  }
+  if id == OPT_RETRY_DELAY || id == OPT_RETRY_MAX_TIME {
+    match seconds_to_ms(value) {
+      Option<i64>::Some(ms) => {
+        if id == OPT_RETRY_DELAY {
+          cfg.retry_delay_ms = ms;
+        } else {
+          cfg.retry_max_time_ms = ms;
+        }
+      },
+      Option<i64>::None() => {
+        return Result<i32, Failure>::Err(option_error(shown, "expected a proper numerical parameter"));
+      }
+    }
+    return done();
+  }
+  if id == OPT_RETRY_CONNREFUSED {
+    cfg.retry_connrefused = enable;
+    return done();
+  }
+  if id == OPT_RETRY_ALL_ERRORS {
+    cfg.retry_all_errors = enable;
     return done();
   }
   if id == OPT_KEEPALIVE_CNT {

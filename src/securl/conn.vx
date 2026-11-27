@@ -156,13 +156,13 @@ deadline : Instant, options : &SocketOptions) -> Result<Conn, Failure> {
           // The time limit of the caller ended the wait. The caller words the message.
           return Result<Conn, Failure>::Err(fail_lit(OPERATION_TIMEDOUT, "Operation timed out"));
         },
+        NetError::Refused() => {
+          let mut f = fail_with(COULDNT_CONNECT, connect_failure(host, port));
+          f.refused = true;
+          return Result<Conn, Failure>::Err(f);
+        },
         _ => {
-          let mut m = lit("Failed to connect to ");
-          append(&mut m, host);
-          push_lit(&mut m, " port ");
-          push_u64(&mut m, port as u64);
-          push_lit(&mut m, ": Could not connect to server");
-          return Result<Conn, Failure>::Err(fail_with(COULDNT_CONNECT, m));
+          return Result<Conn, Failure>::Err(fail_with(COULDNT_CONNECT, connect_failure(host, port)));
         }
       }
     }
@@ -331,4 +331,14 @@ impl Conn {
     self.start = stop;
     return Result<Vec<u8>, Failure>::Ok(out);
   }
+}
+
+/// curl's text for a connection that did not open.
+fn connect_failure(host : &Vec<u8>, port : i32) -> Vec<u8> {
+  let mut m = lit("Failed to connect to ");
+  append(&mut m, host);
+  push_lit(&mut m, " port ");
+  push_u64(&mut m, port as u64);
+  push_lit(&mut m, ": Could not connect to server");
+  return m;
 }

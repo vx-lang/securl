@@ -444,6 +444,14 @@ else
   fail=1
 fi
 
+# --retry: a 503 is tried again after the wait, with curl's warning, and the exit code is the
+# one of the last try.
+check "--retry tries a 503 again" 0 "busy
+fine" --retry 2 --retry-delay 0.25 "http://127.0.0.1:$http/flaky/a"
+stderr_has "  with curl's warning" "Warning: Problem : HTTP error. Retrying in 0.250 seconds. 2 retries left."
+check "  and with -f" 0 "fine" -sS -f --retry 1 --retry-delay 0.1 "http://127.0.0.1:$http/flaky/b"
+check "no --retry, no second try" 22 "" -sS -f "http://127.0.0.1:$http/flaky/c"
+
 # --tr-encoding: gzip as a transfer coding. Without it, curl refuses one that it did not ask for.
 check "--tr-encoding decodes Transfer-Encoding: gzip" 0 "203890" -s --tr-encoding \
   -w '%{size_delivered}' -o "$work/te" "http://127.0.0.1:$http/te-gzip"

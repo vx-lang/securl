@@ -63,9 +63,9 @@ Vx main 12f3786c8.
 
 | Test set | Passed |
 |---|---|
-| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 476 of 757 (62%) |
-| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 427 of 513 (83%) |
-| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 188 of 188 |
+| The tests with the keyword `HTTP` that run the curl tool, as runtests.pl runs them for securl | 490 of 757 (64%) |
+| The HTTP tests that use only options securl implements (`tests/supported-tests.txt`) | 440 of 524 (83%) |
+| TLS, client-certificate, proxy, HTTPS-proxy, compression, HSTS, socket-option and limit tests against local servers (`tests/tls`) | 192 of 192 |
 | HTTP/2 tests against a local server built on python-hyper's `h2` (`tests/h2`) | 32 of 32 |
 | Unit tests (`tests/unit`) | 12 of 12 |
 
@@ -316,7 +316,8 @@ missing options that block the most tests.
 `--proxy-digest` `--proxy-basic` `--proxy-anyauth` `--noproxy` `--resolve` `--connect-to`
 `--path-as-is` `--raw` `-0` `--http1.1` `--http2` `--http2-prior-knowledge` `--url` `-m`
 `--connect-timeout` `--compressed` `--tr-encoding` `--keepalive` `--keepalive-time` `--keepalive-cnt` `--tcp-nodelay`
-`--limit-rate` `--max-filesize` `--remove-on-error` `--next` (`-:`) `-K` (`--config`) `-h`
+`--limit-rate` `--max-filesize` `--remove-on-error` `--next` (`-:`) `-K` (`--config`)
+`--retry` `--retry-delay` `--retry-max-time` `--retry-connrefused` `--retry-all-errors` `-h`
 `-V`, and the options that runtests.pl adds: `-q` `--trace-ascii` `--trace-time`. As in curl,
 a long option may take its value in the same word, as `--max-time=2`, and `--` ends the
 options.
@@ -330,6 +331,16 @@ the value, double quotes with backslash escapes, `#` comments, `next` lines, and
 files deep. The tool reads the file with its file right and hands each line to the parser of
 the command line, which cannot open a file. Errors and warnings name the file and the line as
 curl does, and wrap at the width of the terminal.
+
+`--retry N` tries a transfer again, as curl does, after a time-out, a host with no address, an
+HTTP response 408, 429, 500, 502, 503, 504, 522 or 524 (also with `-f`), a refused connection
+with `--retry-connrefused`, and any error with `--retry-all-errors`. It waits 1 second, then
+twice as long each time up to 10 minutes, or `--retry-delay`, or the Retry-After of the
+response, and gives up when `--retry-max-time` would pass. Each try prints its error and curl's
+warning, such as "Problem : HTTP error. Retrying in 1 second. 3 retries left.", `-w` and
+`--remove-on-error` act on the last try, and `%{num_retries}` counts the tries. An output file
+starts again empty when the try wrote body bytes to it, and else keeps what the try wrote, as
+in curl.
 
 As libcurl does, each connection sets TCP_NODELAY and TCP keepalive: the first probe after 60
 seconds with no traffic, then one each 60 seconds, and 9 probes with no answer drop the
@@ -382,7 +393,7 @@ In order of how much users need them:
 1. Connection reuse (and with it, HTTP/2 multiplexing),
    `--unix-socket`, the
    `Upgrade: h2c` of `--http2` on plain HTTP, and HTTP/2 through an HTTP proxy.
-1. URL globbing (`{a,b}` and `[1-9]`), `-J`, `-C` resume, `--retry`, `--variable`,
+1. URL globbing (`{a,b}` and `[1-9]`), `-J`, `-C` resume, `--variable`,
    `--netrc`, a default `.curlrc`, `-4` and `-6`, several files in one `-F` field, nested multipart forms and `-F`
    encoders, `--preproxy`, SOCKS5 with GSS-API, `--proxy-http2` and client certificates for an
    HTTPS proxy, Digest with the proxy of a

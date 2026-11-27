@@ -27,7 +27,8 @@ time limits of reads, and `/huge-chunk` sends a chunk size too large for 64 bits
 Content-Encoding for `--compressed`; with Python 3.14 or later, which has `compression.zstd`,
 they include zstd bodies, and with the brotli library of the system (libbrotlienc), brotli bodies.
 `/sts?VALUE` sends a Strict-Transport-Security header with
-the decoded VALUE, for `--hsts`.
+the decoded VALUE, for `--hsts`. A path under `/flaky/` answers 503 the first time and 200 after
+that, for `--retry`.
 
 It runs until it is killed.
 """
@@ -120,6 +121,10 @@ if _BR:
     })
 
 
+# The paths of /flaky/ that answered 503 once.
+FLAKY_SEEN = set()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -158,6 +163,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+        elif self.path.startswith("/flaky/"):
+            # 503 the first time for each path, then 200, for --retry.
+            if self.path in FLAKY_SEEN:
+                self.send_body(b"fine\n")
+            else:
+                FLAKY_SEEN.add(self.path)
+                self.send_response(503)
+                self.send_header("Content-Length", "5")
+                self.end_headers()
+                self.wfile.write(b"busy\n")
         elif self.path.startswith("/sts?"):
             # The query, decoded, is the value of a Strict-Transport-Security header.
             self.send_response(200)

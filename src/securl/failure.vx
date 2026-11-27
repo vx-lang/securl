@@ -7,13 +7,16 @@ import sys::text;
 struct Failure {
   code : i32,
   message : Vec<u8>,
+  // The peer refused the connection, for `--retry-connrefused`.
+  refused : bool,
 }
 
 /// A failure with exit code `code` and the message `message`.
 pub fn fail_with(code : i32, message : Vec<u8>) -> Failure {
   return Failure {
     code : code,
-    message : message
+    message : message,
+    refused : false
   };
 }
 
@@ -21,7 +24,8 @@ pub fn fail_with(code : i32, message : Vec<u8>) -> Failure {
 pub fn fail_lit(code : i32, message : *const i8) -> Failure {
   return Failure {
     code : code,
-    message : lit(message)
+    message : lit(message),
+    refused : false
   };
 }
 

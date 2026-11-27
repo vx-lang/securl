@@ -17,6 +17,7 @@ import securl::auth;
 import securl::bytes;
 import securl::conn;
 import securl::cookie;
+import securl::date;
 import securl::failure;
 import securl::h2;
 import securl::hsts;
@@ -62,6 +63,10 @@ struct TransferInfo {
   expected_size : i64,
   // A response of the transfer said HTTP/1.0, so the next requests of the transfer use 1.0.
   received_http10 : bool,
+  // The seconds of the Retry-After header of the last response, or 0, for `--retry`.
+  retry_after : i64,
+  // How many times `--retry` tried the transfer again.
+  num_retries : i32,
 }
 
 /// A `TransferInfo` before the transfer starts.
@@ -90,7 +95,9 @@ pub fn new_info() -> TransferInfo {
     size_header_total : 0i64,
     hop_start_download : 0i64,
     expected_size : -1i64,
-    received_http10 : false
+    received_http10 : false,
+    retry_after : 0i64,
+    num_retries : 0
   };
 }
 
@@ -778,6 +785,7 @@ session : &mut Session, console : &mut Console, sinks : &mut Sinks, info : &mut 
     return Result<Hop, Failure>::Err(fail_lit(FILESIZE_EXCEEDED, "Maximum file size exceeded"));
   }
   info.http_code = head.status;
+  info.retry_after = retry_after_of(&head.headers);
   info.http_version = head.version;
   if head.version == 10 {
     info.received_http10 = true;
@@ -831,11 +839,12 @@ session : &mut Session, console : &mut Console, sinks : &mut Sinks, info : &mut 
 
   let failed = !retry && auth_should_fail(head.status, cfg.fail || cfg.fail_with_body, allowed,
     proxy_allowed, auth.problem);
+  // As libcurl, the head goes to the output before `-f` fails, for `-i` and `-D`.
+  let _w = write_head(console, sinks, cfg.include || cfg.head, &head.raw)?;
   if failed && !cfg.fail_with_body {
     return Result<Hop, Failure>::Err(http_error(head.status));
   }
 
-  let _w = write_head(console, sinks, cfg.include || cfg.head, &head.raw)?;
 
   // The body of a redirect that curl follows goes nowhere.
   let mut trailers = Vec<u8>::new();
@@ -1585,6 +1594,39 @@ pub fn clone_lines(lines : &Vec<Vec<u8>>) -> Vec<Vec<u8>> {
   let mut out = Vec<Vec<u8>>::new();
   for l in lines.iter() {
     out.push(clone_bytes(l));
+  }
+  return out;
+}
+
+/// The Retry-After header of a response in seconds from now, as libcurl reads it: an HTTP date,
+/// or else a number of seconds, at most 6 hours. 0 when there is none, or a date in the past.
+fn retry_after_of(headers : &Vec<Vec<u8>>) -> i64 {
+  let mut out = 0i64;
+  for line in headers.iter() {
+    if starts_lit_nocase(line, "Retry-After:") {
+      let value = trim_blanks(&rest_from(line, 12));
+      out = 0i64;
+      match parse_date(&value) {
+        Option<i64>::Some(date) => {
+          let now = unix_timestamp() as i64;
+          if date >= now {
+            out = date - now;
+          }
+        },
+        Option<i64>::None() => {
+          let mut n = 0i64;
+          let mut i = 0;
+          while i < value.len() && is_digit(value.get(i)) && n < 1000000000000i64 {
+            n = n * 10i64 + ((value.get(i) - 48u8) as i64);
+            i = i + 1;
+          }
+          out = n;
+        }
+      }
+      if out > 21600i64 {
+        out = 21600i64;
+      }
+    }
   }
   return out;
 }
