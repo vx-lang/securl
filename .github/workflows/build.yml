@@ -109,11 +109,8 @@ jobs:
         with:
           name: securl
           path: build
-      - name: Restore OpenSSL
-        uses: actions/cache/restore@v4
-        with:
-          path: build/openssl
-          key: openssl-${{ hashFiles('.git/modules/third_party/openssl/HEAD', 'Makefile') }}
+      # `make openssl-dev` builds OpenSSL here: OpenSSL's Makefile takes a restored build as
+      # older than the fresh checkout of its sources, and configures it again, which fails.
       - name: Build curl's test servers, stunnel and nghttpx
         run: |
           chmod +x build/securl
