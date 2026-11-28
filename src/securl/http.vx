@@ -182,6 +182,12 @@ struct RequestInfo {
   // `--request-target`: the target of the request line, also through a proxy.
   has_target : bool,
   target : Vec<u8>,
+  // `--proxy-header`: they go after the `-H` headers in a request through the proxy.
+  proxy_headers : Vec<Vec<u8>>,
+  // After a 417, the request goes again without the `Expect: 100-continue` of curl.
+  no_expect : bool,
+  // `send_request` sets it: the response came before the body, which did not go.
+  held_body : bool,
 }
 
 /// The header of the condition `cond` of `-z`.
@@ -199,6 +205,55 @@ fn add_line(out : &mut Vec<u8>, name : *const i8, value : &Vec<u8>) -> void {
   push_lit(out, name);
   append(out, value);
   push_lit(out, "\r\n");
+}
+
+/// Whether curl adds `Expect: 100-continue` to the request: for an HTTP/1.1 body larger than
+/// 1 MiB, or in chunks, unless a `-H` gives an Expect header or a 417 said no.
+fn adds_expect(info : &RequestInfo) -> bool {
+  return (info.kind == REQ_POST || info.kind == REQ_PUT) && !info.no_expect && !info.http10
+    && !info.h2 && !has_custom(&info.headers, "Expect")
+    && (info.body_length > EXPECT_100_THRESHOLD || info.add_chunked_header);
+}
+
+/// Whether the request waits for a `100 Continue` before its body, as libcurl's
+/// `http_exp100_setup`: the Expect header of curl, or a `-H` Expect header of `100-continue`.
+pub fn expects_continue(info : &RequestInfo) -> bool {
+  if info.kind != REQ_POST && info.kind != REQ_PUT {
+    return false;
+  }
+  match custom_value(&info.headers, "Expect") {
+    Option<Vec<u8>>::Some(v) => {
+      return starts_lit_nocase(&trim_blanks(&v), "100-continue");
+    },
+    Option<Vec<u8>>::None() => {
+      return adds_expect(info);
+    }
+  }
+}
+
+/// Write the custom headers `lines` of a request, without those that the request makes itself
+/// and those that may not go: the `Authorization` and `Cookie` of the user only where
+/// `trusted`.
+fn add_custom_headers(out : &mut Vec<u8>, lines : &Vec<Vec<u8>>, info : &RequestInfo,
+trusted : bool) -> void {
+  for line in lines.iter() {
+    let h = split_header(line);
+    let skip = h.ignored || h.remove || eq_lit_nocase(&h.name, "Host")
+      || eq_lit_nocase(&h.name, "Connection")
+      || (info.probe && eq_lit_nocase(&h.name, "Content-Length"))
+      || (info.form_boundary.len() > 0 && eq_lit_nocase(&h.name, "Content-Type"))
+      || ((eq_lit_nocase(&h.name, "Authorization") || eq_lit_nocase(&h.name, "Cookie"))
+          && !trusted);
+    if !skip {
+      if h.empty {
+        append(out, &h.name);
+        push_lit(out, ":\r\n");
+      } else {
+        append(out, line);
+        push_lit(out, "\r\n");
+      }
+    }
+  }
 }
 
 /// The bytes of the request line and the headers of a request for `u`, up to and with the
@@ -304,7 +359,8 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
     add_line(&mut out, "Referer: ", &info.referer);
   }
 
-  if info.via_proxy && !has_custom(&info.headers, "Proxy-Connection") {
+  if info.via_proxy && !has_custom(&info.headers, "Proxy-Connection")
+     && !has_custom(&info.proxy_headers, "Proxy-Connection") {
     push_lit(&mut out, "Proxy-Connection: Keep-Alive\r\n");
   }
 
@@ -337,23 +393,11 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
     }
   }
 
-  for line in info.headers.iter() {
-    let h = split_header(line);
-    let skip = h.ignored || h.remove || eq_lit_nocase(&h.name, "Host")
-      || eq_lit_nocase(&h.name, "Connection")
-      || (info.probe && eq_lit_nocase(&h.name, "Content-Length"))
-      || (info.form_boundary.len() > 0 && eq_lit_nocase(&h.name, "Content-Type"))
-      || ((eq_lit_nocase(&h.name, "Authorization") || eq_lit_nocase(&h.name, "Cookie"))
-          && !trusted);
-    if !skip {
-      if h.empty {
-        append(&mut out, &h.name);
-        push_lit(&mut out, ":\r\n");
-      } else {
-        append(&mut out, line);
-        push_lit(&mut out, "\r\n");
-      }
-    }
+  add_custom_headers(&mut out, &info.headers, info, trusted);
+  // As libcurl's `Curl_add_custom_headers`: a request through the proxy has those of
+  // `--proxy-header` too.
+  if info.via_proxy {
+    add_custom_headers(&mut out, &info.proxy_headers, info, trusted);
   }
 
   if info.kind == REQ_POST || info.kind == REQ_PUT {
@@ -380,8 +424,7 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
        && !has_custom(&info.headers, "Content-Type") {
       push_lit(&mut out, "Content-Type: application/x-www-form-urlencoded\r\n");
     }
-    if !info.http10 && !info.h2 && !has_custom(&info.headers, "Expect")
-       && (info.body_length > EXPECT_100_THRESHOLD || info.add_chunked_header) {
+    if adds_expect(info) {
       push_lit(&mut out, "Expect: 100-continue\r\n");
     }
   }
@@ -427,22 +470,47 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
 /// The CONNECT request that asks the HTTP proxy `proxy` for a tunnel to `target`. `auth` is
 /// the Proxy-Authorization header that `auth.vx` made for that proxy.
 pub fn build_connect_request(target : &Vec<u8>, proxy : &Url, auth : &AuthHeader,
-has_user_agent : bool, user_agent : &Vec<u8>) -> Vec<u8> {
+has_user_agent : bool, user_agent : &Vec<u8>, http10 : bool, proxy_headers : &Vec<Vec<u8>>)
+-> Vec<u8> {
+  // As libcurl's `http_proxy_create_CONNECT`: each header of its own, unless a
+  // `--proxy-header` gives it, and then the `--proxy-header` headers.
   let mut out = lit("CONNECT ");
   append(&mut out, target);
-  push_lit(&mut out, " HTTP/1.1\r\n");
-  add_line(&mut out, "Host: ", target);
+  if http10 {
+    push_lit(&mut out, " HTTP/1.0\r\n");
+  } else {
+    push_lit(&mut out, " HTTP/1.1\r\n");
+  }
+  if !has_custom(proxy_headers, "Host") {
+    add_line(&mut out, "Host: ", target);
+  }
   if header_fits(auth, proxy) {
     add_line(&mut out, "Proxy-Authorization: ", &auth.value);
   }
-  if has_user_agent {
-    if user_agent.len() > 0 {
-      add_line(&mut out, "User-Agent: ", user_agent);
+  if !has_custom(proxy_headers, "User-Agent") {
+    if has_user_agent {
+      if user_agent.len() > 0 {
+        add_line(&mut out, "User-Agent: ", user_agent);
+      }
+    } else {
+      add_line(&mut out, "User-Agent: curl/", &securl_version());
     }
-  } else {
-    add_line(&mut out, "User-Agent: curl/", &securl_version());
   }
-  push_lit(&mut out, "Proxy-Connection: Keep-Alive\r\n\r\n");
+  if !has_custom(proxy_headers, "Proxy-Connection") {
+    push_lit(&mut out, "Proxy-Connection: Keep-Alive\r\n");
+  }
+  // libcurl's `Curl_dynhds_add_slist`: `name:` sends nothing, `name;` an empty header, and the
+  // name and the value lose their blanks.
+  for line in proxy_headers.iter() {
+    let h = split_header(line);
+    if !h.ignored && !h.remove && h.name.len() > 0 {
+      append(&mut out, &h.name);
+      push_lit(&mut out, ": ");
+      append(&mut out, &h.value);
+      push_lit(&mut out, "\r\n");
+    }
+  }
+  push_lit(&mut out, "\r\n");
   return out;
 }
 
@@ -483,6 +551,9 @@ struct ResponseHead {
   tr_encoding : bool,
   transfer_codings : Vec<u8>,
   transfer_count : i32,
+  // An HTTP/0.9 response of `--http0.9`: no status line and no headers. All its bytes, which
+  // wait in the connection, are the body, up to the end of the connection.
+  http09 : bool,
 }
 
 /// An empty response head, before the status line is read.
@@ -506,7 +577,8 @@ pub fn empty_head() -> ResponseHead {
     error : Vec<u8>::new(),
     tr_encoding : false,
     transfer_codings : Vec<u8>::new(),
-    transfer_count : 0
+    transfer_count : 0,
+    http09 : false
   };
 }
 

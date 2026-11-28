@@ -17,7 +17,8 @@ securl takes these options of curl, with curl's syntax, messages and exit codes:
 `-J` `-M` `-h` `-V` `-q` `--trace-ascii` `--trace-time` `-z` `--etag-save` `--etag-compare` `-n`
 `--netrc-optional` `--netrc-file` `--variable` and `--expand-` before any option with a value, `--follow` `--post301` `--post302`
 `--post303` `--request-target` `--url-query` `--fail-early` `--disallow-username-in-url`
-`--oauth2-bearer`.
+`--oauth2-bearer` `--proxy-header` `--proxy1.0` `--http0.9` `--expect100-timeout`
+`--ignore-content-length` `--proto-default`.
 
 ## Notes
 

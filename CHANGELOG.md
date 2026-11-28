@@ -9,6 +9,8 @@
 - **Variables:** `--variable` and `--expand-OPTION`, with curl's functions.
 - **Requests:** `--follow`, `--post301`, `--post302`, `--post303`, `--request-target`,
   `--url-query`, `--fail-early`, `--disallow-username-in-url` and `--oauth2-bearer`.
+- **Protocol:** `--proxy-header`, `--proxy1.0`, `--http0.9`, `--ignore-content-length`,
+  `--proto-default`, and the wait for `100 Continue` with `--expect100-timeout`.
 
 ## 0.1.0 (2026-11-27)
 

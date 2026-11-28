@@ -69,7 +69,7 @@ fn is_scheme_byte(b : u8, first : bool) -> bool {
 }
 
 /// The length of the scheme at the start of `text` when `://` follows it, else 0.
-fn scheme_length(text : &Vec<u8>) -> i32 {
+pub fn scheme_length(text : &Vec<u8>) -> i32 {
   let sep = find_seq(text, &lit("://"), 0);
   if sep <= 0 {
     return 0;

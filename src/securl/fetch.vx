@@ -550,10 +550,27 @@ const MAX_HEADER_COUNT : i32 = 5000;
 /// As in libcurl, a line that starts with a blank continues the header line before it, and
 /// each whole header line is checked before it counts: `head.raw` holds the lines before a bad
 /// one, which curl writes with `-i` before it stops.
-fn read_head(c : &mut Conn, raw : bool, tr_encoding : bool, total : &mut i64, bad_status : Failure)
--> Result<ResponseHead, Failure> {
+fn read_head(c : &mut Conn, raw : bool, tr_encoding : bool, total : &mut i64, bad_status : Failure,
+allow09 : bool) -> Result<ResponseHead, Failure> {
   let mut head = empty_head();
   head.tr_encoding = tr_encoding;
+  // As libcurl's `checkprotoprefix`, the first bytes tell an HTTP response from HTTP/0.9, before
+  // a whole line comes.
+  let first = c.peek()?;
+  let prefix = lit("HTTP/");
+  let mut n = first.len();
+  if n > 5 {
+    n = 5;
+  }
+  if n > 0 && !eq_nocase(&range_of(&first, 0, n), &range_of(&prefix, 0, n)) {
+    if !allow09 {
+      return Result<ResponseHead, Failure>::Err(bad_status);
+    }
+    head.http09 = true;
+    head.version = 0;
+    head.close = true;
+    return Result<ResponseHead, Failure>::Ok(head);
+  }
   let mut line = Vec<u8>::new();
   let n = c.read_line(&mut line, MAX_HEADER_LINE, TOO_LARGE,
     "A value or data field grew larger than allowed")?;
@@ -771,8 +788,10 @@ trailers : &mut Vec<u8>, raw : bool) -> Result<i32, Failure> {
 
 /// What one request and its response decided.
 struct Hop {
-  // The same request must go again, for authentication.
+  // The same request must go again, for authentication, or without `Expect: 100-continue`
+  // after a 417 (`expect_failed`).
   retry : bool,
+  expect_failed : bool,
   // The response is a redirect that `-L` follows.
   follow : bool,
   status : i32,
@@ -782,7 +801,7 @@ struct Hop {
 /// Send one request for `u` and read its response. The body of the response goes to
 /// `sinks`, unless curl follows the redirect that the response gives.
 fn one_hop(network : &Network, tls : &TlsSettings, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
-req_kind : i32, ignore_custom : bool, body : &Vec<u8>, creds : &Credential, scope : &Scope, same_host : bool,
+req_kind : i32, ignore_custom : bool, no_expect : bool, body : &Vec<u8>, creds : &Credential, scope : &Scope, same_host : bool,
 has_referer : bool,
 referer : &Vec<u8>, deadline : Instant, form_boundary : &Vec<u8>, auth : &mut AuthContext,
 session : &mut Session, console : &mut Console, sinks : &mut Sinks, info : &mut TransferInfo,
@@ -891,7 +910,10 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
     timecond : cfg.timecond,
     timevalue : cfg.condtime,
     has_target : cfg.has_request_target,
-    target : clone_bytes(&cfg.request_target)
+    target : clone_bytes(&cfg.request_target),
+    proxy_headers : clone_lines(&cfg.proxy_headers),
+    no_expect : no_expect,
+    held_body : false
   };
 
   // `--unix-socket` needs no address: `--connect-to` and `--resolve` do not apply to it.
@@ -940,7 +962,7 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
     }
     let _w = write_head(console, sinks, cfg.include, &head.raw, false)?;
     head = next_head(&mut c, &mut h2, use_h2, cfg.raw, cfg.tr_encoding,
-      &mut info.size_header_total, true)?;
+      &mut info.size_header_total, true, cfg.http09)?;
     set_cookies = take_cookies(&mut session.jar, &head, &cookie_host, &cookie_path,
       secure_context, set_cookies);
     take_hsts(console, cfg, &mut session.hsts, &head, u, secure);
@@ -951,6 +973,10 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
       let _w = sinks.body.write(console, &head.raw)?;
     }
     return Result<Hop, Failure>::Err(fail_with(head.error_code, clone_bytes(&head.error)));
+  }
+  // An HTTP/0.9 response to a HEAD is all body, which a HEAD does not take.
+  if head.http09 && req_kind == REQ_HEAD {
+    return Result<Hop, Failure>::Err(fail_lit(WEIRD_SERVER_REPLY, "Weird server reply"));
   }
   if head.length_overflow && cfg.max_filesize > 0i64 && !has_no_body(head.status, req_kind) {
     return Result<Hop, Failure>::Err(fail_lit(FILESIZE_EXCEEDED, "Maximum file size exceeded"));
@@ -968,6 +994,10 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
   }
   info.content_type = clone_bytes(&head.content_type);
   info.size_header = info.size_header + (head.raw.len() as i64);
+  // `--ignore-content-length`: the body goes to the end of the connection.
+  if cfg.ignore_content_length {
+    head.content_length = -1i64;
+  }
   if head.content_length >= 0i64 && !head.has_transfer_encoding {
     info.expected_size = head.content_length;
   }
@@ -992,7 +1022,26 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
       }
     }
   }
-  let retry = auth_act(head.status, allowed, proxy_allowed, auth, probe, sends_body);
+  let mut retry = auth_act(head.status, allowed, proxy_allowed, auth, probe, sends_body);
+  // A response that came before the body, as libcurl's `http_handle_send_error`: after a 417 the
+  // request goes again without `Expect: 100-continue`; after another one, the body that did
+  // not go leaves the connection unusable.
+  let mut expect_failed = false;
+  let mut stopped_sending = false;
+  if req_info.held_body {
+    if head.status == 417 && !no_expect {
+      expect_failed = true;
+      retry = true;
+      if cfg.verbose {
+        verbose_info(console, &lit("Got HTTP failure 417 while waiting for a 100"));
+      }
+    } else {
+      stopped_sending = true;
+      if cfg.verbose && head.status >= 300 {
+        verbose_info(console, &lit("HTTP error before end of send, stop sending"));
+      }
+    }
+  }
 
   let redirect = head.has_location && (head.status == 301 || head.status == 302
     || head.status == 303 || head.status == 307 || head.status == 308);
@@ -1124,7 +1173,8 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
   // connection yet.
   let ended = has_no_body(head.status, req_kind) || !skip_body;
   // libcurl closes the connection of a response that `-z` stopped.
-  let keep = !use_h2 && ended && !unmet && !closes_after(&head, via_proxy) && c.is_idle();
+  let keep = !use_h2 && ended && !unmet && !stopped_sending && !closes_after(&head, via_proxy)
+    && c.is_idle();
   if cfg.verbose {
     if keep || use_h2 {
       let mut m = lit("Connection #");
@@ -1144,6 +1194,7 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
   }
   return Result<Hop, Failure>::Ok(Hop {
     retry : retry,
+    expect_failed : expect_failed,
     follow : follow,
     status : head.status,
     location : clone_bytes(&head.location)
@@ -1583,6 +1634,7 @@ console : &mut Console) -> Result<ResponseHead, Failure> {
     req_info.add_chunked_header = false;
   }
   let request = build_request(u, req_info);
+  let mut early = Option<ResponseHead>::None();
   if cfg.verbose {
     let shown = shown_request(&request, *use_h2);
     verbose_lines(console, "> ", &shown);
@@ -1601,7 +1653,24 @@ console : &mut Console) -> Result<ResponseHead, Failure> {
     let _sent = c.send(&request)?;
     // libcurl's pretransfer time: the request went, and its body goes next.
     info.time_pretransfer = info.time_pretransfer + request_us(info);
-    if sends_body_now {
+    // `Expect: 100-continue`: the body waits for a `100 Continue`, at most the time of
+    // `--expect100-timeout`. A response that comes first and is not a 1xx means that the
+    // body does not go.
+    let mut send_body = sends_body_now;
+    if sends_body_now && expects_continue(req_info) {
+      if c.wait_readable(cfg.expect100_ms)? {
+        let head = next_head(c, h2, false, cfg.raw, cfg.tr_encoding,
+          &mut info.size_header_total, false, cfg.http09)?;
+        if head.status < 100 || head.status >= 200 {
+          send_body = false;
+          req_info.held_body = true;
+        }
+        early = Option<ResponseHead>::Some(head);
+      } else if cfg.verbose {
+        verbose_info(console, &lit("Done waiting for 100-continue"));
+      }
+    }
+    if send_body {
       if chunked_upload {
         let chunks = chunk_encode(body);
         let _sent_body = c.send(&chunks)?;
@@ -1614,8 +1683,13 @@ console : &mut Console) -> Result<ResponseHead, Failure> {
   }
   info.size_request = info.size_request + info.size_upload;
   info.time_posttransfer = info.time_posttransfer + request_us(info);
-  let head = next_head(c, h2, *use_h2, cfg.raw, cfg.tr_encoding, &mut info.size_header_total,
-    false)?;
+  let head = match early {
+    Option<ResponseHead>::Some(h) => { h },
+    Option<ResponseHead>::None() => {
+      next_head(c, h2, *use_h2, cfg.raw, cfg.tr_encoding, &mut info.size_header_total, false,
+        cfg.http09)?
+    }
+  };
   // The first byte of the response came. A 1xx counts, and the heads after it do not.
   if !info.starttransfer_added {
     info.starttransfer_added = true;
@@ -1899,14 +1973,15 @@ console : &mut Console, sinks : &mut Sinks) -> Result<i32, Failure> {
     Option<Target>::None() => {}
   }
   let request = build_connect_request(&target, &proxy.url,
-    &connect_auth(&proxy.credential, &proxy.url), cfg.has_user_agent, &cfg.user_agent);
+    &connect_auth(&proxy.credential, &proxy.url), cfg.has_user_agent, &cfg.user_agent,
+    cfg.proxy10 && proxy.kind == PROXY_HTTP, &cfg.proxy_headers);
   if cfg.verbose {
     verbose_lines(console, "> ", &request);
   }
   let _sent = c.send(&request)?;
   // A reply that is no HTTP/1 status line is curl's "Invalid response header" (test 750).
   let head = read_head(c, false, false, &mut info.size_header_total,
-    fail_lit(WEIRD_SERVER_REPLY, "Invalid response header"))?;
+    fail_lit(WEIRD_SERVER_REPLY, "Invalid response header"), false)?;
   if cfg.verbose {
     verbose_lines(console, "< ", &head.raw);
   }
@@ -2012,6 +2087,8 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<i32, Failure> {
   let mut req_kind = kind;
   // `--follow` dropped the method of `-X` at a redirect.
   let mut ignore_custom = false;
+  // A 417 said no to `Expect: 100-continue`.
+  let mut no_expect = false;
   let mut has_referer = cfg.has_referer;
   let mut referer = clone_bytes(&cfg.referer);
   let mut redirects = 0;
@@ -2036,10 +2113,15 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<i32, Failure> {
     if netrc_note.len() > 0 && cfg.verbose {
       verbose_info(console, &netrc_note);
     }
-    let hop = one_hop(network, tls, cfg, headers, &u, req_kind, ignore_custom, body, &creds,
+    let hop = one_hop(network, tls, cfg, headers, &u, req_kind, ignore_custom, no_expect, body,
+      &creds,
       &scope, same_host,
       has_referer, &referer, deadline, form_boundary, &mut auth, session, console, sinks,
       info, opener)?;
+    if hop.expect_failed && !no_expect {
+      no_expect = true;
+      continue;
+    }
     if hop.retry && auth_rounds < MAX_AUTH_ROUNDS {
       auth_rounds = auth_rounds + 1;
       continue;
@@ -2103,7 +2185,7 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<i32, Failure> {
 /// The next response head, over HTTP/2 or HTTP/1. `informational` says that a 1xx response
 /// came before it.
 fn next_head(c : &mut Conn, h2 : &mut H2, use_h2 : bool, raw : bool, tr_encoding : bool,
-total : &mut i64, informational : bool)
+total : &mut i64, informational : bool, http09 : bool)
 -> Result<ResponseHead, Failure> {
   if use_h2 {
     return h2_read_head(h2, c);
@@ -2115,7 +2197,9 @@ total : &mut i64, informational : bool)
   if informational || c.reused {
     bad_status = fail_lit(WEIRD_SERVER_REPLY, "Invalid status line");
   }
-  let head = read_head(c, raw, tr_encoding, total, bad_status)?;
+  // `--http0.9` allows a response with no status line where one could be.
+  let allow09 = http09 && !informational && !c.reused;
+  let head = read_head(c, raw, tr_encoding, total, bad_status, allow09)?;
   c.version_seen = head.version;
   return Result<ResponseHead, Failure>::Ok(head);
 }

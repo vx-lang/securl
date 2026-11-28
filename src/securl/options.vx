@@ -254,6 +254,19 @@ struct Config {
   // `--oauth2-bearer`: the token that goes as `Authorization: Bearer`.
   has_bearer : bool,
   bearer : Vec<u8>,
+  // `--proxy-header`: the headers for the proxy, in a CONNECT and in a request through it.
+  proxy_headers : Vec<Vec<u8>>,
+  // `--proxy1.0`: the CONNECT of the HTTP proxy goes as HTTP/1.0.
+  proxy10 : bool,
+  // `--http0.9`: a response with no status line is an HTTP/0.9 body.
+  http09 : bool,
+  // `--expect100-timeout`: how long a request with `Expect: 100-continue` waits, in ms.
+  expect100_ms : i64,
+  // `--ignore-content-length`: the body goes to the end of the connection.
+  ignore_content_length : bool,
+  // `--proto-default`: the scheme of a URL that has none, instead of the one curl guesses.
+  has_proto_default : bool,
+  proto_default : Vec<u8>,
 }
 
 /// The conditions of `-z`: none, `If-Modified-Since` (the default), `If-Unmodified-Since` (a
@@ -394,7 +407,14 @@ pub fn default_config() -> Config {
     fail_early : false,
     disallow_username : false,
     has_bearer : false,
-    bearer : Vec<u8>::new()
+    bearer : Vec<u8>::new(),
+    proxy_headers : Vec<Vec<u8>>::new(),
+    proxy10 : false,
+    http09 : false,
+    expect100_ms : 1000i64,
+    ignore_content_length : false,
+    has_proto_default : false,
+    proto_default : Vec<u8>::new()
   };
 }
 
@@ -522,6 +542,12 @@ const OPT_URL_QUERY : i32 = 118;
 const OPT_FAIL_EARLY : i32 = 119;
 const OPT_DISALLOW_USERNAME : i32 = 120;
 const OPT_OAUTH2_BEARER : i32 = 121;
+const OPT_PROXY_HEADER : i32 = 122;
+const OPT_PROXY10 : i32 = 123;
+const OPT_HTTP09 : i32 = 124;
+const OPT_EXPECT100_TIMEOUT : i32 = 125;
+const OPT_IGNORE_CONTENT_LENGTH : i32 = 126;
+const OPT_PROTO_DEFAULT : i32 = 127;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -650,6 +676,12 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "fail-early") { return OPT_FAIL_EARLY; }
   if eq_lit(name, "disallow-username-in-url") { return OPT_DISALLOW_USERNAME; }
   if eq_lit(name, "oauth2-bearer") { return OPT_OAUTH2_BEARER; }
+  if eq_lit(name, "proxy-header") { return OPT_PROXY_HEADER; }
+  if eq_lit(name, "proxy1.0") { return OPT_PROXY10; }
+  if eq_lit(name, "http0.9") { return OPT_HTTP09; }
+  if eq_lit(name, "expect100-timeout") { return OPT_EXPECT100_TIMEOUT; }
+  if eq_lit(name, "ignore-content-length") { return OPT_IGNORE_CONTENT_LENGTH; }
+  if eq_lit(name, "proto-default") { return OPT_PROTO_DEFAULT; }
   return OPT_UNKNOWN;
 }
 
@@ -712,7 +744,9 @@ fn takes_value(id : i32) -> bool {
     || (id >= OPT_RETRY && id <= OPT_RETRY_MAX_TIME) || id == OPT_CONTINUE_AT
     || id == OPT_UNIX_SOCKET || id == OPT_STDERR || id == OPT_TIME_COND || id == OPT_ETAG_SAVE
     || id == OPT_ETAG_COMPARE || id == OPT_NETRC_FILE || id == OPT_VARIABLE
-    || id == OPT_REQUEST_TARGET || id == OPT_URL_QUERY || id == OPT_OAUTH2_BEARER;
+    || id == OPT_REQUEST_TARGET || id == OPT_URL_QUERY || id == OPT_OAUTH2_BEARER
+    || id == OPT_PROXY_HEADER || id == OPT_PROXY10 || id == OPT_EXPECT100_TIMEOUT
+    || id == OPT_PROTO_DEFAULT;
 }
 
 /// Whether the value of the option names a file, as curl's `ARG_FILE` options.
@@ -1076,6 +1110,47 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     cfg.headers.push(clone_bytes(value));
     return done();
   }
+  if id == OPT_PROTO_DEFAULT {
+    // As curl's `check_protocol`: a protocol that securl has.
+    if value.len() == 0 {
+      return Result<i32, Failure>::Err(option_error(shown,
+        "blank argument where content is expected"));
+    }
+    if !eq_lit_nocase(value, "http") && !eq_lit_nocase(value, "https") {
+      let mut m = lit("option ");
+      append(&mut m, shown);
+      push_lit(&mut m, ": a specified protocol is unsupported by libcurl");
+      return Result<i32, Failure>::Err(fail_with(UNSUPPORTED_PROTOCOL, m));
+    }
+    cfg.has_proto_default = true;
+    cfg.proto_default = to_lower(value);
+    return done();
+  }
+  if id == OPT_HTTP09 {
+    cfg.http09 = enable;
+    return done();
+  }
+  if id == OPT_IGNORE_CONTENT_LENGTH {
+    cfg.ignore_content_length = enable;
+    return done();
+  }
+  if id == OPT_EXPECT100_TIMEOUT {
+    // Seconds, as `-m` takes them.
+    match seconds_to_ms(value) {
+      Option<i64>::Some(ms) => {
+        cfg.expect100_ms = ms;
+        return done();
+      },
+      Option<i64>::None() => {
+        return Result<i32, Failure>::Err(option_error(shown,
+          "expected a proper numerical parameter"));
+      }
+    }
+  }
+  if id == OPT_PROXY_HEADER {
+    cfg.proxy_headers.push(clone_bytes(value));
+    return done();
+  }
   if id == OPT_FORM || id == OPT_FORM_STRING {
     cfg.forms.push(FormArg {
       literal : id == OPT_FORM_STRING,
@@ -1235,9 +1310,15 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     }
     return done();
   }
-  if id == OPT_PROXY {
+  if id == OPT_PROXY || id == OPT_PROXY10 {
+    // `--proxy1.0` is `-x` with an HTTP/1.0 CONNECT, and may not be empty.
+    if id == OPT_PROXY10 && value.len() == 0 {
+      return Result<i32, Failure>::Err(option_error(shown,
+        "blank argument where content is expected"));
+    }
     cfg.proxy_set = true;
     cfg.proxy_kind = PROXY_HTTP;
+    cfg.proxy10 = id == OPT_PROXY10;
     cfg.has_proxy = value.len() > 0;
     cfg.proxy = clone_bytes(value);
     return done();

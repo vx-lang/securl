@@ -309,6 +309,32 @@ impl Conn {
     return alive;
   }
 
+  /// Wait at most `ms` milliseconds for bytes from the peer, or for its end. True when some
+  /// came or the connection ended; false when the time passed first.
+  pub fn wait_readable(self : &mut Conn, ms : i64) -> Result<bool, Failure> {
+    if self.start < self.end || self.closed {
+      return Result<bool, Failure>::Ok(true);
+    }
+    let mut wait = ms;
+    if wait < 1i64 {
+      wait = 1i64;
+    }
+    self.stream.set_deadline(deadline_after(Duration::from_millis(wait as u64)));
+    let result = self.fill();
+    self.stream.set_deadline(self.deadline);
+    match result {
+      Result<bool, Failure>::Ok(_more) => {
+        return Result<bool, Failure>::Ok(true);
+      },
+      Result<bool, Failure>::Err(f) => {
+        if f.code == OPERATION_TIMEDOUT {
+          return Result<bool, Failure>::Ok(false);
+        }
+        return Result<bool, Failure>::Err(f);
+      }
+    }
+  }
+
   /// Make a connection from the pool ready for the next transfer: no `--limit-rate` until
   /// `limit_rate` sets one, and a read buffer of the full size.
   pub fn renew(self : &mut Conn) -> void {
@@ -459,6 +485,18 @@ impl Conn {
         return Result<i32, Failure>::Ok(count);
       }
     }
+  }
+
+  /// The bytes that wait in the buffer, after a read when none do, without taking them. Empty
+  /// when the peer closed the connection.
+  pub fn peek(self : &mut Conn) -> Result<Vec<u8>, Failure> {
+    if self.start == self.end {
+      let more = self.fill()?;
+      if !more {
+        return Result<Vec<u8>, Failure>::Ok(Vec<u8>::new());
+      }
+    }
+    return Result<Vec<u8>, Failure>::Ok(range_of(&self.buffer, self.start, self.end));
   }
 
   /// Give up to `max` bytes, the buffered ones first. An empty result means that the peer

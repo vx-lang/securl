@@ -1548,6 +1548,12 @@ up_glob : &Glob) -> UrlStep {
     }
   };
   let mut url_text = clone_bytes(url);
+  // `--proto-default`: the scheme of a URL that has none.
+  if cfg.has_proto_default && scheme_length(url) == 0 {
+    url_text = clone_bytes(&cfg.proto_default);
+    push_lit(&mut url_text, "://");
+    append(&mut url_text, url);
+  }
   let mut this_kind = other_kind;
   let mut upload_body = Vec<u8>::new();
   let from_stdin = uploads && is_stdin_upload(upload_name);

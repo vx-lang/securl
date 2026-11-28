@@ -31,7 +31,7 @@ max-filesize next config retry retry-delay retry-max-time retry-connrefused
 retry-all-errors continue-at manual remote-header-name stderr unix-socket time-cond etag-save
 etag-compare netrc netrc-optional netrc-file variable
 post301 post302 post303 follow request-target url-query fail-early disallow-username-in-url
-oauth2-bearer
+oauth2-bearer proxy-header proxy1.0 http0.9 expect100-timeout ignore-content-length proto-default
 """.split())
 SUPPORTED_SHORT = set("AbcdDeFHjmorTuwXxU0fGiIkLOqsSvVhg#NpE:KCMJzn")
 # The short options that take a value: the rest of the word is that value.
