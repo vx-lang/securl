@@ -21,7 +21,8 @@
 //
 // Vx has no private fields yet (docs/lang/visibility.md in Vx, section 7), so another file
 // could still read `password`. Until then, tools/check-secrets.sh refuses to build securl when a
-// file other than this one, url.vx and options.vx, where the password is parsed, reads it.
+// file other than this one, url.vx, options.vx and netrc.vx, where the password is parsed,
+// reads it.
 import core::option;
 import core::result;
 import std::vec;
@@ -30,6 +31,7 @@ import sys::text;
 import securl::bytes;
 import securl::encode;
 import securl::failure;
+import securl::netrc;
 import securl::url;
 
 /// The scheme, the host and the port of a URL, in lower case.
@@ -154,17 +156,71 @@ fn login_of(scope : Scope, login : &Vec<u8>) -> Credential {
 /// transfer, and go where its scope allows. Else those that `u` itself holds go, and only to
 /// the origin of `u`: they do not follow a redirect to another URL, even with
 /// `--location-trusted` (curl's test 998).
-pub fn server_credential(scope : &Scope, has_login : bool, login : &Vec<u8>, u : &Url)
--> Credential {
+///
+/// With a `.netrc` (`netrc`), when `-u` does not apply, the entry of the file for the host of
+/// `u` completes the credentials of `u`, or with `--netrc` gives its password instead of the
+/// password of `u` (libcurl's `url_set_data_creds_netrc`). The file gives them for that host,
+/// so they go only to the origin of `u` too. `note` gets libcurl's `-v` line when the file has
+/// nothing for the host.
+pub fn server_credential(scope : &Scope, has_login : bool, login : &Vec<u8>, u : &Url,
+netrc : &Netrc, note : &mut Vec<u8>) -> Result<Credential, Failure> {
   if has_login && allows(scope, u) {
-    return login_of(clone_scope(scope), login);
+    return Result<Credential, Failure>::Ok(login_of(clone_scope(scope), login));
   }
-  return Credential {
+  let from_url = Credential {
     present : u.has_user,
     scope : transfer_scope(u, false),
     user : clone_bytes(&u.user),
     password : clone_bytes(&u.password)
   };
+  if netrc.mode == NETRC_IGNORED {
+    return Result<Credential, Failure>::Ok(from_url);
+  }
+  // `--netrc-optional` keeps a URL that has both a user and a password.
+  if netrc.mode == NETRC_OPTIONAL && u.has_user && u.user.len() > 0 && u.password.len() > 0 {
+    return Result<Credential, Failure>::Ok(from_url);
+  }
+  let mut want = Vec<u8>::new();
+  if u.has_user {
+    want = clone_bytes(&u.user);
+  }
+  let mut code = netrc.status;
+  if code == NETRC_OK {
+    match netrc_find(&netrc.text, &u.host, &want) {
+      Result<NetrcMatch, i32>::Ok(m) => {
+        // HTTP takes control bytes in credentials (libcurl's PROTOPT_USERPWDCTRL): Basic and
+        // Digest encode them.
+        let mut user = clone_bytes(&from_url.user);
+        if m.has_user {
+          user = clone_bytes(&m.user);
+        }
+        let mut password = clone_bytes(&from_url.password);
+        if m.has_password {
+          password = clone_bytes(&m.password);
+        }
+        return Result<Credential, Failure>::Ok(Credential {
+          present : true,
+          scope : transfer_scope(u, false),
+          user : user,
+          password : password
+        });
+      },
+      Result<NetrcMatch, i32>::Err(c) => {
+        code = c;
+      }
+    }
+  }
+  if code == NETRC_NO_MATCH || netrc.mode == NETRC_OPTIONAL {
+    let mut m = lit("Could not find host ");
+    append(&mut m, &u.host);
+    push_lit(&mut m, " in the ");
+    append(&mut m, &netrc.name);
+    push_lit(&mut m, " file; using defaults");
+    *note = m;
+    return Result<Credential, Failure>::Ok(from_url);
+  }
+  return Result<Credential, Failure>::Err(fail_with(READ_ERROR,
+    lit_then(".netrc error: ", &netrc_error_text(code))));
 }
 
 /// The credentials for the proxy `proxy`: those of `--proxy-user` (`login` when `has_login`),

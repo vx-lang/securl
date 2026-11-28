@@ -3,7 +3,9 @@
 ## Unreleased
 
 - **Conditional requests:** `-z` with a date, `--etag-save` and `--etag-compare`, as in curl. A
-  304 never makes an output file. 624 of 762 curl tests pass.
+  304 never makes an output file.
+- **`.netrc`:** `-n`, `--netrc-optional` and `--netrc-file`, with the entry for each host bound
+  to that host. libFuzzer on the netrc parser too.
 
 ## 0.1.0 (2026-11-27)
 

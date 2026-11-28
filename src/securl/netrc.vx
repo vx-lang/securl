@@ -1,0 +1,415 @@
+// The `.netrc` file as libcurl reads it (`lib/netrc.c`): `machine`, `default`, `login`,
+// `password`, `account` and `macdef`, with quoted words and their escapes. The tool reads the
+// file; this file finds the entry for a host in its text. `auth.vx` makes the credentials of
+// an entry, bound to the host of the request.
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import securl::bytes;
+
+// How a group uses the file: not at all, `--netrc-optional`, or `--netrc` and `--netrc-file`.
+const NETRC_IGNORED : i32 = 0;
+const NETRC_OPTIONAL : i32 = 1;
+const NETRC_REQUIRED : i32 = 2;
+
+// libcurl's `NETRCcode`.
+const NETRC_OK : i32 = 0;
+const NETRC_FILE_MISSING : i32 = 1;
+const NETRC_NO_MATCH : i32 = 2;
+const NETRC_SYNTAX_ERROR : i32 = 3;
+
+// libcurl's limits, which its buffers hold with a NUL after the bytes: a line, the file and a
+// word.
+const NETRC_MAX_LINE : i32 = 16384;
+const NETRC_MAX_FILE : i32 = 131072;
+const NETRC_MAX_TOKEN : i32 = 4096;
+
+const NETRC_TOK_EOF : i32 = 0;
+const NETRC_TOK_LITERAL : i32 = 1;
+const NETRC_TOK_MACHINE : i32 = 2;
+const NETRC_TOK_DEFAULT : i32 = 3;
+const NETRC_TOK_ACCOUNT : i32 = 4;
+const NETRC_TOK_LOGIN : i32 = 5;
+const NETRC_TOK_PASSWD : i32 = 6;
+const NETRC_TOK_MACDEF : i32 = 7;
+const NETRC_TOK_JUNK : i32 = 8;
+
+/// The `.netrc` of a group of the command line: how the group uses it (a `NETRC_` mode), and
+/// its text, which the tool reads with `netrc_text`.
+struct Netrc {
+  mode : i32,
+  // NETRC_OK when the file loaded, or else why it did not.
+  status : i32,
+  text : Vec<u8>,
+  // The name in libcurl's messages: the file of `--netrc-file`, or `.netrc`.
+  name : Vec<u8>,
+}
+
+/// No `.netrc`.
+pub fn no_netrc() -> Netrc {
+  return Netrc {
+    mode : NETRC_IGNORED,
+    status : NETRC_FILE_MISSING,
+    text : Vec<u8>::new(),
+    name : lit(".netrc")
+  };
+}
+
+/// The text of the file `bytes` as libcurl's `file2memory` keeps it: each line with a newline at
+/// its end and without the blanks before it, and no line whose first byte after them is `#`.
+/// A line or a file longer than libcurl takes is NETRC_SYNTAX_ERROR.
+pub fn netrc_text(bytes : &Vec<u8>) -> Result<Vec<u8>, i32> {
+  let mut out = Vec<u8>::new();
+  let mut start = 0;
+  loop {
+    let mut end = find_byte(bytes, 10u8, start);
+    let last = end < 0;
+    if last {
+      end = bytes.len();
+    } else {
+      end = end + 1;
+    }
+    // The newline that libcurl adds to the last line counts too.
+    let mut line_len = end - start;
+    if last {
+      line_len = line_len + 1;
+    }
+    if line_len >= NETRC_MAX_LINE {
+      return Result<Vec<u8>, i32>::Err(NETRC_SYNTAX_ERROR);
+    }
+    let mut i = start;
+    while i < end && is_blank(bytes.get(i)) {
+      i = i + 1;
+    }
+    if i >= end || bytes.get(i) != 35u8 {
+      append_range(&mut out, bytes, i, end);
+      // libcurl's `Curl_get_line` ends the last line with a newline.
+      if last {
+        out.push(10u8);
+      }
+    }
+    if out.len() >= NETRC_MAX_FILE {
+      return Result<Vec<u8>, i32>::Err(NETRC_SYNTAX_ERROR);
+    }
+    if last {
+      break;
+    }
+    start = end;
+  }
+  return Result<Vec<u8>, i32>::Ok(out);
+}
+
+/// The words of a `.netrc` text, as libcurl's `netrc_lexer`.
+struct NetrcLexer {
+  text : Vec<u8>,
+  pos : i32,
+  token : i32,
+  literal : Vec<u8>,
+  // The last token comes again on the next call.
+  pushed : bool,
+}
+
+fn netrc_byte(lx : &NetrcLexer, at : i32) -> u8 {
+  if at >= lx.text.len() {
+    return 0u8;
+  }
+  return lx.text.get(at);
+}
+
+/// Pass the blanks and the line ends.
+fn netrc_skip_blanks(lx : &mut NetrcLexer) -> void {
+  let mut s = lx.pos;
+  loop {
+    while is_blank(netrc_byte(lx, s)) {
+      s = s + 1;
+    }
+    while netrc_byte(lx, s) == 13u8 {
+      s = s + 1;
+    }
+    if netrc_byte(lx, s) == 10u8 {
+      s = s + 1;
+    } else {
+      break;
+    }
+  }
+  lx.pos = s;
+}
+
+/// Pass a `macdef`: everything up to an empty line.
+fn netrc_skip_to_empty_line(lx : &mut NetrcLexer) -> void {
+  let mut s = lx.pos;
+  while netrc_byte(lx, s) != 0u8 {
+    let c = netrc_byte(lx, s);
+    s = s + 1;
+    if c == 10u8 {
+      while netrc_byte(lx, s) == 13u8 {
+        s = s + 1;
+      }
+      if netrc_byte(lx, s) == 10u8 {
+        break;
+      }
+    }
+  }
+  lx.pos = s;
+}
+
+/// A quoted word, from its first quote: `\n`, `\r` and `\t` are the control bytes, and a
+/// backslash takes any other byte as it is. A word with no end quote is a syntax error.
+fn netrc_quoted(lx : &mut NetrcLexer) -> i32 {
+  let mut s = lx.pos + 1;
+  let mut escape = false;
+  while netrc_byte(lx, s) != 0u8 {
+    let mut c = netrc_byte(lx, s);
+    if escape {
+      escape = false;
+      if c == 110u8 {
+        c = 10u8;
+      } else if c == 114u8 {
+        c = 13u8;
+      } else if c == 116u8 {
+        c = 9u8;
+      }
+    } else if c == 92u8 {
+      escape = true;
+      s = s + 1;
+      continue;
+    } else if c == 34u8 {
+      lx.pos = s + 1;
+      return NETRC_OK;
+    }
+    if lx.literal.len() + 1 >= NETRC_MAX_TOKEN {
+      lx.pos = s;
+      return NETRC_SYNTAX_ERROR;
+    }
+    lx.literal.push(c);
+    s = s + 1;
+  }
+  lx.pos = s;
+  return NETRC_SYNTAX_ERROR;
+}
+
+/// The next word: a literal when `want_literal`, or else a keyword, matched in any case.
+fn netrc_next(lx : &mut NetrcLexer, want_literal : bool) -> i32 {
+  if lx.pushed {
+    lx.pushed = false;
+    return NETRC_OK;
+  }
+  lx.literal = Vec<u8>::new();
+  netrc_skip_blanks(lx);
+  let c = netrc_byte(lx, lx.pos);
+  if c == 0u8 {
+    lx.token = NETRC_TOK_EOF;
+    return NETRC_OK;
+  }
+  if c == 34u8 {
+    lx.token = NETRC_TOK_LITERAL;
+    return netrc_quoted(lx);
+  }
+  let start = lx.pos;
+  let mut s = start;
+  loop {
+    let b = netrc_byte(lx, s);
+    if b == 0u8 || is_blank(b) || b == 10u8 || b == 13u8 {
+      break;
+    }
+    s = s + 1;
+  }
+  lx.pos = s;
+  let word = range_of(&lx.text, start, s);
+  if want_literal {
+    lx.token = NETRC_TOK_LITERAL;
+    if word.len() + 1 > NETRC_MAX_TOKEN {
+      return NETRC_SYNTAX_ERROR;
+    }
+    lx.literal = word;
+  } else if eq_lit_nocase(&word, "machine") {
+    lx.token = NETRC_TOK_MACHINE;
+  } else if eq_lit_nocase(&word, "default") {
+    lx.token = NETRC_TOK_DEFAULT;
+  } else if eq_lit_nocase(&word, "account") {
+    lx.token = NETRC_TOK_ACCOUNT;
+  } else if eq_lit_nocase(&word, "login") {
+    lx.token = NETRC_TOK_LOGIN;
+  } else if eq_lit_nocase(&word, "password") {
+    lx.token = NETRC_TOK_PASSWD;
+  } else if eq_lit_nocase(&word, "macdef") {
+    lx.token = NETRC_TOK_MACDEF;
+  } else {
+    lx.token = NETRC_TOK_JUNK;
+  }
+  return NETRC_OK;
+}
+
+/// What an entry of the file gave for a request: its login, unless the request names its own
+/// user, and its password. Either may be missing.
+struct NetrcMatch {
+  has_user : bool,
+  user : Vec<u8>,
+  has_password : bool,
+  password : Vec<u8>,
+}
+
+/// The state of libcurl's `netrc_scanner` in an entry.
+struct NetrcEntry {
+  matches_host : bool,
+  has_login : bool,
+  login : Vec<u8>,
+  has_password : bool,
+  password : Vec<u8>,
+}
+
+fn netrc_new_entry() -> NetrcEntry {
+  return NetrcEntry {
+    matches_host : false,
+    has_login : false,
+    login : Vec<u8>::new(),
+    has_password : false,
+    password : Vec<u8>::new()
+  };
+}
+
+/// The value of `login`, `password` or `account`: the next word, kept when the entry is for the
+/// host. At the end of the file, nothing.
+fn netrc_value(lx : &mut NetrcLexer, e : &NetrcEntry, has : &mut bool, value : &mut Vec<u8>)
+-> i32 {
+  let rc = netrc_next(lx, true);
+  if rc != NETRC_OK {
+    return rc;
+  }
+  if lx.token == NETRC_TOK_LITERAL {
+    if e.matches_host {
+      *has = true;
+      *value = clone_bytes(&lx.literal);
+    }
+  } else {
+    lx.pushed = true;
+  }
+  return NETRC_OK;
+}
+
+/// Whether the entry that ends gives the credentials, as libcurl's `netrc_scan_end_entry`: for
+/// the host, with the login of `user` and a password when the request names a user, with any
+/// login when it does not, or with a password and no login, for any user.
+fn netrc_end_entry(e : &NetrcEntry, user : &Vec<u8>, found : &mut NetrcMatch) -> bool {
+  if !e.matches_host {
+    return false;
+  }
+  let mut ok = false;
+  if e.has_login {
+    if user.len() > 0 {
+      if !same_bytes(user, &e.login) {
+        return false;
+      }
+      ok = e.has_password;
+    } else {
+      ok = true;
+    }
+  } else if e.has_password {
+    ok = true;
+  }
+  if !ok {
+    return false;
+  }
+  if user.len() > 0 {
+    found.has_user = true;
+    found.user = clone_bytes(user);
+  } else if e.has_login {
+    found.has_user = true;
+    found.user = clone_bytes(&e.login);
+  }
+  found.has_password = e.has_password;
+  found.password = clone_bytes(&e.password);
+  return true;
+}
+
+/// The entry of the text `text` (from `netrc_text`) for the host `host`, and for the login
+/// `user` when it is not empty, as libcurl's `netrc_scan`. NETRC_NO_MATCH when there is none,
+/// and NETRC_SYNTAX_ERROR for a word that does not end.
+pub fn netrc_find(text : &Vec<u8>, host : &Vec<u8>, user : &Vec<u8>) -> Result<NetrcMatch, i32> {
+  let mut found = NetrcMatch {
+    has_user : false,
+    user : Vec<u8>::new(),
+    has_password : false,
+    password : Vec<u8>::new()
+  };
+  if text.len() == 0 {
+    return Result<NetrcMatch, i32>::Err(NETRC_NO_MATCH);
+  }
+  let mut lx = NetrcLexer {
+    text : clone_bytes(text),
+    pos : 0,
+    token : NETRC_TOK_EOF,
+    literal : Vec<u8>::new(),
+    pushed : false
+  };
+  let mut e = netrc_new_entry();
+  loop {
+    let rc = netrc_next(&mut lx, false);
+    if rc != NETRC_OK {
+      return Result<NetrcMatch, i32>::Err(rc);
+    }
+    let t = lx.token;
+    // These words end the entry before them.
+    if t == NETRC_TOK_EOF || t == NETRC_TOK_MACHINE || t == NETRC_TOK_DEFAULT
+       || t == NETRC_TOK_MACDEF {
+      if netrc_end_entry(&e, user, &mut found) {
+        return Result<NetrcMatch, i32>::Ok(found);
+      }
+      e = netrc_new_entry();
+    }
+    if t == NETRC_TOK_EOF {
+      return Result<NetrcMatch, i32>::Err(NETRC_NO_MATCH);
+    }
+    let mut rc2 = NETRC_OK;
+    if t == NETRC_TOK_MACHINE {
+      rc2 = netrc_next(&mut lx, true);
+      if rc2 == NETRC_OK {
+        if lx.token == NETRC_TOK_LITERAL {
+          e.matches_host = eq_nocase(host, &lx.literal);
+        } else {
+          e.matches_host = false;
+          lx.pushed = true;
+        }
+      }
+    } else if t == NETRC_TOK_DEFAULT {
+      e.matches_host = true;
+    } else if t == NETRC_TOK_ACCOUNT {
+      let mut has = false;
+      let mut ignored = Vec<u8>::new();
+      rc2 = netrc_value(&mut lx, &e, &mut has, &mut ignored);
+    } else if t == NETRC_TOK_LOGIN {
+      let mut has = e.has_login;
+      let mut value = clone_bytes(&e.login);
+      rc2 = netrc_value(&mut lx, &e, &mut has, &mut value);
+      e.has_login = has;
+      e.login = value;
+    } else if t == NETRC_TOK_PASSWD {
+      let mut has = e.has_password;
+      let mut value = clone_bytes(&e.password);
+      rc2 = netrc_value(&mut lx, &e, &mut has, &mut value);
+      e.has_password = has;
+      e.password = value;
+    } else if t == NETRC_TOK_MACDEF {
+      netrc_skip_to_empty_line(&mut lx);
+    }
+    if rc2 != NETRC_OK {
+      return Result<NetrcMatch, i32>::Err(rc2);
+    }
+  }
+  return Result<NetrcMatch, i32>::Err(NETRC_NO_MATCH);
+}
+
+/// libcurl's `Curl_netrc_strerror`.
+pub fn netrc_error_text(code : i32) -> Vec<u8> {
+  if code == NETRC_FILE_MISSING {
+    return lit("no such file");
+  }
+  if code == NETRC_NO_MATCH {
+    return lit("no matching entry");
+  }
+  if code == NETRC_SYNTAX_ERROR {
+    return lit("syntax error");
+  }
+  return Vec<u8>::new();
+}

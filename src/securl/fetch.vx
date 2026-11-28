@@ -2022,7 +2022,12 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<i32, Failure> {
     // A custom Host header goes only to the first host, with the same port and scheme.
     let same_host = eq_nocase(&u.host, &first_host) && u.port == first_port
       && eq_nocase(&u.scheme, &first_scheme);
-    let creds = server_credential(&scope, cfg.has_user, &cfg.user, &u);
+    let mut netrc_note = Vec<u8>::new();
+    let creds = server_credential(&scope, cfg.has_user, &cfg.user, &u, &cfg.netrc,
+      &mut netrc_note)?;
+    if netrc_note.len() > 0 && cfg.verbose {
+      verbose_info(console, &netrc_note);
+    }
     let hop = one_hop(network, tls, cfg, headers, &u, req_kind, body, &creds, &scope, same_host,
       has_referer, &referer, deadline, form_boundary, &mut auth, session, console, sinks,
       info, opener)?;

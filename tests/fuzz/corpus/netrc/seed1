@@ -1,0 +1,5 @@
+default login "user one" password "a\"b\nc"
+macdef init
+cd /
+
+machine example.com

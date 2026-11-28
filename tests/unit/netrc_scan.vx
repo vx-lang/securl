@@ -1,0 +1,130 @@
+// Checks securl::netrc against the cases of curl's unit test 1304 (tests/unit/unit1304.c) and
+// the rules of lib/netrc.c: quoted words, `macdef`, comments and libcurl's limits.
+import core::option;
+import core::result;
+import std::string;
+import std::vec;
+import sys::text;
+import securl::bytes;
+import securl::netrc;
+
+fn show(m : &Vec<u8>) -> void {
+  match String::from_utf8(m) {
+    Result<String, Utf8Error>::Ok(text) => {
+      eprintln!("{}", text);
+    },
+    Result<String, Utf8Error>::Err(_e) => {}
+  }
+}
+
+/// What the file `content` gives for `host` and `user`: `user:password`, with `-` for a part
+/// that is missing, or `no match` or `syntax error`.
+fn find_in(content : &Vec<u8>, host : *const i8, user : *const i8) -> Vec<u8> {
+  let text = match netrc_text(content) {
+    Result<Vec<u8>, i32>::Ok(t) => { t },
+    Result<Vec<u8>, i32>::Err(code) => {
+      return netrc_error_text(code);
+    }
+  };
+  match netrc_find(&text, &lit(host), &lit(user)) {
+    Result<NetrcMatch, i32>::Ok(m) => {
+      let mut out = Vec<u8>::new();
+      if m.has_user {
+        append(&mut out, &m.user);
+      } else {
+        push_lit(&mut out, "-");
+      }
+      push_lit(&mut out, ":");
+      if m.has_password {
+        append(&mut out, &m.password);
+      } else {
+        push_lit(&mut out, "-");
+      }
+      return out;
+    },
+    Result<NetrcMatch, i32>::Err(code) => {
+      return netrc_error_text(code);
+    }
+  }
+}
+
+fn find(content : *const i8, host : *const i8, user : *const i8) -> Vec<u8> {
+  return find_in(&lit(content), host, user);
+}
+
+fn expect(got : &Vec<u8>, want : *const i8) -> void {
+  if !eq_lit(got, want) {
+    let mut m = lit("got:  [");
+    append(&mut m, got);
+    push_lit(&mut m, "]\nwant: [");
+    append(&mut m, &lit(want));
+    push_lit(&mut m, "]");
+    show(&m);
+    panic("a .netrc gives the wrong entry");
+  }
+}
+
+fn main() -> i32 {
+  // unit1304's empty literals, for example.com and no user.
+  expect(&find("default login \"\"", "example.com", ""), ":-");
+  expect(&find("default password \"\"", "example.com", ""), "-:");
+  expect(&find("default login \"\" password secret", "example.com", ""), ":secret");
+  expect(&find("default password \"\" login admin", "example.com", ""), "admin:");
+  expect(&find("default login \"\" password \"\"", "example.com", ""), ":");
+  expect(&find("machine \"\" login ignored password ignored", "example.com", ""), "no matching entry");
+  expect(&find("machine \"\" login ignored password ignored\nmachine example.com login admin password passwd",
+    "example.com", ""), "admin:passwd");
+  expect(&find("machine example.com login \"\" password \"\"", "example.com", ""), ":");
+
+  // unit1304's file.
+  let file = "machine example.com login admin password passwd\nmachine curl.example.com login none password none\n";
+  expect(&find(file, "test.example.com", ""), "no matching entry");
+  expect(&find(file, "example.com", "me"), "no matching entry");
+  expect(&find(file, "test.example.com", "me"), "no matching entry");
+  expect(&find(file, "example.com", "a"), "no matching entry");
+  expect(&find(file, "example.com", "administrator"), "no matching entry");
+  expect(&find(file, "example.com", ""), "admin:passwd");
+  expect(&find(file, "curl.example.com", ""), "none:none");
+  expect(&find(file, "curl.example.com", "hilarious"), "no matching entry");
+  // A host matches in any case; a login does not.
+  expect(&find(file, "EXAMPLE.com", "admin"), "admin:passwd");
+  expect(&find(file, "example.com", "Admin"), "no matching entry");
+
+  // With a user, an entry with that login and no password does not do; the next one does.
+  expect(&find("machine h login u\nmachine h login u password p", "h", "u"), "u:p");
+  // Without a user, the first entry with a login does, with or without a password.
+  expect(&find("machine h login u\nmachine h login v password p", "h", ""), "u:-");
+  // `default` holds for any host, after the machines before it.
+  expect(&find("machine a login x password y\ndefault login d password e", "b", ""), "d:e");
+
+  // Quoted words and their escapes, and keywords in any case.
+  expect(&find("MACHINE h LOGIN \"user one\" PASSWORD \"a\\\"b\\nc\\\\d\\x\"", "h", ""),
+    "user one:a\"b\nc\\dx");
+  // A quoted word with no end is a syntax error.
+  expect(&find("machine h login u password \"open", "h", ""), "syntax error");
+
+  // A comment is a line whose first byte after the blanks is `#`.
+  expect(&find("  # machine h login c password c\nmachine h login u password p", "h", ""), "u:p");
+  // A macdef goes to the next empty line, and ends the entry before it.
+  expect(&find("machine h login u password p macdef init\nmachine h login m password m\n\nmachine g login g password g",
+    "h", ""), "u:p");
+  expect(&find("macdef init\nmachine h login m password m\n\nmachine h login g password g",
+    "h", ""), "g:g");
+
+  // libcurl's limits: a line of 16384 bytes, and a word of 4096 bytes.
+  let mut long_line = lit("machine h login u password ");
+  while long_line.len() < 16383 {
+    long_line.push(120u8);
+  }
+  long_line.push(10u8);
+  expect(&find_in(&long_line, "h", ""), "syntax error");
+  let mut long_word = lit("machine h login u password ");
+  let mut n = 0;
+  while n < 4096 {
+    long_word.push(120u8);
+    n = n + 1;
+  }
+  long_word.push(10u8);
+  expect(&find_in(&long_word, "h", ""), "syntax error");
+  return 0;
+}

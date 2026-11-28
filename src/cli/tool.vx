@@ -30,6 +30,7 @@ import securl::form;
 import securl::glob;
 import securl::hsts;
 import securl::http;
+import securl::netrc;
 import securl::options;
 import securl::output;
 import securl::pool;
@@ -156,8 +157,14 @@ pub fn tool_main(root : Root, command_line : Vec<String>) -> i32 {
   for cfg in groups.iter() {
     if !cfg.show_help && !cfg.show_version && !cfg.show_manual
        && (!file_given_exists(&mut console, &root.files, &cfg.cacert, "cacert")
-         || !file_given_exists(&mut console, &root.files, &cfg.proxy_cacert, "proxy-cacert")) {
+         || !file_given_exists(&mut console, &root.files, &cfg.proxy_cacert, "proxy-cacert")
+         || !file_given_exists(&mut console, &root.files, &cfg.netrc_file, "netrc-file")) {
       return FAILED_INIT;
+    }
+  }
+  for cfg in groups.iter_mut() {
+    if cfg.use_netrc || cfg.netrc_optional || cfg.has_netrc_file {
+      cfg.netrc = load_netrc(&root.files, &root.env, cfg);
     }
   }
   return run(&root.network, &root.files, &mut stdin, &mut console, &groups);
@@ -182,6 +189,49 @@ fn time_of_file(console : &mut Console, files : &Files, cfg : &mut Config) -> vo
   }
   cfg.timecond = TIMECOND_NONE;
   cfg.has_time_cond_file = false;
+}
+
+/// The `.netrc` of the group `cfg`: the file of `--netrc-file`, or else of `NETRC`, or else
+/// `.netrc` in `HOME`, as libcurl's `Curl_netrc_scan` finds it. `--netrc-optional` makes a
+/// missing or broken file no error.
+fn load_netrc(files : &Files, env : &Environment, cfg : &Config) -> Netrc {
+  let mut n = no_netrc();
+  n.mode = NETRC_REQUIRED;
+  if cfg.netrc_optional {
+    n.mode = NETRC_OPTIONAL;
+  }
+  let mut path = clone_bytes(&cfg.netrc_file);
+  if cfg.has_netrc_file {
+    n.name = clone_bytes(&cfg.netrc_file);
+  } else {
+    path = env_var(env, "NETRC");
+    if path.len() == 0 {
+      let home = env_var(env, "HOME");
+      if home.len() == 0 {
+        n.status = NETRC_FILE_MISSING;
+        return n;
+      }
+      path = home;
+      push_lit(&mut path, "/.netrc");
+    }
+  }
+  match read_path(files, &path) {
+    Result<Vec<u8>, Failure>::Ok(bytes) => {
+      match netrc_text(&bytes) {
+        Result<Vec<u8>, i32>::Ok(text) => {
+          n.status = NETRC_OK;
+          n.text = text;
+        },
+        Result<Vec<u8>, i32>::Err(code) => {
+          n.status = code;
+        }
+      }
+    },
+    Result<Vec<u8>, Failure>::Err(_f) => {
+      n.status = NETRC_FILE_MISSING;
+    }
+  }
+  return n;
 }
 
 fn clone_env(vars : &Vec<EnvVar>) -> Vec<EnvVar> {

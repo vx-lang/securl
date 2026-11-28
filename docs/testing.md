@@ -31,7 +31,7 @@ tests/tls/run.sh` runs the same checks against another curl; curl 8.23 passes th
 
 ## Fuzzing
 
-`make fuzz FUZZ_TIME=60` runs libFuzzer on 9 parsers. vxc has no fuzzer option, so
+`make fuzz FUZZ_TIME=60` runs libFuzzer on 10 parsers. vxc has no fuzzer option, so
 `tools/build-fuzzers.sh` goes through LLVM: vxc emits MLIR, `mlir-translate` makes LLVM IR, and
 clang adds libFuzzer. A Vx panic shows as a crash, and its input stays in `build/fuzz`.
 

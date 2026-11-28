@@ -14,7 +14,8 @@ securl takes these options of curl, with curl's syntax, messages and exit codes:
 `--compressed` `--tr-encoding` `--keepalive` `--keepalive-time` `--keepalive-cnt`
 `--tcp-nodelay` `--limit-rate` `--max-filesize` `--remove-on-error` `--next` `-K` `--stderr`
 `--retry` `--retry-delay` `--retry-max-time` `--retry-connrefused` `--retry-all-errors` `-C`
-`-J` `-M` `-h` `-V` `-q` `--trace-ascii` `--trace-time` `-z` `--etag-save` `--etag-compare`.
+`-J` `-M` `-h` `-V` `-q` `--trace-ascii` `--trace-time` `-z` `--etag-save` `--etag-compare` `-n`
+`--netrc-optional` `--netrc-file`.
 
 ## Notes
 
@@ -27,6 +28,8 @@ securl takes these options of curl, with curl's syntax, messages and exit codes:
 - **`--retry` and `-C`:** curl's retry rules and waits, and its resume checks.
 - **`-z`:** takes a date. With a file name, securl drops the condition with a warning, because
   Vx's `std::fs` cannot read the time of a file yet.
+- **`.netrc`:** the entry for each host of a transfer, also after a redirect, goes only to
+  that host, as in curl.
 - **Proxies:** `-x`, the proxy variables of the environment, `--noproxy`, and SOCKS 4, 4a, 5
   and 5h, also over a Unix-domain socket.
 

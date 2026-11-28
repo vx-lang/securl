@@ -1,0 +1,2 @@
+machine example.com login admin password passwd
+machine curl.example.com login none password none
