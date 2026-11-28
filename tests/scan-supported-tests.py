@@ -29,7 +29,7 @@ socks4 socks4a socks5 socks5-hostname cert cert-type key key-type pass compresse
 suppress-connect-headers proxy-insecure proxy-cacert proxy-capath remove-on-error limit-rate
 max-filesize next config retry retry-delay retry-max-time retry-connrefused
 retry-all-errors continue-at manual remote-header-name stderr unix-socket time-cond etag-save
-etag-compare netrc netrc-optional netrc-file
+etag-compare netrc netrc-optional netrc-file variable
 """.split())
 SUPPORTED_SHORT = set("AbcdDeFHjmorTuwXxU0fGiIkLOqsSvVhg#NpE:KCMJzn")
 # The short options that take a value: the rest of the word is that value.
@@ -68,6 +68,8 @@ def missing_options(command):
         if word.startswith("--"):
             option = word[2:].split("=", 1)[0]
             base = option[3:] if option.startswith("no-") else option
+            if option.startswith("expand-"):
+                base = option[7:]
             if option not in SUPPORTED_LONG and base not in SUPPORTED_LONG:
                 missing.add(word)
         elif word.startswith("-") and len(word) > 1:

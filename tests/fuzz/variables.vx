@@ -1,0 +1,52 @@
+// libFuzzer target: the expansion of `--expand-OPTION`, the `--variable` argument and Base64,
+// securl::variables and securl::encode. tools/build-fuzzers.sh builds it, and `make fuzz`
+// runs it. A panic, which stops the program, is a crash for libFuzzer.
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import securl::encode;
+import securl::variables;
+
+/// The input of libFuzzer as bytes.
+fn input_of(data : *const u8, len : i64) -> Vec<u8> {
+  let mut bytes = Vec<u8>::new();
+  let mut i = 0i64;
+  while i < len {
+    bytes.push(unsafe { data[i] });
+    i = i + 1i64;
+  }
+  return bytes;
+}
+
+extern fn vx_fuzz_one(data : *const u8, len : i64) -> i32 {
+  let input = input_of(data, len);
+  let mut vars = Vec<Variable>::new();
+  vars.push(Variable {
+    name : lit("x"),
+    content : clone_input(&input)
+  });
+  vars.push(Variable {
+    name : lit("e"),
+    content : lit(" aGk= ")
+  });
+  let mut warnings = Vec<Vec<u8>>::new();
+  let _expanded = expand_variables(&input, &vars, &mut warnings);
+  let _spec = parse_variable(&input);
+  let _decoded = base64_decode(&input);
+  match parse_variable(&input) {
+    Result<VariableSpec, i32>::Ok(spec) => {
+      let _part = variable_range(&input, spec.start, spec.end);
+    },
+    Result<VariableSpec, i32>::Err(_e) => {}
+  }
+  return 0;
+}
+
+fn clone_input(v : &Vec<u8>) -> Vec<u8> {
+  let mut out = Vec<u8>::new();
+  for b in v.iter() {
+    out.push(*b);
+  }
+  return out;
+}

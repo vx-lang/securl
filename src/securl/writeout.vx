@@ -6,6 +6,7 @@
 import std::vec;
 import sys::text;
 import securl::bytes;
+import securl::encode;
 import securl::fetch;
 
 // The destinations of a piece of `-w` text.
@@ -36,110 +37,11 @@ fn push_three_digits(out : &mut Vec<u8>, code : i32) -> void {
   out.push(48u8 + (code % 10) as u8);
 }
 
-/// The value of the `-w` variable `name`, or false when securl does not know it.
-/// The length of the valid UTF-8 sequence at `i`, or 0 (curl's `utf8len`).
-fn utf8_length(s : &Vec<u8>, i : i32) -> i32 {
-  let b = s.get(i);
-  let mut n = 0;
-  let mut lo = 128u8;
-  let mut hi = 191u8;
-  if b >= 194u8 && b <= 223u8 {
-    n = 2;
-  }
-  if b >= 224u8 && b <= 239u8 {
-    n = 3;
-    if b == 224u8 {
-      lo = 160u8;
-    }
-    if b == 237u8 {
-      hi = 159u8;
-    }
-  }
-  if b >= 240u8 && b <= 244u8 {
-    n = 4;
-    if b == 240u8 {
-      lo = 144u8;
-    }
-    if b == 244u8 {
-      hi = 143u8;
-    }
-  }
-  if n == 0 || s.len() - i < n || s.get(i + 1) < lo || s.get(i + 1) > hi {
-    return 0;
-  }
-  let mut k = 2;
-  while k < n {
-    if s.get(i + k) < 128u8 || s.get(i + k) > 191u8 {
-      return 0;
-    }
-    k = k + 1;
-  }
-  return n;
-}
-
 /// `s` as a JSON string, in quotes, as curl writes it (`jsonWriteString`). With `lower`, the
 /// letters are in lower case.
 fn json_string(s : &Vec<u8>, lower : bool, out : &mut Vec<u8>) -> void {
-  let hex = lit("0123456789abcdef");
   out.push(34u8);
-  let mut i = 0;
-  while i < s.len() {
-    let b = s.get(i);
-    let mut done = true;
-    if b == 92u8 {
-      push_lit(out, "\\\\");
-    } else {
-      if b == 34u8 {
-        push_lit(out, "\\\"");
-      } else {
-        if b == 8u8 {
-          push_lit(out, "\\b");
-        } else {
-          if b == 12u8 {
-            push_lit(out, "\\f");
-          } else {
-            if b == 10u8 {
-              push_lit(out, "\\n");
-            } else {
-              if b == 13u8 {
-                push_lit(out, "\\r");
-              } else {
-                if b == 9u8 {
-                  push_lit(out, "\\t");
-                } else {
-                  done = false;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    if done {
-      i = i + 1;
-      continue;
-    }
-    if b >= 128u8 {
-      let n = utf8_length(s, i);
-      if n > 0 {
-        append_range(out, s, i, i + n);
-        i = i + n;
-        continue;
-      }
-    }
-    if b < 32u8 || b >= 128u8 {
-      push_lit(out, "\\u00");
-      out.push(hex.get((b / 16u8) as i32));
-      out.push(hex.get((b % 16u8) as i32));
-    } else {
-      if lower {
-        out.push(ascii_lower(b));
-      } else {
-        out.push(b);
-      }
-    }
-    i = i + 1;
-  }
+  json_quoted(s, lower, out);
   out.push(34u8);
 }
 

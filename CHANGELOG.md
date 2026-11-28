@@ -6,6 +6,7 @@
   304 never makes an output file.
 - **`.netrc`:** `-n`, `--netrc-optional` and `--netrc-file`, with the entry for each host bound
   to that host. libFuzzer on the netrc parser too.
+- **Variables:** `--variable` and `--expand-OPTION`, with curl's functions.
 
 ## 0.1.0 (2026-11-27)
 

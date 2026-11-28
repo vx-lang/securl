@@ -1,0 +1,330 @@
+// The variables of curl's `--variable` and their expansion in `--expand-OPTION` values, as
+// curl's src/var.c: `{{name}}` with the functions `trim`, `json`, `url`, `b64` and `64dec`.
+// The tool reads the files and the environment that a `--variable` names; this file parses
+// its syntax and expands the variables.
+import core::option;
+import core::result;
+import std::vec;
+import sys::text;
+import securl::bytes;
+import securl::encode;
+
+// curl's MAX_VAR_LEN: a name is shorter.
+const MAX_VARIABLE_NAME : i32 = 128;
+
+/// A variable of `--variable`.
+struct Variable {
+  name : Vec<u8>,
+  content : Vec<u8>,
+}
+
+/// The content of the newest variable called `name`, if there is one.
+fn variable_content(vars : &Vec<Variable>, name : &Vec<u8>) -> Option<Vec<u8>> {
+  let mut i = vars.len() - 1;
+  while i >= 0 {
+    let v = vars.get_ref(i);
+    if same_bytes(&v.name, name) {
+      return Option<Vec<u8>>::Some(clone_bytes(&v.content));
+    }
+    i = i - 1;
+  }
+  return Option<Vec<u8>>::None();
+}
+
+/// Whether a variable is called `name`.
+pub fn has_variable(vars : &Vec<Variable>, name : &Vec<u8>) -> bool {
+  match variable_content(vars, name) {
+    Option<Vec<u8>>::Some(_c) => {
+      return true;
+    },
+    Option<Vec<u8>>::None() => {
+      return false;
+    }
+  }
+}
+
+fn is_name_byte(b : u8) -> bool {
+  return is_digit(b) || (b >= 65u8 && b <= 90u8) || (b >= 97u8 && b <= 122u8) || b == 95u8;
+}
+
+// curl's ISSPACE.
+fn is_space_byte(b : u8) -> bool {
+  return b == 32u8 || (b >= 9u8 && b <= 13u8);
+}
+
+/// Whether the function `name` starts at `at` of `funcs` and ends there, at a `}` or a `:`.
+fn function_at(funcs : &Vec<u8>, at : i32, name : *const i8) -> bool {
+  let n = lit(name);
+  if !has_at(funcs, at, &n) {
+    return false;
+  }
+  let after = at + n.len();
+  return after < funcs.len() && (funcs.get(after) == 125u8 || funcs.get(after) == 58u8);
+}
+
+/// The value `value` after the functions of `funcs`, which starts at a `:` and ends at the `}`
+/// of the `}}`, as curl's `varfunc`: each function works on what the one before gave. An
+/// unknown function is curl's error.
+fn apply_functions(value : &Vec<u8>, funcs : &Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
+  let mut c = clone_bytes(value);
+  let mut f = 0;
+  while f < funcs.len() && funcs.get(f) != 125u8 {
+    // A `:` before each function.
+    f = f + 1;
+    let mut out = Vec<u8>::new();
+    if function_at(funcs, f, "trim") {
+      f = f + 4;
+      let mut start = 0;
+      let mut end = c.len();
+      while start < end && is_space_byte(c.get(start)) {
+        start = start + 1;
+      }
+      while end > start && is_space_byte(c.get(end - 1)) {
+        end = end - 1;
+      }
+      out = range_of(&c, start, end);
+    } else if function_at(funcs, f, "json") {
+      f = f + 4;
+      json_quoted(&c, false, &mut out);
+    } else if function_at(funcs, f, "url") {
+      f = f + 3;
+      out = url_encode(&c);
+    } else if function_at(funcs, f, "b64") {
+      f = f + 3;
+      if c.len() > 0 {
+        out = base64(&c);
+      }
+    } else if function_at(funcs, f, "64dec") {
+      f = f + 5;
+      if c.len() > 0 {
+        match base64_decode(&c) {
+          Option<Vec<u8>>::Some(bytes) => {
+            out = bytes;
+          },
+          Option<Vec<u8>>::None() => {
+            out = lit("[64dec-fail]");
+          }
+        }
+      }
+    } else {
+      let mut m = lit("unknown variable function in '");
+      append_range(&mut m, funcs, 0, funcs.len() - 1);
+      push_lit(&mut m, "'");
+      return Result<Vec<u8>, Vec<u8>>::Err(m);
+    }
+    c = out;
+  }
+  return Result<Vec<u8>, Vec<u8>>::Ok(c);
+}
+
+/// The text `input` with each `{{name}}` and `{{name:functions}}` replaced, as curl's
+/// `varexpand`. None when nothing was replaced: then curl keeps `input` as it is, with the
+/// backslash of each `\{{`. Warnings go to `warnings`; an error gives curl's error line.
+pub fn expand_variables(input : &Vec<u8>, vars : &Vec<Variable>, warnings : &mut Vec<Vec<u8>>)
+-> Result<Option<Vec<u8>>, Vec<u8>> {
+  let mut out = Vec<u8>::new();
+  let mut added = false;
+  let open = lit("{{");
+  let close = lit("}}");
+  let mut line = 0;
+  loop {
+    let envp = find_seq(input, &open, line);
+    if envp < 0 {
+      break;
+    }
+    if envp > line && input.get(envp - 1) == 92u8 {
+      // `\{{` stays `{{`.
+      append_range(&mut out, input, line, envp - 1);
+      push_lit(&mut out, "{{");
+      line = envp + 2;
+      continue;
+    }
+    let clp = find_seq(input, &close, envp);
+    if clp < 0 {
+      let mut m = lit("missing close '}}' in '");
+      append(&mut m, input);
+      push_lit(&mut m, "'");
+      warnings.push(m);
+      break;
+    }
+    let start = envp + 2;
+    let mut funcp = find_byte(input, 58u8, start);
+    if funcp >= clp {
+      funcp = -1;
+    }
+    let mut nlen = clp - start;
+    if funcp >= 0 {
+      nlen = funcp - start;
+    }
+    if nlen <= 0 || nlen >= MAX_VARIABLE_NAME {
+      let mut m = lit("bad variable name length '");
+      append(&mut m, input);
+      push_lit(&mut m, "'");
+      warnings.push(m);
+      append_range(&mut out, input, line, clp + 2);
+    } else {
+      append_range(&mut out, input, line, envp);
+      let name = range_of(input, start, start + nlen);
+      let mut good = true;
+      for b in name.iter() {
+        if !is_name_byte(*b) {
+          good = false;
+        }
+      }
+      if !good {
+        warnings.push(lit_then("bad variable name: ", &name));
+        append_range(&mut out, input, envp, clp + 2);
+      } else {
+        let mut value = Vec<u8>::new();
+        match variable_content(vars, &name) {
+          Option<Vec<u8>>::Some(c) => {
+            value = c;
+          },
+          Option<Vec<u8>>::None() => {}
+        }
+        if funcp >= 0 {
+          // The functions, from the first `:` to the `}` of the `}}`.
+          value = apply_functions(&value, &range_of(input, funcp, clp + 1))?;
+        }
+        if find_byte(&value, 0u8, 0) >= 0 {
+          return Result<Option<Vec<u8>>, Vec<u8>>::Err(lit("variable contains NUL byte"));
+        }
+        append(&mut out, &value);
+        added = true;
+      }
+    }
+    line = clp + 2;
+  }
+  if !added {
+    return Result<Option<Vec<u8>>, Vec<u8>>::Ok(Option<Vec<u8>>::None());
+  }
+  append_range(&mut out, input, line, input.len());
+  return Result<Option<Vec<u8>>, Vec<u8>>::Ok(Option<Vec<u8>>::Some(out));
+}
+
+// Where the content of a `--variable` comes from.
+const VARIABLE_ASSIGN : i32 = 0;
+const VARIABLE_FILE : i32 = 1;
+// Nothing: the environment gave the content of `%NAME`, or the syntax is bad.
+const VARIABLE_NONE : i32 = 2;
+
+/// A `--variable` argument, as curl's `setvariable` reads it, for the tool to fill in.
+struct VariableSpec {
+  // `%NAME`: the content comes from the environment variable `name`, if it is set.
+  from_env : bool,
+  name : Vec<u8>,
+  // The name is empty or too long: curl warns and skips it.
+  bad_name : bool,
+  // Something comes after the name: for `%NAME`, what to do when it is not set.
+  has_more : bool,
+  // `[N-M]` or `[N-]`: the bytes N to M of the content.
+  start : i64,
+  end : i64,
+  // A `VARIABLE_` value: `=CONTENT`, or `@FILE` (`-` for standard input).
+  source : i32,
+  rest : Vec<u8>,
+}
+
+/// The digits at `at` of `t` as a number, and where they end; None for no digits.
+fn number_at(t : &Vec<u8>, at : i32, end : &mut i32) -> Option<i64> {
+  let mut i = at;
+  let mut n = 0i64;
+  while i < t.len() && is_digit(t.get(i)) {
+    if n > 922337203685477579i64 {
+      return Option<i64>::None();
+    }
+    n = n * 10i64 + ((t.get(i) - 48u8) as i64);
+    i = i + 1;
+  }
+  if i == at {
+    return Option<i64>::None();
+  }
+  *end = i;
+  return Option<i64>::Some(n);
+}
+
+/// The parts of the `--variable` argument `input`. Err is curl's PARAM_VAR_SYNTAX, for a
+/// bad byte range.
+pub fn parse_variable(input : &Vec<u8>) -> Result<VariableSpec, i32> {
+  let mut spec = VariableSpec {
+    from_env : false,
+    name : Vec<u8>::new(),
+    bad_name : false,
+    has_more : false,
+    start : 0i64,
+    end : 9223372036854775807i64,
+    source : VARIABLE_NONE,
+    rest : Vec<u8>::new()
+  };
+  let mut i = 0;
+  if input.len() > 0 && input.get(0) == 37u8 {
+    spec.from_env = true;
+    i = 1;
+  }
+  let name_start = i;
+  while i < input.len() && is_name_byte(input.get(i)) {
+    i = i + 1;
+  }
+  spec.name = range_of(input, name_start, i);
+  spec.has_more = i < input.len();
+  if spec.name.len() == 0 || spec.name.len() >= MAX_VARIABLE_NAME {
+    spec.bad_name = true;
+    return Result<VariableSpec, i32>::Ok(spec);
+  }
+  if i + 1 < input.len() && input.get(i) == 91u8 && is_digit(input.get(i + 1)) {
+    let mut at = i + 1;
+    match number_at(input, at, &mut at) {
+      Option<i64>::Some(n) => {
+        spec.start = n;
+      },
+      Option<i64>::None() => {
+        return Result<VariableSpec, i32>::Err(0);
+      }
+    }
+    if at >= input.len() || input.get(at) != 45u8 {
+      return Result<VariableSpec, i32>::Err(0);
+    }
+    at = at + 1;
+    if at < input.len() && input.get(at) == 93u8 {
+      at = at + 1;
+    } else {
+      match number_at(input, at, &mut at) {
+        Option<i64>::Some(n) => {
+          spec.end = n;
+        },
+        Option<i64>::None() => {
+          return Result<VariableSpec, i32>::Err(0);
+        }
+      }
+      if at >= input.len() || input.get(at) != 93u8 {
+        return Result<VariableSpec, i32>::Err(0);
+      }
+      at = at + 1;
+    }
+    if spec.start > spec.end {
+      return Result<VariableSpec, i32>::Err(0);
+    }
+    i = at;
+  }
+  if i < input.len() && input.get(i) == 64u8 {
+    spec.source = VARIABLE_FILE;
+    spec.rest = rest_from(input, i + 1);
+  } else if i < input.len() && input.get(i) == 61u8 {
+    spec.source = VARIABLE_ASSIGN;
+    spec.rest = rest_from(input, i + 1);
+  }
+  return Result<VariableSpec, i32>::Ok(spec);
+}
+
+/// The bytes `start` to `end` of `content`, both in, as curl takes a range of a variable.
+pub fn variable_range(content : &Vec<u8>, start : i64, end : i64) -> Vec<u8> {
+  let len = content.len() as i64;
+  if start >= len {
+    return Vec<u8>::new();
+  }
+  let mut last = end;
+  if last >= len {
+    last = len - 1i64;
+  }
+  return range_of(content, start as i32, (last + 1i64) as i32);
+}

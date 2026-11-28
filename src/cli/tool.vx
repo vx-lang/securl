@@ -36,6 +36,7 @@ import securl::output;
 import securl::pool;
 import securl::fetch;
 import securl::url;
+import securl::variables;
 import securl::writeout;
 import disk::files;
 
@@ -127,7 +128,8 @@ pub fn tool_main(root : Root, command_line : Vec<String>) -> i32 {
   let args = words_of(&command_line);
   let columns = columns_of(&root.env);
   let mut parser = new_arg_parser();
-  match read_command_line(&mut parser, &args, &root.files, &mut stdin, &mut console, columns) {
+  match read_command_line(&mut parser, &args, &root.files, &root.env, &mut stdin, &mut console,
+    columns) {
     Result<i32, Failure>::Ok(_n) => {},
     Result<i32, Failure>::Err(f) => {
       let mut m = lit("curl: ");
@@ -250,7 +252,7 @@ const CONFIG_MAX_LEVELS : i32 = 5;
 
 /// Read the command line into `parser`, with the config file of each `-K`, which the tool
 /// reads with its file right. The parser itself cannot open a file.
-fn read_command_line(parser : &mut ArgParser, args : &Vec<Vec<u8>>, files : &Files,
+fn read_command_line(parser : &mut ArgParser, args : &Vec<Vec<u8>>, files : &Files, env : &Environment,
 stdin : &mut Stdin, console : &mut Console, columns : i32) -> Result<i32, Failure> {
   let mut at = 0;
   loop {
@@ -268,8 +270,25 @@ stdin : &mut Stdin, console : &mut Console, columns : i32) -> Result<i32, Failur
         return Result<i32, Failure>::Err(fail_with(READ_ERROR, m));
       }
     }
+    if stop.has_variable {
+      match set_variable(parser, files, env, stdin, console, &stop.variable, columns) {
+        Result<i32, VariableError>::Ok(_n) => {},
+        Result<i32, VariableError>::Err(e) => {
+          let mut m = Vec<u8>::new();
+          if e.line.len() > 0 && parser.errors_shown() {
+            append(&mut m, &e.line);
+            push_lit(&mut m, "\ncurl: ");
+          }
+          push_lit(&mut m, "option ");
+          append(&mut m, &stop.config_option);
+          push_lit(&mut m, ": ");
+          append(&mut m, &e.reason);
+          return Result<i32, Failure>::Err(fail_with(e.code, m));
+        }
+      }
+    }
     if stop.has_config {
-      match read_config(parser, &stop.config_file, files, stdin, console, columns,
+      match read_config(parser, &stop.config_file, files, env, stdin, console, columns,
         CONFIG_MAX_LEVELS - 1) {
         Result<i32, ConfigError>::Ok(_n) => {},
         Result<i32, ConfigError>::Err(e) => {
@@ -329,6 +348,111 @@ fn error_line(console : &mut Console, parser : &ArgParser, text : &Vec<u8>, colu
 /// Read the config file `name` of `-K` (`-` for standard input) into `parser`, as curl's
 /// `parseconfig`. `levels` is how many more files deep it may go. On an error, it prints curl's
 /// line about it, and gives the reason for the option that read the file.
+/// Why a `--variable` failed: curl's error line before the reason, if any, the reason of the
+/// option, and the exit code.
+struct VariableError {
+  line : Vec<u8>,
+  reason : Vec<u8>,
+  code : i32,
+}
+
+fn variable_error(line : Vec<u8>, reason : *const i8, code : i32) -> Result<i32, VariableError> {
+  return Result<i32, VariableError>::Err(VariableError {
+    line : line,
+    reason : lit(reason),
+    code : code
+  });
+}
+
+/// The value of the environment variable `name`, if it is set, also when it is empty.
+fn env_lookup(env : &Environment, name : &Vec<u8>) -> Option<Vec<u8>> {
+  match String::from_utf8(name) {
+    Result<String, Utf8Error>::Ok(key) => {
+      match env.var(&key) {
+        Result<String, EnvError>::Ok(value) => {
+          return Option<Vec<u8>>::Some(value.to_bytes());
+        },
+        Result<String, EnvError>::Err(_e) => {
+          return Option<Vec<u8>>::None();
+        }
+      }
+    },
+    Result<String, Utf8Error>::Err(_e) => {
+      return Option<Vec<u8>>::None();
+    }
+  }
+}
+
+/// `--variable INPUT`, as curl's `setvariable`: `NAME=CONTENT`, `NAME@FILE` (`-` for standard
+/// input), `%NAME` from the environment with either of them for when it is not set, and
+/// `[N-M]` for a part of the content. The tool reads the file and the environment; the parser
+/// keeps the variable.
+fn set_variable(parser : &mut ArgParser, files : &Files, env : &Environment, stdin : &mut Stdin,
+console : &mut Console, input : &Vec<u8>, columns : i32) -> Result<i32, VariableError> {
+  let spec = match parse_variable(input) {
+    Result<VariableSpec, i32>::Ok(v) => { v },
+    Result<VariableSpec, i32>::Err(_e) => {
+      return variable_error(Vec<u8>::new(), "syntax error in --variable argument", FAILED_INIT);
+    }
+  };
+  if spec.bad_name {
+    let mut m = lit("Bad variable name length (");
+    push_i64(&mut m, spec.name.len() as i64);
+    push_lit(&mut m, "), skipping");
+    parser.warn(m);
+    print_warnings(console, parser, columns);
+    return Result<i32, VariableError>::Ok(0);
+  }
+  let mut content = Vec<u8>::new();
+  let mut have = false;
+  if spec.from_env {
+    match env_lookup(env, &spec.name) {
+      Option<Vec<u8>>::Some(v) => {
+        content = v;
+        have = true;
+      },
+      Option<Vec<u8>>::None() => {
+        if !spec.has_more {
+          let line = lit_then("Variable '", &lit_then_lit(&spec.name, "' import fail, not set"));
+          return variable_error(line, "variable expansion failure", FAILED_INIT);
+        }
+      }
+    }
+  }
+  if !have {
+    if spec.source == VARIABLE_FILE {
+      match read_file(files, stdin, &spec.rest) {
+        Result<Vec<u8>, Failure>::Ok(bytes) => {
+          content = variable_range(&bytes, spec.start, spec.end);
+        },
+        Result<Vec<u8>, Failure>::Err(_f) => {
+          let reason = open_error_text(files, &spec.rest);
+          let mut line = Vec<u8>::new();
+          if reason.len() > 0 {
+            line = lit("Failed to open ");
+            append(&mut line, &spec.rest);
+            push_lit(&mut line, ": ");
+            append(&mut line, &reason);
+          }
+          return variable_error(line, "error encountered when reading a file", READ_ERROR);
+        }
+      }
+    } else if spec.source == VARIABLE_ASSIGN {
+      content = variable_range(&spec.rest, spec.start, spec.end);
+    } else {
+      parser.warn(lit_then("Bad --variable syntax, skipping: ", input));
+      print_warnings(console, parser, columns);
+      return Result<i32, VariableError>::Ok(0);
+    }
+  }
+  if parser.variable_exists(&spec.name) && parser.tracing() {
+    console.to_stderr(&message_lines("Note: ",
+      &lit_then("Overwriting variable '", &lit_then_lit(&spec.name, "'")), columns));
+  }
+  parser.add_variable(&spec.name, &content);
+  return Result<i32, VariableError>::Ok(0);
+}
+
 /// Read the URLs of the file `name` of `--url @name`, or of standard input for `-`, one on each
 /// line, as curl's `my_get_line`: it skips empty lines and the lines whose first byte that is
 /// not a blank is `#`. False when the file cannot be read.
@@ -359,7 +483,8 @@ fn read_url_file(parser : &mut ArgParser, name : &Vec<u8>, files : &Files, stdin
   return true;
 }
 
-fn read_config(parser : &mut ArgParser, name : &Vec<u8>, files : &Files, stdin : &mut Stdin,
+fn read_config(parser : &mut ArgParser, name : &Vec<u8>, files : &Files, env : &Environment,
+stdin : &mut Stdin,
 console : &mut Console, columns : i32, levels : i32) -> Result<i32, ConfigError> {
   let mut shown = clone_bytes(name);
   if eq_lit(name, "-") {
@@ -392,6 +517,20 @@ console : &mut Console, columns : i32, levels : i32) -> Result<i32, ConfigError>
         if step.has_stderr {
           redirect_stderr(console, parser, files, &step.stderr_file, columns);
         }
+        if step.has_variable {
+          match set_variable(parser, files, env, stdin, console, &step.variable, columns) {
+            Result<i32, VariableError>::Ok(_n) => {},
+            Result<i32, VariableError>::Err(ve) => {
+              if ve.line.len() > 0 {
+                error_line(console, parser, &ve.line, columns);
+              }
+              let e = config_error(&shown, line.lineno, &line.option, &ve.reason, &ve.reason,
+                ve.code);
+              error_line(console, parser, &e.text, columns);
+              return Result<i32, ConfigError>::Err(e);
+            }
+          }
+        }
         if step.has_url_file && !read_url_file(parser, &step.url_file, files, stdin) {
           let reason = lit("error encountered when reading a file");
           let e = config_error(&shown, line.lineno, &line.option, &reason, &reason, READ_ERROR);
@@ -408,7 +547,7 @@ console : &mut Console, columns : i32, levels : i32) -> Result<i32, ConfigError>
               code : FAILED_INIT
             });
           } else {
-            nested = read_config(parser, &step.config_file, files, stdin, console, columns,
+            nested = read_config(parser, &step.config_file, files, env, stdin, console, columns,
               levels - 1);
           }
           match nested {

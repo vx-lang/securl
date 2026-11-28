@@ -14,6 +14,7 @@ import securl::date;
 import securl::failure;
 import securl::netrc;
 import securl::socks;
+import securl::variables;
 
 // The kinds of request body option. `-d` and `--data-ascii` read a file after `@` and drop its
 // CR and LF bytes. `--data-raw` never reads a file. `--data-binary` and `--json` keep the
@@ -480,6 +481,8 @@ const OPT_ETAG_COMPARE : i32 = 108;
 const OPT_NETRC : i32 = 109;
 const OPT_NETRC_OPTIONAL : i32 = 110;
 const OPT_NETRC_FILE : i32 = 111;
+// `--variable`, which the parser hands to the tool, which reads its file or environment.
+const OPT_VARIABLE : i32 = 112;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -598,6 +601,7 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "netrc") { return OPT_NETRC; }
   if eq_lit(name, "netrc-optional") { return OPT_NETRC_OPTIONAL; }
   if eq_lit(name, "netrc-file") { return OPT_NETRC_FILE; }
+  if eq_lit(name, "variable") { return OPT_VARIABLE; }
   return OPT_UNKNOWN;
 }
 
@@ -659,7 +663,7 @@ fn takes_value(id : i32) -> bool {
     || id == OPT_PROXY_CAPATH || id == OPT_LIMIT_RATE || id == OPT_MAX_FILESIZE || id == OPT_CONFIG
     || (id >= OPT_RETRY && id <= OPT_RETRY_MAX_TIME) || id == OPT_CONTINUE_AT
     || id == OPT_UNIX_SOCKET || id == OPT_STDERR || id == OPT_TIME_COND || id == OPT_ETAG_SAVE
-    || id == OPT_ETAG_COMPARE || id == OPT_NETRC_FILE;
+    || id == OPT_ETAG_COMPARE || id == OPT_NETRC_FILE || id == OPT_VARIABLE;
 }
 
 /// Whether the value of the option names a file, as curl's `ARG_FILE` options.
@@ -1645,6 +1649,10 @@ struct Step {
   // each to `add_file_url`.
   has_url_file : bool,
   url_file : Vec<u8>,
+  // `--variable ARG`: the caller reads what ARG names, and gives the variable to
+  // `add_variable`.
+  has_variable : bool,
+  variable : Vec<u8>,
   // `-h` or `-V`: curl stops reading the command line and shows the help or the version.
   stop : bool,
 }
@@ -1661,6 +1669,8 @@ struct ArgParser {
   show_manual : bool,
   // Warnings of curl about the options so far, for the caller to print.
   warnings : Vec<Vec<u8>>,
+  // The variables of `--variable`, for all the groups.
+  variables : Vec<Variable>,
 }
 
 /// A parser with one group of the defaults of curl.
@@ -1679,7 +1689,8 @@ pub fn new_arg_parser() -> ArgParser {
     show_help : false,
     show_version : false,
     show_manual : false,
-    warnings : Vec<Vec<u8>>::new()
+    warnings : Vec<Vec<u8>>::new(),
+    variables : Vec<Variable>::new()
   };
 }
 
@@ -1697,6 +1708,9 @@ struct WordsStop {
   // A `--url @FILE` option: the file of URLs to read before the next word.
   has_url_file : bool,
   url_file : Vec<u8>,
+  // A `--variable` option: its argument, for the caller to read.
+  has_variable : bool,
+  variable : Vec<u8>,
   // The words ended, or `-h` or `-V` stopped the reading.
   finished : bool,
 }
@@ -1711,11 +1725,39 @@ fn no_step() -> Step {
     stderr_file : Vec<u8>::new(),
     has_url_file : false,
     url_file : Vec<u8>::new(),
+    has_variable : false,
+    variable : Vec<u8>::new(),
     stop : false
   };
 }
 
 impl ArgParser {
+  /// Set the variable `name` to `content`, for the rest of the command line. A variable of the
+  /// same name before goes out of use.
+  pub fn add_variable(self : &mut ArgParser, name : &Vec<u8>, content : &Vec<u8>) -> void {
+    self.variables.push(Variable {
+      name : clone_bytes(name),
+      content : clone_bytes(content)
+    });
+  }
+
+  /// Whether a variable called `name` exists.
+  pub fn variable_exists(self : &ArgParser, name : &Vec<u8>) -> bool {
+    return has_variable(&self.variables, name);
+  }
+
+  /// Whether `-v` or `--trace` came so far, which shows curl's notes.
+  pub fn tracing(self : &ArgParser) -> bool {
+    return self.globals.verbose || self.globals.has_trace;
+  }
+
+  /// Add a warning, which the caller prints with the others. `-s` hides it, as curl's `warnf`.
+  pub fn warn(self : &mut ArgParser, text : Vec<u8>) -> void {
+    if !self.globals.silent {
+      self.warnings.push(text);
+    }
+  }
+
   /// The warnings so far, which the caller prints. It leaves none.
   pub fn take_warnings(self : &mut ArgParser) -> Vec<Vec<u8>> {
     return replace(&mut self.warnings, Vec<Vec<u8>>::new());
@@ -1781,6 +1823,11 @@ impl ArgParser {
       step.stderr_file = clone_bytes(value);
       return done();
     }
+    if id == OPT_VARIABLE {
+      step.has_variable = true;
+      step.variable = clone_bytes(value);
+      return done();
+    }
     if id == OPT_URL && value.len() > 0 && value.get(0) == 64u8 {
       // As curl: the URLs of a file, each as with `-O` and with no globbing.
       step.has_url_file = true;
@@ -1835,6 +1882,7 @@ impl ArgParser {
         name = range_of(&name, 0, eq);
       }
       let mut enable = true;
+      let mut expand = false;
       let mut id = long_option(&name);
       if id == OPT_UNKNOWN && starts_lit(&name, "no-") {
         let rest = rest_from(&name, 3);
@@ -1843,9 +1891,16 @@ impl ArgParser {
           id = base;
           enable = false;
         }
+      } else if id == OPT_UNKNOWN && starts_lit(&name, "expand-") {
+        // `--expand-OPTION`: the variables of the value are expanded first.
+        id = long_option(&rest_from(&name, 7));
+        expand = true;
       }
       if id == OPT_UNKNOWN {
         return Result<Step, Failure>::Err(option_error(shown, "is unknown"));
+      }
+      if expand && !takes_value(id) {
+        return Result<Step, Failure>::Err(option_error(shown, "variable expansion failure"));
       }
       let mut value = Vec<u8>::new();
       if takes_value(id) && inline_value {
@@ -1856,6 +1911,35 @@ impl ArgParser {
         }
         value = clone_bytes(next);
         step.used_next = true;
+      }
+      if expand {
+        let mut expand_warnings = Vec<Vec<u8>>::new();
+        let expanded = expand_variables(&value, &self.variables, &mut expand_warnings);
+        for w in expand_warnings.iter() {
+          self.warn(clone_bytes(w));
+        }
+        match expanded {
+          Result<Option<Vec<u8>>, Vec<u8>>::Ok(found) => {
+            match found {
+              Option<Vec<u8>>::Some(v) => {
+                value = v;
+              },
+              Option<Vec<u8>>::None() => {}
+            }
+          },
+          Result<Option<Vec<u8>>, Vec<u8>>::Err(why) => {
+            // curl's `errorf` line, which `-s` hides unless `-S` comes too.
+            let mut m = Vec<u8>::new();
+            if self.errors_shown() {
+              append(&mut m, &why);
+              push_lit(&mut m, "\ncurl: ");
+            }
+            push_lit(&mut m, "option ");
+            append(&mut m, shown);
+            push_lit(&mut m, ": variable expansion failure");
+            return Result<Step, Failure>::Err(fail_with(FAILED_INIT, m));
+          }
+        }
       }
       let _applied = self.apply_option(id, &value, enable, shown, &mut step)?;
       return Result<Step, Failure>::Ok(step);
@@ -1977,6 +2061,13 @@ impl ArgParser {
           stop.config_option = clone_bytes(word);
           return Result<WordsStop, Failure>::Ok(stop);
         }
+        if step.has_variable {
+          let mut stop = words_stop(i, false);
+          stop.has_variable = true;
+          stop.variable = step.variable;
+          stop.config_option = clone_bytes(word);
+          return Result<WordsStop, Failure>::Ok(stop);
+        }
       } else {
         let _added = add_url(&mut self.current, word, word)?;
         i = i + 1;
@@ -2049,6 +2140,8 @@ fn words_stop(at : i32, finished : bool) -> WordsStop {
     stderr_file : Vec<u8>::new(),
     has_url_file : false,
     url_file : Vec<u8>::new(),
+    has_variable : false,
+    variable : Vec<u8>::new(),
     finished : finished
   };
 }

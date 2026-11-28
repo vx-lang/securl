@@ -1,5 +1,7 @@
-// Base64 for Basic authentication, and the URL encoding of `--data-urlencode`.
+// Base64 for Basic authentication, the URL encoding of `--data-urlencode`, and JSON strings.
+import core::option;
 import std::vec;
+import sys::text;
 import securl::bytes;
 
 /// The Base64 digit for the 6-bit value `v`.
@@ -92,4 +94,183 @@ pub fn url_encode(data : &Vec<u8>) -> Vec<u8> {
     }
   }
   return out;
+}
+
+/// The length of the valid UTF-8 sequence at `i`, or 0 (curl's `utf8len`).
+fn utf8_length(s : &Vec<u8>, i : i32) -> i32 {
+  let b = s.get(i);
+  let mut n = 0;
+  let mut lo = 128u8;
+  let mut hi = 191u8;
+  if b >= 194u8 && b <= 223u8 {
+    n = 2;
+  }
+  if b >= 224u8 && b <= 239u8 {
+    n = 3;
+    if b == 224u8 {
+      lo = 160u8;
+    }
+    if b == 237u8 {
+      hi = 159u8;
+    }
+  }
+  if b >= 240u8 && b <= 244u8 {
+    n = 4;
+    if b == 240u8 {
+      lo = 144u8;
+    }
+    if b == 244u8 {
+      hi = 143u8;
+    }
+  }
+  if n == 0 || s.len() - i < n || s.get(i + 1) < lo || s.get(i + 1) > hi {
+    return 0;
+  }
+  let mut k = 2;
+  while k < n {
+    if s.get(i + k) < 128u8 || s.get(i + k) > 191u8 {
+      return 0;
+    }
+    k = k + 1;
+  }
+  return n;
+}
+
+/// `s` as the inside of a JSON string, as curl's `jsonquoted` writes it: the escapes of JSON,
+/// valid UTF-8 as it is, and `\u00XX` for the other bytes. With `lower`, the letters are in
+/// lower case.
+pub fn json_quoted(s : &Vec<u8>, lower : bool, out : &mut Vec<u8>) -> void {
+  let hex = lit("0123456789abcdef");
+  let mut i = 0;
+  while i < s.len() {
+    let b = s.get(i);
+    let mut done = true;
+    if b == 92u8 {
+      push_lit(out, "\\\\");
+    } else {
+      if b == 34u8 {
+        push_lit(out, "\\\"");
+      } else {
+        if b == 8u8 {
+          push_lit(out, "\\b");
+        } else {
+          if b == 12u8 {
+            push_lit(out, "\\f");
+          } else {
+            if b == 10u8 {
+              push_lit(out, "\\n");
+            } else {
+              if b == 13u8 {
+                push_lit(out, "\\r");
+              } else {
+                if b == 9u8 {
+                  push_lit(out, "\\t");
+                } else {
+                  done = false;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if done {
+      i = i + 1;
+      continue;
+    }
+    if b >= 128u8 {
+      let n = utf8_length(s, i);
+      if n > 0 {
+        append_range(out, s, i, i + n);
+        i = i + n;
+        continue;
+      }
+    }
+    if b < 32u8 || b >= 128u8 {
+      push_lit(out, "\\u00");
+      out.push(hex.get((b / 16u8) as i32));
+      out.push(hex.get((b % 16u8) as i32));
+    } else {
+      if lower {
+        out.push(ascii_lower(b));
+      } else {
+        out.push(b);
+      }
+    }
+    i = i + 1;
+  }
+}
+
+/// The 6-bit value of the Base64 digit `b`, or -1.
+fn base64_value(b : u8) -> i32 {
+  if b >= 65u8 && b <= 90u8 {
+    return (b - 65u8) as i32;
+  }
+  if b >= 97u8 && b <= 122u8 {
+    return (b - 97u8) as i32 + 26;
+  }
+  if b >= 48u8 && b <= 57u8 {
+    return (b - 48u8) as i32 + 52;
+  }
+  if b == 43u8 {
+    return 62;
+  }
+  if b == 47u8 {
+    return 63;
+  }
+  return -1;
+}
+
+/// The bytes of the Base64 text `text`, or None when it is not Base64 as curl's
+/// `curlx_base64_decode` takes it: a length that is a multiple of 4, and at most two `=` at
+/// the end. As there, the text ends at a NUL byte.
+pub fn base64_decode(text : &Vec<u8>) -> Option<Vec<u8>> {
+  let mut len = find_byte(text, 0u8, 0);
+  if len < 0 {
+    len = text.len();
+  }
+  if len == 0 || len % 4 != 0 {
+    return Option<Vec<u8>>::None();
+  }
+  let mut padding = 0;
+  while padding < len && text.get(len - 1 - padding) == 61u8 {
+    padding = padding + 1;
+    if padding > 2 {
+      return Option<Vec<u8>>::None();
+    }
+  }
+  let mut out = Vec<u8>::new();
+  let mut i = 0;
+  while i < len {
+    let last = i + 4 == len;
+    let mut x = 0;
+    let mut pads = 0;
+    let mut k = 0;
+    while k < 4 {
+      let b = text.get(i + k);
+      if b == 61u8 && last && padding > 0 {
+        pads = pads + 1;
+        if pads > padding {
+          return Option<Vec<u8>>::None();
+        }
+        x = x * 64;
+      } else {
+        let v = base64_value(b);
+        if v < 0 || pads > 0 {
+          return Option<Vec<u8>>::None();
+        }
+        x = x * 64 + v;
+      }
+      k = k + 1;
+    }
+    out.push(((x / 65536) % 256) as u8);
+    if !last || padding < 2 {
+      out.push(((x / 256) % 256) as u8);
+    }
+    if !last || padding < 1 {
+      out.push((x % 256) as u8);
+    }
+    i = i + 4;
+  }
+  return Option<Vec<u8>>::Some(out);
 }

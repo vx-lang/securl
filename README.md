@@ -28,12 +28,12 @@ You also need a C compiler and Perl. For a vxc built from source, set `VXC`, `VX
 
 | Tests | Passed |
 |---|---|
-| curl's HTTP tests, from curl 2f5c657 (`make test`) | 638 of 762 |
-| The ones that use only options securl has (`make test-supported`) | 574 of 605 |
+| curl's HTTP tests, from curl 2f5c657 (`make test`) | 651 of 762 |
+| The ones that use only options securl has (`make test-supported`) | 590 of 617 |
 | TLS, proxy and limit tests (`make test-tls`) | 290 of 290 |
 | HTTP/2 tests (`make test-h2`) | 32 of 32 |
-| Unit tests (`make unit`) | 13 of 13 |
-| libFuzzer on 10 parsers (`make fuzz`) | no crash in 50 million inputs |
+| Unit tests (`make unit`) | 14 of 14 |
+| libFuzzer on 11 parsers (`make fuzz`) | no crash in 50 million inputs |
 
 [docs/testing.md](docs/testing.md) says how to run curl's test suite.
 
@@ -52,7 +52,7 @@ You also need a C compiler and Perl. For a vxc built from source, set `VXC`, `VX
 ## Not done yet
 
 - HTTP/2 connection reuse, `Upgrade: h2c`, HTTP/2 through a proxy, and HTTP/3.
-- `--variable`, `-4` and `-6`, the progress meter, and PKCS#12 certificates.
+- `-4` and `-6`, the progress meter, and PKCS#12 certificates.
 - `%{time_namelookup}` holds no DNS time: Vx's `std::net` resolves inside its connect.
 
 ## Layout
