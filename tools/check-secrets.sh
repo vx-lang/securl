@@ -12,6 +12,9 @@
 #   src/securl/options.vx  parses `-E CERT:PASSWORD`
 #   src/securl/netrc.vx    reads the entry of a `.netrc` file, for auth.vx
 #
+# The raw values of `-u` and `--oauth2-bearer` go from the parser through fetch.vx to auth.vx's
+# server_credential, which binds them to where they may go before anything sends them.
+#
 #   tools/check-secrets.sh
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)

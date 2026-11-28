@@ -7,6 +7,8 @@
 - **`.netrc`:** `-n`, `--netrc-optional` and `--netrc-file`, with the entry for each host bound
   to that host. libFuzzer on the netrc parser too.
 - **Variables:** `--variable` and `--expand-OPTION`, with curl's functions.
+- **Requests:** `--follow`, `--post301`, `--post302`, `--post303`, `--request-target`,
+  `--url-query`, `--fail-early`, `--disallow-username-in-url` and `--oauth2-bearer`.
 
 ## 0.1.0 (2026-11-27)
 

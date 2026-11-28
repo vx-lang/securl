@@ -117,6 +117,8 @@ struct Credential {
   scope : Scope,
   user : Vec<u8>,
   password : Vec<u8>,
+  // The token of `--oauth2-bearer`, or empty.
+  bearer : Vec<u8>,
 
   invariant true,
 }
@@ -127,7 +129,8 @@ pub fn no_credential(u : &Url) -> Credential {
     present : false,
     scope : transfer_scope(u, false),
     user : Vec<u8>::new(),
-    password : Vec<u8>::new()
+    password : Vec<u8>::new(),
+    bearer : Vec<u8>::new()
   };
 }
 
@@ -140,14 +143,16 @@ fn login_of(scope : Scope, login : &Vec<u8>) -> Credential {
       present : true,
       scope : scope,
       user : clone_bytes(login),
-      password : Vec<u8>::new()
+      password : Vec<u8>::new(),
+      bearer : Vec<u8>::new()
     };
   }
   return Credential {
     present : true,
     scope : scope,
     user : range_of(login, 0, colon),
-    password : rest_from(login, colon + 1)
+    password : rest_from(login, colon + 1),
+    bearer : Vec<u8>::new()
   };
 }
 
@@ -157,21 +162,35 @@ fn login_of(scope : Scope, login : &Vec<u8>) -> Credential {
 /// the origin of `u`: they do not follow a redirect to another URL, even with
 /// `--location-trusted` (curl's test 998).
 ///
+/// The token of `--oauth2-bearer` (`bearer` when `has_bearer`) belongs to the transfer as `-u`
+/// does, and with either of them the URL and the `.netrc` give nothing (libcurl's
+/// CREDS_OPTION).
+///
 /// With a `.netrc` (`netrc`), when `-u` does not apply, the entry of the file for the host of
 /// `u` completes the credentials of `u`, or with `--netrc` gives its password instead of the
 /// password of `u` (libcurl's `url_set_data_creds_netrc`). The file gives them for that host,
 /// so they go only to the origin of `u` too. `note` gets libcurl's `-v` line when the file has
 /// nothing for the host.
-pub fn server_credential(scope : &Scope, has_login : bool, login : &Vec<u8>, u : &Url,
-netrc : &Netrc, note : &mut Vec<u8>) -> Result<Credential, Failure> {
-  if has_login && allows(scope, u) {
-    return Result<Credential, Failure>::Ok(login_of(clone_scope(scope), login));
+pub fn server_credential(scope : &Scope, has_login : bool, login : &Vec<u8>, has_bearer : bool,
+bearer : &Vec<u8>, u : &Url, netrc : &Netrc, note : &mut Vec<u8>) -> Result<Credential, Failure> {
+  if (has_login || has_bearer) && allows(scope, u) {
+    let mut c = no_credential(u);
+    if has_login {
+      c = login_of(clone_scope(scope), login);
+    }
+    c.present = true;
+    c.scope = clone_scope(scope);
+    if has_bearer {
+      c.bearer = clone_bytes(bearer);
+    }
+    return Result<Credential, Failure>::Ok(c);
   }
   let from_url = Credential {
     present : u.has_user,
     scope : transfer_scope(u, false),
     user : clone_bytes(&u.user),
-    password : clone_bytes(&u.password)
+    password : clone_bytes(&u.password),
+    bearer : Vec<u8>::new()
   };
   if netrc.mode == NETRC_IGNORED {
     return Result<Credential, Failure>::Ok(from_url);
@@ -202,7 +221,8 @@ netrc : &Netrc, note : &mut Vec<u8>) -> Result<Credential, Failure> {
           present : true,
           scope : transfer_scope(u, false),
           user : user,
-          password : password
+          password : password,
+          bearer : Vec<u8>::new()
         });
       },
       Result<NetrcMatch, i32>::Err(c) => {
@@ -233,7 +253,8 @@ pub fn proxy_credential(proxy : &Url, has_login : bool, login : &Vec<u8>) -> Cre
     present : proxy.has_user,
     scope : transfer_scope(proxy, false),
     user : clone_bytes(&proxy.user),
-    password : clone_bytes(&proxy.password)
+    password : clone_bytes(&proxy.password),
+    bearer : Vec<u8>::new()
   };
 }
 
@@ -242,7 +263,8 @@ pub fn clone_credential(c : &Credential) -> Credential {
     present : c.present,
     scope : clone_scope(&c.scope),
     user : clone_bytes(&c.user),
-    password : clone_bytes(&c.password)
+    password : clone_bytes(&c.password),
+    bearer : clone_bytes(&c.bearer)
   };
 }
 
@@ -354,6 +376,7 @@ pub fn socks5_login_message(c : &Credential, proxy : &Url) -> Result<Vec<u8>, Fa
 const AUTH_NONE : i32 = 0;
 const AUTH_BASIC : i32 = 1;
 const AUTH_DIGEST : i32 = 2;
+const AUTH_BEARER : i32 = 64;
 // `--anyauth`: each method but the old Digest of Internet Explorer.
 const AUTH_ANY : i32 = 2147483631;
 // No method fits: send no credentials.
@@ -841,6 +864,14 @@ from : &Url, problem : &mut bool) -> void {
     if method_at(value, at, "Digest") {
       take_digest(value, at, a, d, &origin, problem);
     }
+    if method_at(value, at, "Bearer") {
+      a.avail = a.avail | AUTH_BEARER;
+      if a.picked == AUTH_BEARER {
+        // The server refused the token.
+        a.avail = AUTH_NONE;
+        *problem = true;
+      }
+    }
     if method_at(value, at, "Basic") {
       a.avail = a.avail | AUTH_BASIC;
       if a.picked == AUTH_BASIC {
@@ -883,12 +914,14 @@ origin : &Vec<u8>, problem : &mut bool) -> void {
   }
 }
 
-/// Pick one method of those that the server offered and the user allows: Digest before Basic,
-/// as libcurl does (`pickoneauth`). False when none fits.
+/// Pick one method of those that the server offered and the user allows: Bearer, then Digest,
+/// then Basic, as libcurl does (`pickoneauth`). False when none fits.
 pub fn pick_one(a : &mut AuthState, has_credentials : bool) -> bool {
   let avail = a.avail & a.want;
   let mut picked = true;
-  if (avail & AUTH_DIGEST) != 0 && has_credentials {
+  if (avail & AUTH_BEARER) != 0 && has_credentials {
+    a.picked = AUTH_BEARER;
+  } else if (avail & AUTH_DIGEST) != 0 && has_credentials {
     a.picked = AUTH_DIGEST;
   } else {
     if (avail & AUTH_BASIC) != 0 && has_credentials {
@@ -940,6 +973,15 @@ uri : &Vec<u8>, custom : bool, method : &Vec<u8>) -> AuthHeader {
     } else {
       a.done = false;
     }
+  }
+  if a.picked == AUTH_BEARER {
+    // `--oauth2-bearer`: the token, as libcurl's `http_output_bearer`.
+    if !custom && c.bearer.len() > 0 {
+      used = true;
+      header.present = true;
+      header.value = lit_then("Bearer ", &c.bearer);
+    }
+    a.done = true;
   }
   if a.picked == AUTH_BASIC {
     if !custom && has_user_or_password(c) {

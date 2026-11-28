@@ -782,7 +782,7 @@ struct Hop {
 /// Send one request for `u` and read its response. The body of the response goes to
 /// `sinks`, unless curl follows the redirect that the response gives.
 fn one_hop(network : &Network, tls : &TlsSettings, cfg : &Config, headers : &Vec<Vec<u8>>, u : &Url,
-req_kind : i32, body : &Vec<u8>, creds : &Credential, scope : &Scope, same_host : bool,
+req_kind : i32, ignore_custom : bool, body : &Vec<u8>, creds : &Credential, scope : &Scope, same_host : bool,
 has_referer : bool,
 referer : &Vec<u8>, deadline : Instant, form_boundary : &Vec<u8>, auth : &mut AuthContext,
 session : &mut Session, console : &mut Console, sinks : &mut Sinks, info : &mut TransferInfo,
@@ -796,7 +796,7 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
     return Result<Hop, Failure>::Err(fail_lit(BAD_FUNCTION_ARGUMENT, "HTTP upload cannot be resumed"));
   }
   let mut method = lit("GET");
-  if cfg.has_method {
+  if cfg.has_method && !ignore_custom {
     method = clone_bytes(&cfg.method);
   } else {
     if req_kind == REQ_POST {
@@ -889,7 +889,9 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
     accept_encoding : cfg.compressed,
     tr_encoding : cfg.tr_encoding,
     timecond : cfg.timecond,
-    timevalue : cfg.condtime
+    timevalue : cfg.condtime,
+    has_target : cfg.has_request_target,
+    target : clone_bytes(&cfg.request_target)
   };
 
   // `--unix-socket` needs no address: `--connect-to` and `--resolve` do not apply to it.
@@ -2008,6 +2010,8 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<i32, Failure> {
   let first_host = clone_bytes(&first.host);
   let mut u = first;
   let mut req_kind = kind;
+  // `--follow` dropped the method of `-X` at a redirect.
+  let mut ignore_custom = false;
   let mut has_referer = cfg.has_referer;
   let mut referer = clone_bytes(&cfg.referer);
   let mut redirects = 0;
@@ -2023,12 +2027,17 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<i32, Failure> {
     let same_host = eq_nocase(&u.host, &first_host) && u.port == first_port
       && eq_nocase(&u.scheme, &first_scheme);
     let mut netrc_note = Vec<u8>::new();
-    let creds = server_credential(&scope, cfg.has_user, &cfg.user, &u, &cfg.netrc,
-      &mut netrc_note)?;
+    if cfg.disallow_username && u.has_user && u.user.len() > 0 {
+      return Result<i32, Failure>::Err(fail_lit(LOGIN_DENIED,
+        "URL rejected: Credentials was passed in the URL when prohibited"));
+    }
+    let creds = server_credential(&scope, cfg.has_user, &cfg.user, cfg.has_bearer, &cfg.bearer,
+      &u, &cfg.netrc, &mut netrc_note)?;
     if netrc_note.len() > 0 && cfg.verbose {
       verbose_info(console, &netrc_note);
     }
-    let hop = one_hop(network, tls, cfg, headers, &u, req_kind, body, &creds, &scope, same_host,
+    let hop = one_hop(network, tls, cfg, headers, &u, req_kind, ignore_custom, body, &creds,
+      &scope, same_host,
       has_referer, &referer, deadline, form_boundary, &mut auth, session, console, sinks,
       info, opener)?;
     if hop.retry && auth_rounds < MAX_AUTH_ROUNDS {
@@ -2057,12 +2066,30 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<i32, Failure> {
     }
     // 301, 302 and 303 turn a POST into a GET, as browsers do. 303 turns a PUT into a GET too.
     // 307 and 308 keep the method and the body.
-    let to_get = hop.status == 301 || hop.status == 302 || hop.status == 303;
-    if req_kind == REQ_POST && to_get {
-      req_kind = REQ_GET;
-    }
-    if req_kind == REQ_PUT && hop.status == 303 {
-      req_kind = REQ_GET;
+    // As libcurl's `follow_switch_get`: a POST becomes a GET after a 301 or a 302, unless
+    // `--post301` or `--post302`, and every request after a 303, unless a POST with
+    // `--post303`. With `--follow`, the method of `-X` goes too; with `-L` it stays.
+    let post = req_kind == REQ_POST;
+    let switch_get = (hop.status == 301 && post && !cfg.post301)
+      || (hop.status == 302 && post && !cfg.post302)
+      || (hop.status == 303 && !(post && cfg.post303));
+    if switch_get {
+      if ((cfg.has_method && !ignore_custom) || req_kind != REQ_GET) && cfg.follow_obeycode {
+        if cfg.verbose {
+          let mut m = lit("Switch to GET because of ");
+          push_i64(&mut m, hop.status as i64);
+          push_lit(&mut m, " response");
+          verbose_info(console, &m);
+        }
+        ignore_custom = true;
+      } else if cfg.has_method && !ignore_custom && cfg.verbose {
+        let mut m = lit_then("Stick to ", &cfg.method);
+        push_lit(&mut m, " instead of GET");
+        verbose_info(console, &m);
+      }
+      if req_kind != REQ_HEAD {
+        req_kind = REQ_GET;
+      }
     }
     if cfg.auto_referer {
       has_referer = true;

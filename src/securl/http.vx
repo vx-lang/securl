@@ -179,6 +179,9 @@ struct RequestInfo {
   // `-z`: the condition (a `TIMECOND_` value of `options.vx`) and its time.
   timecond : i32,
   timevalue : i64,
+  // `--request-target`: the target of the request line, also through a proxy.
+  has_target : bool,
+  target : Vec<u8>,
 }
 
 /// The header of the condition `cond` of `-z`.
@@ -209,12 +212,16 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
   let trusted = allows(&info.scope, u);
   let mut out = clone_bytes(&info.method);
   push_lit(&mut out, " ");
-  if info.via_proxy {
-    append(&mut out, &u.scheme);
-    push_lit(&mut out, "://");
-    append(&mut out, &host_header_value(u));
+  if info.has_target {
+    append(&mut out, &info.target);
+  } else {
+    if info.via_proxy {
+      append(&mut out, &u.scheme);
+      push_lit(&mut out, "://");
+      append(&mut out, &host_header_value(u));
+    }
+    append(&mut out, &u.path);
   }
-  append(&mut out, &u.path);
   if info.http10 {
     push_lit(&mut out, " HTTP/1.0\r\n");
   } else {

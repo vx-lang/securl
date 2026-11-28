@@ -235,6 +235,25 @@ struct Config {
   has_netrc_file : bool,
   netrc_file : Vec<u8>,
   netrc : Netrc,
+  // `--follow`: as `-L`, and a redirect that turns a request into a GET drops `-X`.
+  follow_obeycode : bool,
+  // `--post301`, `--post302` and `--post303`: a POST stays a POST after that redirect.
+  post301 : bool,
+  post302 : bool,
+  post303 : bool,
+  // `--request-target`: the target of the request line instead of the path of the URL.
+  has_request_target : bool,
+  request_target : Vec<u8>,
+  // `--url-query`: the parts of the query that goes after the URL, as `--data-urlencode`
+  // parts, or `+TEXT` as it is.
+  queries : Vec<DataPart>,
+  // `--fail-early`: the first transfer that fails ends the run. A global option.
+  fail_early : bool,
+  // `--disallow-username-in-url`: a URL with a user name is an error.
+  disallow_username : bool,
+  // `--oauth2-bearer`: the token that goes as `Authorization: Bearer`.
+  has_bearer : bool,
+  bearer : Vec<u8>,
 }
 
 /// The conditions of `-z`: none, `If-Modified-Since` (the default), `If-Unmodified-Since` (a
@@ -364,7 +383,18 @@ pub fn default_config() -> Config {
     netrc_optional : false,
     has_netrc_file : false,
     netrc_file : Vec<u8>::new(),
-    netrc : no_netrc()
+    netrc : no_netrc(),
+    follow_obeycode : false,
+    post301 : false,
+    post302 : false,
+    post303 : false,
+    has_request_target : false,
+    request_target : Vec<u8>::new(),
+    queries : Vec<DataPart>::new(),
+    fail_early : false,
+    disallow_username : false,
+    has_bearer : false,
+    bearer : Vec<u8>::new()
   };
 }
 
@@ -483,6 +513,15 @@ const OPT_NETRC_OPTIONAL : i32 = 110;
 const OPT_NETRC_FILE : i32 = 111;
 // `--variable`, which the parser hands to the tool, which reads its file or environment.
 const OPT_VARIABLE : i32 = 112;
+const OPT_POST301 : i32 = 113;
+const OPT_POST302 : i32 = 114;
+const OPT_POST303 : i32 = 115;
+const OPT_FOLLOW : i32 = 116;
+const OPT_REQUEST_TARGET : i32 = 117;
+const OPT_URL_QUERY : i32 = 118;
+const OPT_FAIL_EARLY : i32 = 119;
+const OPT_DISALLOW_USERNAME : i32 = 120;
+const OPT_OAUTH2_BEARER : i32 = 121;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -602,6 +641,15 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "netrc-optional") { return OPT_NETRC_OPTIONAL; }
   if eq_lit(name, "netrc-file") { return OPT_NETRC_FILE; }
   if eq_lit(name, "variable") { return OPT_VARIABLE; }
+  if eq_lit(name, "post301") { return OPT_POST301; }
+  if eq_lit(name, "post302") { return OPT_POST302; }
+  if eq_lit(name, "post303") { return OPT_POST303; }
+  if eq_lit(name, "follow") { return OPT_FOLLOW; }
+  if eq_lit(name, "request-target") { return OPT_REQUEST_TARGET; }
+  if eq_lit(name, "url-query") { return OPT_URL_QUERY; }
+  if eq_lit(name, "fail-early") { return OPT_FAIL_EARLY; }
+  if eq_lit(name, "disallow-username-in-url") { return OPT_DISALLOW_USERNAME; }
+  if eq_lit(name, "oauth2-bearer") { return OPT_OAUTH2_BEARER; }
   return OPT_UNKNOWN;
 }
 
@@ -663,7 +711,8 @@ fn takes_value(id : i32) -> bool {
     || id == OPT_PROXY_CAPATH || id == OPT_LIMIT_RATE || id == OPT_MAX_FILESIZE || id == OPT_CONFIG
     || (id >= OPT_RETRY && id <= OPT_RETRY_MAX_TIME) || id == OPT_CONTINUE_AT
     || id == OPT_UNIX_SOCKET || id == OPT_STDERR || id == OPT_TIME_COND || id == OPT_ETAG_SAVE
-    || id == OPT_ETAG_COMPARE || id == OPT_NETRC_FILE || id == OPT_VARIABLE;
+    || id == OPT_ETAG_COMPARE || id == OPT_NETRC_FILE || id == OPT_VARIABLE
+    || id == OPT_REQUEST_TARGET || id == OPT_URL_QUERY || id == OPT_OAUTH2_BEARER;
 }
 
 /// Whether the value of the option names a file, as curl's `ARG_FILE` options.
@@ -1393,13 +1442,61 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     cfg.head = enable;
     return done();
   }
-  if id == OPT_LOCATION {
+  if id == OPT_LOCATION || id == OPT_FOLLOW {
     cfg.follow = enable;
+    cfg.follow_obeycode = enable && id == OPT_FOLLOW;
     return done();
   }
   if id == OPT_LOCATION_TRUSTED {
     cfg.follow = enable;
+    cfg.follow_obeycode = false;
     cfg.location_trusted = enable;
+    return done();
+  }
+  if id == OPT_POST301 {
+    cfg.post301 = enable;
+    return done();
+  }
+  if id == OPT_POST302 {
+    cfg.post302 = enable;
+    return done();
+  }
+  if id == OPT_POST303 {
+    cfg.post303 = enable;
+    return done();
+  }
+  if id == OPT_REQUEST_TARGET || id == OPT_OAUTH2_BEARER {
+    if value.len() == 0 {
+      return Result<i32, Failure>::Err(option_error(shown,
+        "blank argument where content is expected"));
+    }
+    if id == OPT_REQUEST_TARGET {
+      cfg.has_request_target = true;
+      cfg.request_target = clone_bytes(value);
+    } else {
+      cfg.auth_type = cfg.auth_type | AUTH_BEARER;
+      cfg.has_bearer = true;
+      cfg.bearer = clone_bytes(value);
+    }
+    return done();
+  }
+  if id == OPT_URL_QUERY {
+    // `+TEXT` goes as it is; the rest as `--data-urlencode` takes it.
+    if value.len() > 0 && value.get(0) == 43u8 {
+      cfg.queries.push(DataPart {
+        kind : DATA_RAW,
+        text : rest_from(value, 1)
+      });
+    } else {
+      cfg.queries.push(DataPart {
+        kind : DATA_URLENCODE,
+        text : clone_bytes(value)
+      });
+    }
+    return done();
+  }
+  if id == OPT_DISALLOW_USERNAME {
+    cfg.disallow_username = enable;
     return done();
   }
   if id == OPT_REMOTE_NAME {
@@ -1631,6 +1728,7 @@ struct Globals {
   verbose : bool,
   has_trace : bool,
   trace : Vec<u8>,
+  fail_early : bool,
 }
 
 /// What an option asks of the caller besides the change to the configuration.
@@ -1683,7 +1781,8 @@ pub fn new_arg_parser() -> ArgParser {
       show_error : false,
       verbose : false,
       has_trace : false,
-      trace : Vec<u8>::new()
+      trace : Vec<u8>::new(),
+      fail_early : false
     },
     still_flags : true,
     show_help : false,
@@ -1832,6 +1931,17 @@ impl ArgParser {
       // As curl: the URLs of a file, each as with `-O` and with no globbing.
       step.has_url_file = true;
       step.url_file = rest_from(value, 1);
+      return done();
+    }
+    if (id == OPT_LOCATION || id == OPT_LOCATION_TRUSTED) && self.current.follow
+       && self.current.follow_obeycode {
+      self.warn(lit("--location overrides --follow"));
+    }
+    if id == OPT_FOLLOW && self.current.follow && !self.current.follow_obeycode {
+      self.warn(lit("--follow overrides --location"));
+    }
+    if id == OPT_FAIL_EARLY {
+      self.globals.fail_early = enable;
       return done();
     }
     let _applied = apply(&mut self.current, id, value, enable, shown)?;
@@ -2122,6 +2232,7 @@ impl ArgParser {
       g.verbose = self.globals.verbose;
       g.has_trace = self.globals.has_trace;
       g.trace = clone_bytes(&self.globals.trace);
+      g.fail_early = self.globals.fail_early;
       g.show_help = self.show_help;
       g.show_version = self.show_version;
       g.show_manual = self.show_manual;

@@ -1029,7 +1029,7 @@ groups : &Vec<Config>) -> i32 {
     if session.transfers > before || group_code != 0 {
       code = group_code;
     }
-    if group_code == FAILED_INIT {
+    if group_code == FAILED_INIT || (cfg.fail_early && group_code != 0) {
       break;
     }
   }
@@ -1042,18 +1042,13 @@ groups : &Vec<Config>) -> i32 {
   return code;
 }
 
-/// Run the transfers of one group of the command line, and give the exit code of the last one.
-fn run_group(network : &Network, files : &Files, stdin : &mut Stdin, console : &mut Console,
-cfg : &Config, session : &mut Session) -> i32 {
-  if !has_url(cfg) {
-    console.to_stderr(&lit("curl: (2) no URL specified\ncurl: try 'curl --help' for more information\n"));
-    return FAILED_INIT;
-  }
-
-  // Read each file that a data option names. curl warns and sends nothing for a file that it
-  // cannot read.
+/// The content of each file that a part of `parts` names (`-d @FILE`, `--data-urlencode
+/// NAME@FILE`), or empty for a part without one. curl warns about a file that it cannot read,
+/// and sends nothing for it.
+fn read_data_files(files : &Files, stdin : &mut Stdin, console : &mut Console, cfg : &Config,
+parts : &Vec<DataPart>) -> Vec<Vec<u8>> {
   let mut contents = Vec<Vec<u8>>::new();
-  for part in cfg.data.iter() {
+  for part in parts.iter() {
     match data_file_name(part) {
       Option<Vec<u8>>::Some(name) => {
         match read_file(files, stdin, &name) {
@@ -1074,6 +1069,22 @@ cfg : &Config, session : &mut Session) -> i32 {
       }
     }
   }
+  return contents;
+}
+
+/// Run the transfers of one group of the command line, and give the exit code of the last one.
+fn run_group(network : &Network, files : &Files, stdin : &mut Stdin, console : &mut Console,
+cfg : &Config, session : &mut Session) -> i32 {
+  if !has_url(cfg) {
+    console.to_stderr(&lit("curl: (2) no URL specified\ncurl: try 'curl --help' for more information\n"));
+    return FAILED_INIT;
+  }
+
+  // Read each file that a data option names. curl warns and sends nothing for a file that it
+  // cannot read. `--url-query` parts read files as `--data-urlencode` does.
+  let contents = read_data_files(files, stdin, console, cfg, &cfg.data);
+  let query_contents = read_data_files(files, stdin, console, cfg, &cfg.queries);
+  let query = build_body(&cfg.queries, &query_contents);
   let mut request_body = build_body(&cfg.data, &contents);
 
   // A form (`-F`): read the files of its fields, and make the multipart body.
@@ -1214,7 +1225,7 @@ cfg : &Config, session : &mut Session) -> i32 {
             proxy : p
           };
           let code = run_all(network, files, stdin, console, &settings, cfg, &headers,
-            &request_body, other_kind, &form_boundary, session, hsts_too_long);
+            &request_body, &query, other_kind, &form_boundary, session, hsts_too_long);
           save_jar(console, files, cfg, &mut session.jar);
           save_hsts(files, cfg, &session.hsts);
           return code;
@@ -1314,7 +1325,7 @@ fn effective_url(text : &Vec<u8>, path_as_is : bool) -> Vec<u8> {
 /// Run the transfer of each URL, and give the exit code of the last one.
 fn run_all(network : &Network, files : &Files, stdin : &mut Stdin, console : &mut Console,
 tls : &TlsSettings, cfg : &Config, headers : &Vec<Vec<u8>>, request_body : &Vec<u8>,
-other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first : bool) -> i32 {
+query : &Vec<u8>, other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first : bool) -> i32 {
   // As curl's `create_transfer`: for each URL node, each upload file of its `-T` glob, and for
   // each of those, each URL of its URL glob, the last glob changing fastest.
   let mut exit_code = 0;
@@ -1390,11 +1401,12 @@ other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first :
         }
         url_round = url_round + 1;
         let step = run_url(network, files, stdin, console, tls, cfg, headers, request_body,
-          other_kind, form_boundary, session, first && fail_first, node, &url_text, uploads,
-          &upload_name, &url_glob, &up_glob);
+          query, other_kind, form_boundary, session, first && fail_first, node, &url_text,
+          uploads, &upload_name, &url_glob, &up_glob);
         first = false;
         exit_code = step.code;
-        if step.stop {
+        // `--fail-early`: the first transfer that fails ends the run.
+        if step.stop || (cfg.fail_early && exit_code != 0) {
           return exit_code;
         }
       }
@@ -1433,6 +1445,30 @@ fn etag_compare_header(console : &mut Console, files : &Files, cfg : &Config) ->
   return lit_then("If-None-Match: ", &etag);
 }
 
+/// `q` with the hex digits of each `%XX` in upper case, as libcurl's `curl_url_set` writes a
+/// query that it appends (`url_uppercasehex_part`).
+fn upper_hex_escapes(q : &Vec<u8>) -> Vec<u8> {
+  let mut out = clone_bytes(q);
+  let mut i = 0;
+  while i + 2 < out.len() {
+    if out.get(i) == 37u8 && hex_value(out.get(i + 1)) >= 0 && hex_value(out.get(i + 2)) >= 0 {
+      out[i + 1] = ascii_upper(out.get(i + 1));
+      out[i + 2] = ascii_upper(out.get(i + 2));
+      i = i + 3;
+    } else {
+      i = i + 1;
+    }
+  }
+  return out;
+}
+
+fn ascii_upper(b : u8) -> u8 {
+  if b >= 97u8 && b <= 122u8 {
+    return b - 32u8;
+  }
+  return b;
+}
+
 /// What one transfer gave: its exit code, and whether the run stops there.
 struct UrlStep {
   code : i32,
@@ -1444,7 +1480,7 @@ struct UrlStep {
 /// the upload now, for the `#1` and `#<name>` of `-o`.
 fn run_url(network : &Network, files : &Files, stdin : &mut Stdin, console : &mut Console,
 tls : &TlsSettings, cfg : &Config, headers : &Vec<Vec<u8>>, request_body : &Vec<u8>,
-other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first : bool,
+query : &Vec<u8>, other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first : bool,
 node : &UrlNode, url : &Vec<u8>, uploads : bool, upload_name : &Vec<u8>, url_glob : &Glob,
 up_glob : &Glob) -> UrlStep {
   // As curl's `setup_etag_files`: the ETag of `--etag-compare` goes as an `If-None-Match`
@@ -1535,13 +1571,19 @@ up_glob : &Glob) -> UrlStep {
     }
     url_text = upload_url(&url_text, upload_name);
   }
-  if cfg.get_data && cfg.data.len() > 0 {
+  // The query of `-G`, or else of `--url-query`, as curl's `httpgetfields`.
+  let get_data = cfg.get_data && cfg.data.len() > 0;
+  if get_data || cfg.queries.len() > 0 {
     if find_byte(&url_text, 63u8, 0) >= 0 {
       url_text.push(38u8);
     } else {
       url_text.push(63u8);
     }
-    append(&mut url_text, request_body);
+    if get_data {
+      append(&mut url_text, &upper_hex_escapes(request_body));
+    } else {
+      append(&mut url_text, &upper_hex_escapes(query));
+    }
   }
 
   let mut info = new_info();

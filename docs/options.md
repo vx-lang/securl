@@ -15,7 +15,9 @@ securl takes these options of curl, with curl's syntax, messages and exit codes:
 `--tcp-nodelay` `--limit-rate` `--max-filesize` `--remove-on-error` `--next` `-K` `--stderr`
 `--retry` `--retry-delay` `--retry-max-time` `--retry-connrefused` `--retry-all-errors` `-C`
 `-J` `-M` `-h` `-V` `-q` `--trace-ascii` `--trace-time` `-z` `--etag-save` `--etag-compare` `-n`
-`--netrc-optional` `--netrc-file` `--variable` and `--expand-` before any option with a value.
+`--netrc-optional` `--netrc-file` `--variable` and `--expand-` before any option with a value, `--follow` `--post301` `--post302`
+`--post303` `--request-target` `--url-query` `--fail-early` `--disallow-username-in-url`
+`--oauth2-bearer`.
 
 ## Notes
 
@@ -28,6 +30,7 @@ securl takes these options of curl, with curl's syntax, messages and exit codes:
 - **`--retry` and `-C`:** curl's retry rules and waits, and its resume checks.
 - **`-z`:** takes a date. With a file name, securl drops the condition with a warning, because
   Vx's `std::fs` cannot read the time of a file yet.
+- **`--oauth2-bearer`:** the token goes where `-u` may go, and stops the `.netrc` as `-u` does.
 - **`.netrc`:** the entry for each host of a transfer, also after a redirect, goes only to
   that host, as in curl.
 - **`--variable`:** `NAME=TEXT`, `NAME@FILE`, `%ENV` and byte ranges, and the functions

@@ -48,6 +48,7 @@ const GOT_NOTHING : i32 = 52;
 const SEND_ERROR : i32 = 55;
 const RECV_ERROR : i32 = 56;
 const BAD_CONTENT_ENCODING : i32 = 61;
+const LOGIN_DENIED : i32 = 67;
 const FILESIZE_EXCEEDED : i32 = 63;
 const RANGE_ERROR : i32 = 33;
 const BAD_FUNCTION_ARGUMENT : i32 = 43;
