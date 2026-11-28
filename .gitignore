@@ -1,3 +1,7 @@
 build/
 config.mk
 __pycache__/
+# The seeds of the fuzz targets are seedN. libFuzzer adds the inputs it finds to the folder it
+# runs on (tools/run-fuzzers.sh gives it a copy in build/fuzz), and those stay out.
+tests/fuzz/corpus/*/*
+!tests/fuzz/corpus/*/seed*
