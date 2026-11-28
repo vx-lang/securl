@@ -1,5 +1,10 @@
 # Changes
 
+## Unreleased
+
+- **Conditional requests:** `-z` with a date, `--etag-save` and `--etag-compare`, as in curl. A
+  304 never makes an output file. 624 of 762 curl tests pass.
+
 ## 0.1.0 (2026-11-27)
 
 The first release: the curl tool, rewritten in Vx, for HTTP/1.1, HTTP/2 and HTTPS.

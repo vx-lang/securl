@@ -120,6 +120,44 @@ pub fn read_path(files : &Files, name : &Vec<u8>) -> Result<Vec<u8>, Failure> {
   }
 }
 
+/// Why the file `name` does not open for reading, as the C library's `strerror` says it, for
+/// curl's "Failed to open" warnings. Empty when it opens.
+pub fn open_error_text(files : &Files, name : &Vec<u8>) -> Vec<u8> {
+  match path_string(name) {
+    Option<String>::Some(path) => {
+      match File::open(files, &path, OpenMode::Read()) {
+        Result<File, FileError>::Ok(_f) => {
+          return Vec<u8>::new();
+        },
+        Result<File, FileError>::Err(e) => {
+          match e {
+            FileError::NotFound() => {
+              return lit("No such file or directory");
+            },
+            FileError::PermissionDenied() => {
+              return lit("Permission denied");
+            },
+            FileError::Os(code) => {
+              if code == 21 {
+                return lit("Is a directory");
+              }
+              let mut m = lit("Unknown error ");
+              push_i64(&mut m, code as i64);
+              return m;
+            },
+            _ => {
+              return lit("Invalid argument");
+            }
+          }
+        }
+      }
+    },
+    Option<String>::None() => {
+      return lit("Invalid argument");
+    }
+  }
+}
+
 /// Make the file `name`, or make an existing one empty, for writing.
 pub fn create_file(files : &Files, name : &Vec<u8>) -> Result<File, Failure> {
   let mut m = lit("Failed to open the file ");

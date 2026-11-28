@@ -412,14 +412,29 @@ fn push_two(out : &mut Vec<u8>, v : i64) -> void {
   push_i64(out, v);
 }
 
-/// The time `t`, in seconds since 1970, in UTC as libcurl writes it to an HSTS file:
-/// `YYYYMMDD hh:mm:ss`.
-pub fn compact_date(t : i64) -> Vec<u8> {
+/// A time in UTC as the parts of its date.
+struct Civil {
+  year : i64,
+  month : i64,
+  day : i64,
+  // The seconds since midnight.
+  secs : i64,
+  // The day of the week: 0 is Sunday.
+  wday : i64,
+}
+
+/// The date of the time `t`, in seconds since 1970, in UTC.
+fn civil_of(t : i64) -> Civil {
   let mut days = t / 86400i64;
   let mut secs = t % 86400i64;
   if secs < 0i64 {
     secs = secs + 86400i64;
     days = days - 1i64;
+  }
+  // 1 January 1970 was a Thursday.
+  let mut wday = (days + 4i64) % 7i64;
+  if wday < 0i64 {
+    wday = wday + 7i64;
   }
   // The civil date of a day number, by Howard Hinnant's method.
   let z = days + 719468i64;
@@ -440,15 +455,61 @@ pub fn compact_date(t : i64) -> Vec<u8> {
   if month <= 2i64 {
     year = year + 1i64;
   }
+  return Civil {
+    year : year,
+    month : month,
+    day : day,
+    secs : secs,
+    wday : wday
+  };
+}
+
+fn push_clock(out : &mut Vec<u8>, secs : i64) -> void {
+  push_two(out, secs / 3600i64);
+  out.push(58u8);
+  push_two(out, (secs / 60i64) % 60i64);
+  out.push(58u8);
+  push_two(out, secs % 60i64);
+}
+
+/// The time `t`, in seconds since 1970, in UTC as libcurl writes it to an HSTS file:
+/// `YYYYMMDD hh:mm:ss`.
+pub fn compact_date(t : i64) -> Vec<u8> {
+  let c = civil_of(t);
   let mut out = Vec<u8>::new();
-  push_i64(&mut out, year);
-  push_two(&mut out, month);
-  push_two(&mut out, day);
+  push_i64(&mut out, c.year);
+  push_two(&mut out, c.month);
+  push_two(&mut out, c.day);
   out.push(32u8);
-  push_two(&mut out, secs / 3600i64);
-  out.push(58u8);
-  push_two(&mut out, (secs / 60i64) % 60i64);
-  out.push(58u8);
-  push_two(&mut out, secs % 60i64);
+  push_clock(&mut out, c.secs);
+  return out;
+}
+
+/// The time `t`, in seconds since 1970, as libcurl writes it in an `If-Modified-Since` header:
+/// `Sun, 12 Dec 1999 11:00:00 GMT`.
+pub fn http_date(t : i64) -> Vec<u8> {
+  let c = civil_of(t);
+  let days = lit("SunMonTueWedThuFriSat");
+  let months = lit("JanFebMarAprMayJunJulAugSepOctNovDec");
+  let mut out = Vec<u8>::new();
+  append_range(&mut out, &days, (c.wday * 3i64) as i32, (c.wday * 3i64 + 3i64) as i32);
+  push_lit(&mut out, ", ");
+  push_two(&mut out, c.day);
+  out.push(32u8);
+  append_range(&mut out, &months, ((c.month - 1i64) * 3i64) as i32,
+    ((c.month - 1i64) * 3i64 + 3i64) as i32);
+  out.push(32u8);
+  // curl's `%4d`.
+  let mut year = Vec<u8>::new();
+  push_i64(&mut year, c.year);
+  let mut width = year.len();
+  while width < 4 {
+    out.push(32u8);
+    width = width + 1;
+  }
+  append(&mut out, &year);
+  out.push(32u8);
+  push_clock(&mut out, c.secs);
+  push_lit(&mut out, " GMT");
   return out;
 }

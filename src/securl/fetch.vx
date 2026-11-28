@@ -168,6 +168,9 @@ struct Session {
   jar : CookieJar,
   hsts : Hsts,
   pool : Pool,
+  // How many transfers the run started. `--etag-save` skips a transfer whose file it cannot
+  // make, and curl's "no transfer performed" is for a run that started none.
+  transfers : i32,
 }
 
 /// Where the bytes of one transfer go.
@@ -179,14 +182,21 @@ struct Sinks {
   resume_from : i64,
   // The upload of `-T` comes from standard input, so its length is not known before.
   upload_from_stdin : bool,
+  // `--etag-save`: take the ETag of each 2xx and 3xx response. To standard output it goes at
+  // once; for a file, the tool writes the last one when the transfer ends.
+  save_etag : bool,
+  etag_to_stdout : bool,
+  has_etag : bool,
+  etag : Vec<u8>,
 }
 
 /// Write the header lines `raw` to the output when `to_body` (`-i`), and to the file of `-D`.
-/// When both get them, curl writes each line to the one and then to the other, which shows
-/// when both are standard output.
-fn write_head(console : &mut Console, sinks : &mut Sinks, to_body : bool, raw : &Vec<u8>)
--> Result<i32, Failure> {
-  if !to_body || !sinks.has_headers {
+/// With `etags`, take the ETag of the lines for `--etag-save`. As curl's header callback, each
+/// line goes to `-D`, then to the ETag, then to `-i`, which shows when they share standard
+/// output.
+fn write_head(console : &mut Console, sinks : &mut Sinks, to_body : bool, raw : &Vec<u8>,
+etags : bool) -> Result<i32, Failure> {
+  if !etags && (!to_body || !sinks.has_headers) {
     if to_body {
       let _w = sinks.body.write(console, raw)?;
     }
@@ -202,11 +212,67 @@ fn write_head(console : &mut Console, sinks : &mut Sinks, to_body : bool, raw : 
       end = raw.len() - 1;
     }
     let line = range_of(raw, start, end + 1);
-    let _b = sinks.body.write(console, &line)?;
-    let _h = sinks.headers.write(console, &line)?;
+    if sinks.has_headers {
+      let _h = sinks.headers.write(console, &line)?;
+    }
+    if etags {
+      take_etag(console, sinks, &line);
+    }
+    if to_body {
+      let _b = sinks.body.write(console, &line)?;
+    }
     start = end + 1;
   }
   return Result<i32, Failure>::Ok(0);
+}
+
+/// The ETag of the header line `line` for `--etag-save`, as curl's `save_etag`: a line that
+/// starts with `etag:` and ends with a newline gives its value without the blanks around it.
+fn take_etag(console : &mut Console, sinks : &mut Sinks, line : &Vec<u8>) -> void {
+  if line.len() < 6 || line.get(line.len() - 1) != 10u8
+     || !eq_lit_nocase(&range_of(line, 0, 5), "etag:") {
+    return;
+  }
+  let mut start = 5;
+  let mut end = line.len() - 1;
+  while start < end && (line.get(start) == 32u8 || line.get(start) == 9u8) {
+    start = start + 1;
+  }
+  // curl's ISSPACE: a space, or a byte from tab to carriage return.
+  while end >= start && (line.get(end) == 32u8 || (line.get(end) >= 9u8 && line.get(end) <= 13u8)) {
+    end = end - 1;
+  }
+  if end < start {
+    return;
+  }
+  let value = range_of(line, start, end + 1);
+  if sinks.etag_to_stdout {
+    let mut text = clone_bytes(&value);
+    text.push(10u8);
+    let _ok = console.to_stdout(&text);
+    return;
+  }
+  sinks.has_etag = true;
+  sinks.etag = value;
+}
+
+/// The time of the Last-Modified header of `headers` (the last one), or 0 when there is none
+/// or libcurl cannot read its date.
+fn last_modified_of(headers : &Vec<Vec<u8>>) -> i64 {
+  let mut t = 0i64;
+  for line in headers.iter() {
+    let colon = find_byte(line, 58u8, 0);
+    if colon > 0 && eq_lit_nocase(&range_of(line, 0, colon), "Last-Modified") {
+      t = 0i64;
+      match parse_date(&trim_blanks(&rest_from(line, colon + 1))) {
+        Option<i64>::Some(v) => {
+          t = v;
+        },
+        Option<i64>::None() => {}
+      }
+    }
+  }
+  return t;
 }
 
 /// Write `bytes` to standard error with `prefix` before each line, for `-v`.
@@ -821,7 +887,9 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
     form_boundary : form_text(req_kind, form_boundary),
     h2 : false,
     accept_encoding : cfg.compressed,
-    tr_encoding : cfg.tr_encoding
+    tr_encoding : cfg.tr_encoding,
+    timecond : cfg.timecond,
+    timevalue : cfg.condtime
   };
 
   // `--unix-socket` needs no address: `--connect-to` and `--resolve` do not apply to it.
@@ -868,7 +936,7 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
     if cfg.verbose {
       verbose_lines(console, "< ", &head.raw);
     }
-    let _w = write_head(console, sinks, cfg.include, &head.raw)?;
+    let _w = write_head(console, sinks, cfg.include, &head.raw, false)?;
     head = next_head(&mut c, &mut h2, use_h2, cfg.raw, cfg.tr_encoding,
       &mut info.size_header_total, true)?;
     set_cookies = take_cookies(&mut session.jar, &head, &cookie_host, &cookie_path,
@@ -952,7 +1020,8 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
     && auth_should_fail(head.status, cfg.fail || cfg.fail_with_body, allowed, proxy_allowed,
     auth.problem);
   // As libcurl, the head goes to the output before `-f` fails, for `-i` and `-D`.
-  let _w = write_head(console, sinks, cfg.include || cfg.head, &head.raw)?;
+  let etags = sinks.save_etag && head.status >= 200 && head.status < 400;
+  let _w = write_head(console, sinks, cfg.include || cfg.head, &head.raw, etags)?;
   if failed && !cfg.fail_with_body {
     return Result<Hop, Failure>::Err(http_error(head.status));
   }
@@ -966,6 +1035,36 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
   // The same goes for a response to a request that goes again for authentication.
   let again = follow || retry;
   let mut skip_body = again && (head.close || unknown_end);
+  // `-z`: as libcurl's `http_firstwrite`, the body of a final response whose Last-Modified
+  // does not meet the condition does not come, and the response counts as a 304. Not when a
+  // range is asked for, nor for a 204 or a 304, whose Last-Modified libcurl does not read.
+  let mut unmet = false;
+  if cfg.timecond != TIMECOND_NONE && !again && !failed && !cfg.has_range && resume == 0i64
+     && head.status != 204 && head.status != 304 {
+    let doc = last_modified_of(&head.headers);
+    if doc != 0i64 && cfg.condtime != 0i64 {
+      if cfg.timecond == TIMECOND_IFUNMODSINCE {
+        if doc >= cfg.condtime {
+          unmet = true;
+          if cfg.verbose {
+            verbose_info(console, &lit("The requested document is not old enough"));
+          }
+        }
+      } else if doc <= cfg.condtime {
+        unmet = true;
+        if cfg.verbose {
+          verbose_info(console, &lit("The requested document is not new enough"));
+        }
+      }
+    }
+    if unmet {
+      if cfg.verbose {
+        verbose_info(console, &lit("Simulate an HTTP 304 response"));
+      }
+      info.http_code = 304;
+      skip_body = true;
+    }
+  }
   if resumed_get && !again && !has_no_body(head.status, req_kind) {
     let get_everything = range.other && head.status < 300;
     if head.status == 416 {
@@ -981,7 +1080,8 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
       }
     }
   }
-  if !again && sinks.body.is_pending() {
+  // A 304, from the server or from `-z`, makes no output file, as curl's unmet condition.
+  if !again && sinks.body.is_pending() && info.http_code != 304 {
     // The response that the output is for: the tool opens the file now, as curl does when the
     // body starts, with the name that a Content-Disposition or a Location gave for `-J`.
     let file = opener(&info.header_name, info.has_header_name)?;
@@ -1012,7 +1112,7 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
     }
   }
   if trailers.len() > 0 {
-    let _w = write_head(console, sinks, cfg.include, &trailers)?;
+    let _w = write_head(console, sinks, cfg.include, &trailers, false)?;
   }
   if failed {
     return Result<Hop, Failure>::Err(http_error(head.status));
@@ -1021,7 +1121,8 @@ opener : |&Vec<u8>, bool| -> Result<File, Failure>) -> Result<Hop, Failure> {
   // said, and the server does not close the connection after it. securl keeps no HTTP/2
   // connection yet.
   let ended = has_no_body(head.status, req_kind) || !skip_body;
-  let keep = !use_h2 && ended && !closes_after(&head, via_proxy) && c.is_idle();
+  // libcurl closes the connection of a response that `-z` stopped.
+  let keep = !use_h2 && ended && !unmet && !closes_after(&head, via_proxy) && c.is_idle();
   if cfg.verbose {
     if keep || use_h2 {
       let mut m = lit("Connection #");
@@ -1813,7 +1914,7 @@ console : &mut Console, sinks : &mut Sinks) -> Result<i32, Failure> {
   info.size_header = info.size_header + (head.raw.len() as i64);
   info.http_connect = head.status;
   if !cfg.suppress_connect_headers {
-    let _w = write_head(console, sinks, cfg.include, &head.raw)?;
+    let _w = write_head(console, sinks, cfg.include, &head.raw, false)?;
   }
   if head.status == 407 {
     // libcurl reads the body of a 407 before it gives up, so that the connection could take

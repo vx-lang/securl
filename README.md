@@ -28,8 +28,8 @@ You also need a C compiler and Perl. For a vxc built from source, set `VXC`, `VX
 
 | Tests | Passed |
 |---|---|
-| curl's HTTP tests, from curl 2f5c657 (`make test`) | 599 of 762 |
-| The ones that use only options securl has (`make test-supported`) | 539 of 569 |
+| curl's HTTP tests, from curl 2f5c657 (`make test`) | 624 of 762 |
+| The ones that use only options securl has (`make test-supported`) | 561 of 592 |
 | TLS, proxy and limit tests (`make test-tls`) | 290 of 290 |
 | HTTP/2 tests (`make test-h2`) | 32 of 32 |
 | Unit tests (`make unit`) | 13 of 13 |

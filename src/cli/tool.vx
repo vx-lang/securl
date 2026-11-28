@@ -147,6 +147,9 @@ pub fn tool_main(root : Root, command_line : Vec<String>) -> i32 {
   for cfg in groups.iter_mut() {
     cfg.proxy_env = clone_env(&env_vars);
     cfg.columns = columns;
+    if cfg.has_time_cond_file {
+      time_of_file(&mut console, &root.files, cfg);
+    }
   }
   // As curl does while it reads the command line: a `--cacert` or `--proxy-cacert` file must
   // exist.
@@ -158,6 +161,27 @@ pub fn tool_main(root : Root, command_line : Vec<String>) -> i32 {
     }
   }
   return run(&root.network, &root.files, &mut stdin, &mut console, &groups);
+}
+
+/// `-z` with a value that is no date: curl takes the time of the file of that name, and drops
+/// the condition with a warning when there is no such file. Vx's `std::fs` cannot read the
+/// time of a file yet, so securl drops the condition for a file too, and says so.
+fn time_of_file(console : &mut Console, files : &Files, cfg : &mut Config) -> void {
+  if !cfg.silent {
+    if file_exists(files, &cfg.time_cond_file) {
+      console.to_stderr(&message_lines("Warning: ",
+        &lit_then("securl cannot read the time of a file yet. Disabling time condition: ",
+        &cfg.time_cond_file), cfg.columns));
+    } else {
+      // curl's `getfiletime` warns first, with the reason of its `stat`.
+      console.to_stderr(&message_lines("Warning: ",
+        &lit_then("Failed to get filetime: ", &open_error_text(files, &cfg.time_cond_file)),
+        cfg.columns));
+      console.to_stderr(&message_lines("Warning: ", &lit("Illegal date format for -z, --time-cond (and not a filename). Disabling time condition. See curl_getdate(3) for valid date syntax."), cfg.columns));
+    }
+  }
+  cfg.timecond = TIMECOND_NONE;
+  cfg.has_time_cond_file = false;
 }
 
 fn clone_env(vars : &Vec<EnvVar>) -> Vec<EnvVar> {
@@ -805,14 +829,26 @@ groups : &Vec<Config>) -> i32 {
   let mut session = Session {
     jar : new_jar(false),
     hsts : new_hsts(false),
-    pool : new_pool()
+    pool : new_pool(),
+    transfers : 0
   };
   let mut code = 0;
   for cfg in groups.iter() {
-    code = run_group(network, files, stdin, console, cfg, &mut session);
-    if code == FAILED_INIT {
+    let before = session.transfers;
+    let group_code = run_group(network, files, stdin, console, cfg, &mut session);
+    // A group whose transfers `--etag-save` skipped leaves the exit code as it was.
+    if session.transfers > before || group_code != 0 {
+      code = group_code;
+    }
+    if group_code == FAILED_INIT {
       break;
     }
+  }
+  if session.transfers == 0 && code == 0 {
+    if !first.silent || first.show_error {
+      console.to_stderr(&lit("curl: no transfer performed\n"));
+    }
+    return READ_ERROR;
   }
   return code;
 }
@@ -1178,6 +1214,36 @@ other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first :
   return exit_code;
 }
 
+/// The `If-None-Match` header of `--etag-compare`: the ETag in its file without the line ends,
+/// as curl's `file2string`, or `""` when the file is empty or does not open, after curl's
+/// warning.
+fn etag_compare_header(console : &mut Console, files : &Files, cfg : &Config) -> Vec<u8> {
+  let mut etag = Vec<u8>::new();
+  match read_path(files, &cfg.etag_compare) {
+    Result<Vec<u8>, Failure>::Ok(bytes) => {
+      for b in bytes.iter() {
+        if *b != 13u8 && *b != 10u8 {
+          etag.push(*b);
+        }
+      }
+    },
+    Result<Vec<u8>, Failure>::Err(_f) => {
+      let reason = open_error_text(files, &cfg.etag_compare);
+      if reason.len() > 0 && !cfg.silent {
+        let mut m = lit("Failed to open ");
+        append(&mut m, &cfg.etag_compare);
+        push_lit(&mut m, ": ");
+        append(&mut m, &reason);
+        console.to_stderr(&message_lines("Warning: ", &m, cfg.columns));
+      }
+    }
+  }
+  if etag.len() == 0 {
+    return lit("If-None-Match: \"\"");
+  }
+  return lit_then("If-None-Match: ", &etag);
+}
+
 /// What one transfer gave: its exit code, and whether the run stops there.
 struct UrlStep {
   code : i32,
@@ -1192,6 +1258,31 @@ tls : &TlsSettings, cfg : &Config, headers : &Vec<Vec<u8>>, request_body : &Vec<
 other_kind : i32, form_boundary : &Vec<u8>, session : &mut Session, fail_first : bool,
 node : &UrlNode, url : &Vec<u8>, uploads : bool, upload_name : &Vec<u8>, url_glob : &Glob,
 up_glob : &Glob) -> UrlStep {
+  // As curl's `setup_etag_files`: the ETag of `--etag-compare` goes as an `If-None-Match`
+  // header after the `-H` headers, and the file of `--etag-save` must open, or the transfer
+  // and the rest of its group do not happen.
+  let mut url_headers = clone_lines(headers);
+  if cfg.has_etag_compare {
+    url_headers.push(etag_compare_header(console, files, cfg));
+  }
+  if cfg.has_etag_save && !eq_lit(&cfg.etag_save, "-") {
+    match open_to_append(files, &cfg.etag_save) {
+      Result<File, Failure>::Ok(_f) => {},
+      Result<File, Failure>::Err(_e) => {
+        if !cfg.silent {
+          let mut m = lit("Failed creating file for saving etags: \"");
+          append(&mut m, &cfg.etag_save);
+          push_lit(&mut m, "\". Skip this transfer");
+          console.to_stderr(&message_lines("Warning: ", &m, cfg.columns));
+        }
+        return UrlStep {
+          code : 0,
+          stop : true
+        };
+      }
+    }
+  }
+  session.transfers = session.transfers + 1;
   // The output, from the URL before the upload name and the data of `-G` go into it, as curl's
   // `setup_outfile` comes first.
   let mut out_name = clone_bytes(&node.out);
@@ -1289,11 +1380,13 @@ up_glob : &Glob) -> UrlStep {
       result = Result<i32, Failure>::Err(fail_lit(TOO_LARGE,
         "A value or data field grew larger than allowed"));
     } else if this_kind == REQ_PUT {
-      result = transfer_one(network, files, console, tls, cfg, headers, &url_text, &upload_body,
-        this_kind, form_boundary, session, &plan, from_stdin, &mut info, &mut state);
+      result = transfer_one(network, files, console, tls, cfg, &url_headers, &url_text,
+        &upload_body, this_kind, form_boundary, session, &plan, from_stdin, &mut info,
+        &mut state);
     } else {
-      result = transfer_one(network, files, console, tls, cfg, headers, &url_text, request_body,
-        this_kind, form_boundary, session, &plan, from_stdin, &mut info, &mut state);
+      result = transfer_one(network, files, console, tls, cfg, &url_headers, &url_text,
+        request_body, this_kind, form_boundary, session, &plan, from_stdin, &mut info,
+        &mut state);
     }
     created = created || state.created;
     match result {
@@ -1418,7 +1511,11 @@ state : &mut OutputState) -> Result<i32, Failure> {
     headers : header_output,
     has_headers : cfg.has_dump_header,
     resume_from : state.resume,
-    upload_from_stdin : upload_from_stdin
+    upload_from_stdin : upload_from_stdin,
+    save_etag : cfg.has_etag_save,
+    etag_to_stdout : eq_lit(&cfg.etag_save, "-"),
+    has_etag : false,
+    etag : Vec<u8>::new()
   };
   // The right to open this one output file, which is all of the file right that the transfer
   // gets.
@@ -1442,6 +1539,13 @@ state : &mut OutputState) -> Result<i32, Failure> {
         }
       }
     }
+  }
+  if sinks.has_etag {
+    // The last ETag of the transfer replaces what the file of `--etag-save` had, as curl
+    // empties it for each one.
+    let mut text = clone_bytes(&sinks.etag);
+    text.push(10u8);
+    let _w = append_to_file(files, &cfg.etag_save, false, &text);
   }
   if state.warning.len() > 0 && !cfg.silent {
     console.to_stderr(&message_lines("Warning: ", &state.warning, cfg.columns));

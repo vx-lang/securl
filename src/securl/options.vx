@@ -10,6 +10,7 @@ import std::vec;
 import sys::text;
 import securl::auth;
 import securl::bytes;
+import securl::date;
 import securl::failure;
 import securl::socks;
 
@@ -212,7 +213,28 @@ struct Config {
   // The proxy variables of the environment that are set, such as `https_proxy`. The tool
   // reads them. This package gets their values, and not the right to read the environment.
   proxy_env : Vec<EnvVar>,
+  // `-z`: the condition (a `TIMECOND_` value) and its time in seconds since 1970. When the
+  // value is no date, curl takes the time of the file of that name, which the tool reads:
+  // `time_cond_file` is that name.
+  timecond : i32,
+  condtime : i64,
+  has_time_cond_file : bool,
+  time_cond_file : Vec<u8>,
+  // `--etag-save` and `--etag-compare`, which work on a single URL only.
+  has_etag_save : bool,
+  etag_save : Vec<u8>,
+  has_etag_compare : bool,
+  etag_compare : Vec<u8>,
+  // How many URLs the group has, for that check.
+  num_urls : i32,
 }
+
+/// The conditions of `-z`: none, `If-Modified-Since` (the default), `If-Unmodified-Since` (a
+/// value that starts with `-`) and `Last-Modified` (with `=`).
+const TIMECOND_NONE : i32 = 0;
+const TIMECOND_IFMODSINCE : i32 = 1;
+const TIMECOND_IFUNMODSINCE : i32 = 2;
+const TIMECOND_LASTMOD : i32 = 3;
 
 /// A `Config` with curl's defaults.
 pub fn default_config() -> Config {
@@ -320,7 +342,16 @@ pub fn default_config() -> Config {
     resume_current : false,
     remote_header_name : false,
     hsts : Vec<u8>::new(),
-    proxy_env : Vec<EnvVar>::new()
+    proxy_env : Vec<EnvVar>::new(),
+    timecond : TIMECOND_NONE,
+    condtime : 0i64,
+    has_time_cond_file : false,
+    time_cond_file : Vec<u8>::new(),
+    has_etag_save : false,
+    etag_save : Vec<u8>::new(),
+    has_etag_compare : false,
+    etag_compare : Vec<u8>::new(),
+    num_urls : 0
   };
 }
 
@@ -431,6 +462,9 @@ const OPT_REMOTE_HEADER_NAME : i32 = 103;
 const OPT_UNIX_SOCKET : i32 = 104;
 // `--stderr`, which the parser hands to the tool, as `-K`.
 const OPT_STDERR : i32 = 105;
+const OPT_TIME_COND : i32 = 106;
+const OPT_ETAG_SAVE : i32 = 107;
+const OPT_ETAG_COMPARE : i32 = 108;
 // Options with a value that came after the booleans.
 const OPT_CACERT : i32 = 60;
 const OPT_CAPATH : i32 = 61;
@@ -543,6 +577,9 @@ fn long_option(name : &Vec<u8>) -> i32 {
   if eq_lit(name, "remote-header-name") { return OPT_REMOTE_HEADER_NAME; }
   if eq_lit(name, "unix-socket") { return OPT_UNIX_SOCKET; }
   if eq_lit(name, "stderr") { return OPT_STDERR; }
+  if eq_lit(name, "time-cond") { return OPT_TIME_COND; }
+  if eq_lit(name, "etag-save") { return OPT_ETAG_SAVE; }
+  if eq_lit(name, "etag-compare") { return OPT_ETAG_COMPARE; }
   return OPT_UNKNOWN;
 }
 
@@ -590,6 +627,7 @@ fn short_option(letter : u8) -> i32 {
   if letter == 78u8 { return OPT_NO_BUFFER; }       // N
   if letter == 112u8 { return OPT_PROXYTUNNEL; }    // p
   if letter == 69u8 { return OPT_CERT; }            // E
+  if letter == 122u8 { return OPT_TIME_COND; }      // z
   return OPT_UNKNOWN;
 }
 
@@ -601,7 +639,8 @@ fn takes_value(id : i32) -> bool {
     || (id >= OPT_SOCKS4 && id <= OPT_PASS) || id == OPT_HSTS || id == OPT_PROXY_CACERT
     || id == OPT_PROXY_CAPATH || id == OPT_LIMIT_RATE || id == OPT_MAX_FILESIZE || id == OPT_CONFIG
     || (id >= OPT_RETRY && id <= OPT_RETRY_MAX_TIME) || id == OPT_CONTINUE_AT
-    || id == OPT_UNIX_SOCKET || id == OPT_STDERR;
+    || id == OPT_UNIX_SOCKET || id == OPT_STDERR || id == OPT_TIME_COND || id == OPT_ETAG_SAVE
+    || id == OPT_ETAG_COMPARE;
 }
 
 /// Whether the value of the option names a file, as curl's `ARG_FILE` options.
@@ -609,7 +648,8 @@ fn takes_file(id : i32) -> bool {
   return id == OPT_CACERT || id == OPT_CAPATH || id == OPT_CERT || id == OPT_CONFIG
     || id == OPT_DUMP_HEADER || id == OPT_KEY || id == OPT_OUTPUT || id == OPT_PROXY_CACERT
     || id == OPT_PROXY_CAPATH || id == OPT_TRACE || id == OPT_TRACE_ASCII
-    || id == OPT_UNIX_SOCKET || id == OPT_UPLOAD_FILE || id == OPT_STDERR;
+    || id == OPT_UNIX_SOCKET || id == OPT_UPLOAD_FILE || id == OPT_STDERR
+    || id == OPT_ETAG_SAVE || id == OPT_ETAG_COMPARE;
 }
 
 /// A time in seconds, such as `2` or `2.5`, as milliseconds. None when it is not a number.
@@ -1026,7 +1066,28 @@ fn apply(cfg : &mut Config, id : i32, value : &Vec<u8>, enable : bool, shown : &
     return done();
   }
   if id == OPT_URL {
-    add_url(cfg, value);
+    return add_url(cfg, value, shown);
+  }
+  if id == OPT_TIME_COND {
+    set_time_cond(cfg, value);
+    return done();
+  }
+  if id == OPT_ETAG_SAVE || id == OPT_ETAG_COMPARE {
+    if cfg.num_urls > 1 {
+      return Result<i32, Failure>::Err(bad_use(shown,
+        "The etag options only work on a single URL"));
+    }
+    if value.len() == 0 {
+      return Result<i32, Failure>::Err(option_error(shown,
+        "blank argument where content is expected"));
+    }
+    if id == OPT_ETAG_SAVE {
+      cfg.has_etag_save = true;
+      cfg.etag_save = clone_bytes(value);
+    } else {
+      cfg.has_etag_compare = true;
+      cfg.etag_compare = clone_bytes(value);
+    }
     return done();
   }
   if id == OPT_MAX_REDIRS {
@@ -1457,11 +1518,54 @@ fn upload_slot(cfg : &mut Config) -> i32 {
   return cfg.nodes.len() - 1;
 }
 
-/// Put the URL `url` in the first node that has none.
-fn add_url(cfg : &mut Config, url : &Vec<u8>) -> void {
+/// `-z`: the condition of the first byte (`+`, `-` or `=`) and the date after it. A value that
+/// is no date names a file, whose time the tool reads, as curl's `getfiletime`.
+fn set_time_cond(cfg : &mut Config, value : &Vec<u8>) -> void {
+  let mut text = clone_bytes(value);
+  cfg.timecond = TIMECOND_IFMODSINCE;
+  if value.len() > 0 {
+    let first = value.get(0);
+    if first == 43u8 {
+      text = rest_from(value, 1);
+    } else if first == 45u8 {
+      cfg.timecond = TIMECOND_IFUNMODSINCE;
+      text = rest_from(value, 1);
+    } else if first == 61u8 {
+      cfg.timecond = TIMECOND_LASTMOD;
+      text = rest_from(value, 1);
+    }
+  }
+  cfg.has_time_cond_file = false;
+  cfg.time_cond_file = Vec<u8>::new();
+  match parse_date(&text) {
+    Option<i64>::Some(t) => {
+      cfg.condtime = t;
+    },
+    Option<i64>::None() => {
+      cfg.condtime = 0i64;
+      cfg.has_time_cond_file = true;
+      cfg.time_cond_file = text;
+    }
+  }
+}
+
+/// Put the URL `url` in the first node that has none. `shown` is the option, or the URL itself,
+/// for the error of the etag options, which work on one URL only.
+fn add_url(cfg : &mut Config, url : &Vec<u8>, shown : &Vec<u8>) -> Result<i32, Failure> {
   let at = url_slot(cfg);
   cfg.nodes[at].has_url = true;
   cfg.nodes[at].url = clone_bytes(url);
+  return count_url(cfg, shown);
+}
+
+/// Count one more URL of the group, as curl's `num_urls`.
+fn count_url(cfg : &mut Config, shown : &Vec<u8>) -> Result<i32, Failure> {
+  cfg.num_urls = cfg.num_urls + 1;
+  if cfg.num_urls > 1 && (cfg.has_etag_save || cfg.has_etag_compare) {
+    return Result<i32, Failure>::Err(bad_use(shown,
+      "The etag options only work on a single URL"));
+  }
+  return done();
 }
 
 /// Whether some node of `cfg` has a URL.
@@ -1759,12 +1863,14 @@ impl ArgParser {
   }
 
   /// Add a URL of the file of `--url @FILE`: as with `-O`, and with no globbing.
+  /// It counts the URL for the etag options, which check the count when they come later.
   pub fn add_file_url(self : &mut ArgParser, url : &Vec<u8>) -> void {
     let at = url_slot(&mut self.current);
     self.current.nodes[at].has_url = true;
     self.current.nodes[at].url = clone_bytes(url);
     self.current.nodes[at].remote = true;
     self.current.nodes[at].noglob = true;
+    self.current.num_urls = self.current.num_urls + 1;
   }
 
   /// Start a new group after `--next`. False when the current group has no URL yet.
@@ -1839,7 +1945,7 @@ impl ArgParser {
           return Result<WordsStop, Failure>::Ok(stop);
         }
       } else {
-        add_url(&mut self.current, word);
+        let _added = add_url(&mut self.current, word, word)?;
         i = i + 1;
       }
     }

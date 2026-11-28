@@ -8,8 +8,10 @@ import std::vec;
 import sys::text;
 import securl::auth;
 import securl::bytes;
+import securl::date;
 import securl::encode;
 import securl::failure;
+import securl::options;
 import securl::url;
 
 /// The text that securl gives as its version, and sends in `User-Agent`.
@@ -174,6 +176,20 @@ struct RequestInfo {
   accept_encoding : bool,
   // `--tr-encoding`: ask for gzip as a transfer coding, with `TE: gzip` and `Connection: TE`.
   tr_encoding : bool,
+  // `-z`: the condition (a `TIMECOND_` value of `options.vx`) and its time.
+  timecond : i32,
+  timevalue : i64,
+}
+
+/// The header of the condition `cond` of `-z`.
+fn time_condition_name(cond : i32) -> *const i8 {
+  if cond == TIMECOND_IFUNMODSINCE {
+    return "If-Unmodified-Since";
+  }
+  if cond == TIMECOND_LASTMOD {
+    return "Last-Modified";
+  }
+  return "If-Modified-Since";
 }
 
 fn add_line(out : &mut Vec<u8>, name : *const i8, value : &Vec<u8>) -> void {
@@ -300,6 +316,18 @@ pub fn build_request(u : &Url, info : &RequestInfo) -> Vec<u8> {
   }
   if cookie.len() > 0 {
     add_line(&mut out, "Cookie: ", &cookie);
+  }
+
+  // The condition of `-z`, after the cookies and before the `-H` headers, as libcurl's
+  // `Curl_add_timecondition`. A `-H` header of that name goes instead.
+  if info.timecond != TIMECOND_NONE {
+    let name = time_condition_name(info.timecond);
+    if !has_custom(&info.headers, name) {
+      push_lit(&mut out, name);
+      push_lit(&mut out, ": ");
+      append(&mut out, &http_date(info.timevalue));
+      push_lit(&mut out, "\r\n");
+    }
   }
 
   for line in info.headers.iter() {
